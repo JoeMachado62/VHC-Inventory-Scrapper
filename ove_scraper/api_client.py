@@ -151,6 +151,69 @@ class VCHApiClient:
         )
         return response.json()
 
+    def send_scraper_heartbeat(
+        self,
+        *,
+        worker_id: str,
+        profile: str | None = None,
+        scraper_version: str | None = None,
+        node_id: str | None = None,
+        last_sync_at: str | None = None,
+        last_poll_at: str | None = None,
+        last_claim_at: str | None = None,
+        pending_claims: int | None = None,
+        status_note: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Best-effort liveness heartbeat to the VPS.
+
+        Per the 2026-04-08 VPS handoff: partial heartbeats are accepted —
+        only fields present in the body overwrite server-side state, null
+        / missing fields preserve the prior value. The VPS warning
+        threshold is 5 minutes, critical is 15 minutes; the scraper main
+        loop sends one heartbeat per ~30s polling tick to stay well under.
+
+        This method NEVER raises. Heartbeats are best-effort by contract:
+        a transient network failure on the heartbeat path must not stop
+        the scraper from doing real work. Returns None on any failure.
+        """
+        body: dict[str, Any] = {"worker_id": worker_id}
+        if profile is not None:
+            body["profile"] = profile
+        if scraper_version is not None:
+            body["scraper_version"] = scraper_version
+        if node_id is not None:
+            body["node_id"] = node_id
+        if last_sync_at is not None:
+            body["last_sync_at"] = last_sync_at
+        if last_poll_at is not None:
+            body["last_poll_at"] = last_poll_at
+        if last_claim_at is not None:
+            body["last_claim_at"] = last_claim_at
+        if pending_claims is not None:
+            body["pending_claims"] = pending_claims
+        if status_note is not None:
+            body["status_note"] = status_note
+        if details is not None:
+            body["details"] = details
+        try:
+            # Heartbeats are tight-budget calls; do NOT use the long
+            # retry-with-backoff path. A single try with a short timeout
+            # keeps the polling loop responsive.
+            response = self.client.post(
+                f"{self.base_url}/inventory/ove/scraper-heartbeat",
+                json=body,
+                timeout=10.0,
+            )
+            if response.status_code >= 400:
+                return None
+            try:
+                return response.json()
+            except Exception:
+                return None
+        except Exception:
+            return None
+
     def _request_with_retry(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         backoffs = [0, 2, 4, 8]
         last_error: Exception | None = None

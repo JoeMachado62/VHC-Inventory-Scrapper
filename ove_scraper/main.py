@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
+import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -24,6 +26,41 @@ from ove_scraper.schemas import PendingDetailRequest
 from ove_scraper.sync_service import HourlySyncRunner
 
 EASTERN_TZ = ZoneInfo("America/New_York")
+
+# Process-wide shutdown event flipped by SIGINT / SIGTERM / SIGBREAK.
+# The main loop checks this between ticks so taskkill / Ctrl+C / Task
+# Scheduler "stop" can drain in-flight work cleanly instead of being
+# killed mid-scrape and leaving claims dangling on the VPS.
+SHUTDOWN_EVENT = threading.Event()
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _install_signal_handlers(logger) -> None:
+    def _handler(signum, _frame):
+        try:
+            name = signal.Signals(signum).name
+        except Exception:
+            name = str(signum)
+        logger.warning("Received signal %s; flipping shutdown event", name)
+        SHUTDOWN_EVENT.set()
+
+    # SIGINT works on every platform (Ctrl+C). SIGTERM is POSIX. SIGBREAK
+    # is what Windows Task Scheduler sends when stopping a task — it is
+    # the closest thing to SIGTERM on Windows. Install whichever exists.
+    signal.signal(signal.SIGINT, _handler)
+    if hasattr(signal, "SIGTERM"):
+        try:
+            signal.signal(signal.SIGTERM, _handler)
+        except (ValueError, OSError):
+            pass
+    if hasattr(signal, "SIGBREAK"):
+        try:
+            signal.signal(signal.SIGBREAK, _handler)
+        except (ValueError, OSError):
+            pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,7 +83,14 @@ def main() -> None:
     args = build_parser().parse_args()
     settings = Settings.from_env()
     logger = configure_logging(settings.log_level, settings.log_file_path)
+    _install_signal_handlers(logger)
     browser, api_client, sync_runner, deep_scrape_worker, notifier = build_runtime(settings, logger)
+    # Track the most-recent successful sync timestamp so heartbeats can
+    # report it to the VPS health endpoint. Initialized lazily on the
+    # first successful sync; remains None until then so the VPS can tell
+    # "scraper running but never synced" from "scraper synced X minutes ago".
+    last_sync_at_iso: str | None = None
+    last_poll_at_iso: str | None = None
 
     try:
         with KeepAwake(logger):
@@ -85,14 +129,15 @@ def main() -> None:
             next_sync_at = 0.0
             next_poll_at = 0.0
             next_keepalive_at = 0.0
+            next_heartbeat_at = 0.0
 
-            while True:
+            while not SHUTDOWN_EVENT.is_set():
                 try:
                     now = time.monotonic()
 
                     if now >= next_sync_at:
                         if is_within_sync_window(settings):
-                            run_sync_once_with_recovery(
+                            sync_result = run_sync_once_with_recovery(
                                 settings,
                                 browser,
                                 api_client,
@@ -100,6 +145,16 @@ def main() -> None:
                                 sync_runner=sync_runner,
                                 notifier=notifier,
                             )
+                            if sync_result is not None and getattr(sync_result, "execution_status", None) == "Success":
+                                last_sync_at_iso = _utc_now_iso()
+                                send_heartbeat(
+                                    api_client,
+                                    settings,
+                                    logger,
+                                    last_sync_at=last_sync_at_iso,
+                                    last_poll_at=last_poll_at_iso,
+                                    status_note="snapshot_ok",
+                                )
                             next_sync_at = now + settings.sync_interval_seconds
                         else:
                             pause_seconds = seconds_until_next_sync_window(settings)
@@ -109,8 +164,11 @@ def main() -> None:
                             )
                             next_sync_at = now + pause_seconds
 
+                    if SHUTDOWN_EVENT.is_set():
+                        break
+
                     if now >= next_poll_at:
-                        run_poll_once_with_recovery(
+                        poll_result = run_poll_once_with_recovery(
                             settings,
                             browser,
                             api_client,
@@ -118,7 +176,25 @@ def main() -> None:
                             deep_scrape_worker=deep_scrape_worker,
                             notifier=notifier,
                         )
+                        last_poll_at_iso = _utc_now_iso()
+                        send_heartbeat(
+                            api_client,
+                            settings,
+                            logger,
+                            last_sync_at=last_sync_at_iso,
+                            last_poll_at=last_poll_at_iso,
+                            last_claim_at=last_poll_at_iso if poll_result else None,
+                            pending_claims=len(poll_result) if isinstance(poll_result, list) else 0,
+                            status_note="poll_ok",
+                        )
                         next_poll_at = now + settings.deep_scrape_poll_interval_seconds
+                        # Polling triggers an explicit heartbeat above, so
+                        # the periodic heartbeat doesn't need to fire again
+                        # in the next ~30s. Defer it.
+                        next_heartbeat_at = now + 60
+
+                    if SHUTDOWN_EVENT.is_set():
+                        break
 
                     if now >= next_keepalive_at:
                         run_browser_operation(
@@ -131,7 +207,24 @@ def main() -> None:
                         )
                         next_keepalive_at = now + settings.browser_keepalive_interval_seconds
 
-                    time.sleep(1)
+                    if now >= next_heartbeat_at:
+                        # Periodic-only safety net: if neither poll nor sync
+                        # fired in the last 60s (e.g., paused outside sync
+                        # window AND poll deferred), still emit a liveness
+                        # heartbeat so the VPS health endpoint stays green.
+                        send_heartbeat(
+                            api_client,
+                            settings,
+                            logger,
+                            last_sync_at=last_sync_at_iso,
+                            last_poll_at=last_poll_at_iso,
+                            status_note="idle_tick",
+                        )
+                        next_heartbeat_at = now + 60
+
+                    # Wait on the shutdown event instead of a plain sleep so
+                    # SIGINT/SIGTERM/SIGBREAK wake the loop within 1s.
+                    SHUTDOWN_EVENT.wait(timeout=1.0)
                 except Exception as exc:
                     logger.exception("OVE main loop crashed; rebuilding runtime: %s", exc)
                     try:
@@ -139,9 +232,28 @@ def main() -> None:
                     finally:
                         if hasattr(browser, "close"):
                             browser.close()
-                    time.sleep(5)
+                    if SHUTDOWN_EVENT.wait(timeout=5.0):
+                        break
                     browser, api_client, sync_runner, deep_scrape_worker, notifier = build_runtime(settings, logger)
+            logger.info("Shutdown event observed; exiting main loop cleanly")
     finally:
+        try:
+            released = deep_scrape_worker.release_in_flight_claims()
+            if released:
+                logger.warning("Released %s in-flight detail claims on shutdown", released)
+        except Exception as exc:
+            logger.warning("Failed to release in-flight claims on shutdown: %s", exc)
+        try:
+            send_heartbeat(
+                api_client,
+                settings,
+                logger,
+                last_sync_at=last_sync_at_iso,
+                last_poll_at=last_poll_at_iso,
+                status_note="shutting_down",
+            )
+        except Exception:
+            pass
         api_client.close()
         if hasattr(browser, "close"):
             browser.close()
@@ -173,9 +285,39 @@ def run_sync_once_with_recovery(
     logger,
     sync_runner: HourlySyncRunner | None = None,
     notifier: AdminNotifier | None = None,
-) -> None:
+):
     runner = sync_runner or HourlySyncRunner(settings, browser, api_client, logger, notifier=notifier)
-    run_browser_operation(settings, browser, logger, runner.run_once, "hourly sync", notifier=notifier)
+    return run_browser_operation(settings, browser, logger, runner.run_once, "hourly sync", notifier=notifier)
+
+
+def send_heartbeat(
+    api_client: VCHApiClient,
+    settings: Settings,
+    logger,
+    *,
+    last_sync_at: str | None = None,
+    last_poll_at: str | None = None,
+    last_claim_at: str | None = None,
+    pending_claims: int | None = None,
+    status_note: str | None = None,
+) -> None:
+    """Best-effort heartbeat. Never raises — see VCHApiClient.send_scraper_heartbeat."""
+    try:
+        result = api_client.send_scraper_heartbeat(
+            worker_id=settings.detail_worker_id,
+            profile=settings.scraper_profile_slug,
+            scraper_version=settings.scraper_version,
+            node_id=settings.scraper_node_id,
+            last_sync_at=last_sync_at,
+            last_poll_at=last_poll_at,
+            last_claim_at=last_claim_at,
+            pending_claims=pending_claims,
+            status_note=status_note,
+        )
+        if result is None:
+            logger.debug("Heartbeat to VPS returned None (transient or non-200)")
+    except Exception as exc:
+        logger.debug("Heartbeat call raised unexpectedly: %s", exc)
 
 
 def run_poll_once_with_recovery(
@@ -185,9 +327,9 @@ def run_poll_once_with_recovery(
     logger,
     deep_scrape_worker: DeepScrapeWorker | None = None,
     notifier: AdminNotifier | None = None,
-) -> None:
+):
     worker = deep_scrape_worker or DeepScrapeWorker(api_client, browser, logger, settings)
-    run_browser_operation(settings, browser, logger, worker.process_pending_once, "detail poll", notifier=notifier)
+    return run_browser_operation(settings, browser, logger, worker.process_pending_once, "detail poll", notifier=notifier)
 
 
 def run_browser_operation(settings: Settings, browser, logger, operation, operation_name: str, notifier: AdminNotifier | None = None):

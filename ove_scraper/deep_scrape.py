@@ -49,6 +49,26 @@ class DeepScrapeWorker:
         # 3.5-hour /fail hot loop. Independent of the VPS-side `next_retry_at`
         # filter (which is correct but cannot react instantly to a 409 race).
         self._fail_cooldown: dict[str, float] = {}
+        # Per-request consecutive-same-category failure counter. After
+        # MAX_CONSECUTIVE_FAILS_PER_CATEGORY (or the lower
+        # MAX_CONSECUTIVE_VIN_NOT_FOUND_FAILS for not-found) consecutive
+        # fails with the same error_category for the same request_id, the
+        # request is escalated to /terminal so the VPS stops re-queuing it.
+        # Per the 2026-04-08 VPS handoff: this is the browser_error loop
+        # guard that would have stopped the prior F-150 incident at attempt
+        # 5 instead of 42. Counter resets on category change so transient
+        # issues don't burn the budget.
+        self._fail_streak: dict[str, dict[str, Any]] = {}
+        # Set of (request_id, vin) tuples currently being scraped. Used by
+        # graceful shutdown to release the lease back to the VPS with
+        # error_category="worker_shutdown" so the request becomes
+        # immediately re-claimable instead of waiting for the lease to
+        # expire (default 900s).
+        self._in_flight_claims: set[tuple[str, str]] = set()
+        self._in_flight_lock = threading.Lock()
+
+    MAX_CONSECUTIVE_FAILS_PER_CATEGORY = 5
+    MAX_CONSECUTIVE_VIN_NOT_FOUND_FAILS = 3
 
     def process_pending_once(self) -> list[str]:
         self.logger.info(
@@ -99,6 +119,20 @@ class DeepScrapeWorker:
         browser: BrowserSession,
         api_client: VCHApiClient,
     ) -> str | None:
+        with self._in_flight_lock:
+            self._in_flight_claims.add((request.request_id, request.vin))
+        try:
+            return self._process_request_inner(request, browser, api_client)
+        finally:
+            with self._in_flight_lock:
+                self._in_flight_claims.discard((request.request_id, request.vin))
+
+    def _process_request_inner(
+        self,
+        request: PendingDetailRequest,
+        browser: BrowserSession,
+        api_client: VCHApiClient,
+    ) -> str | None:
         self.logger.info(
             "Starting deep scrape for request_id=%s vin=%s attempts=%s claimed_at=%s lease_expires_at=%s",
             request.request_id,
@@ -134,11 +168,29 @@ class DeepScrapeWorker:
             )
             api_client.push_ove_detail(request.vin, payload)
             self._clear_not_found_state(request.vin)
-            api_client.complete_detail_request(
-                request.request_id,
-                worker_id=self.settings.detail_worker_id,
-                result="success",
-            )
+            try:
+                api_client.complete_detail_request(
+                    request.request_id,
+                    worker_id=self.settings.detail_worker_id,
+                    result="success",
+                )
+            except ApiClientError as complete_exc:
+                # The detail POST safety net (SCRAPER_CONTRACT.md §3.6)
+                # auto-completes any CLAIMED request whose VIN matches the
+                # POST. So by the time we explicitly call /complete the
+                # request is already in COMPLETED state and the VPS responds
+                # 409 "is not currently claimed (status=COMPLETED)". That is
+                # success, not failure — the request reached its terminal
+                # state through the path the contract says it should.
+                if not self._is_already_resolved_conflict(complete_exc):
+                    raise
+                self.logger.info(
+                    "Detail request %s for VIN %s already completed by detail-POST safety net; explicit /complete is a no-op",
+                    request.request_id,
+                    request.vin,
+                )
+            self._record_fail_cooldown(request, 24 * 60 * 60)
+            self._fail_streak.pop(request.request_id, None)
             self.logger.info("Completed deep scrape request_id=%s vin=%s", request.request_id, request.vin)
             return request.vin
         except ListingNotFoundError as exc:
@@ -210,6 +262,7 @@ class DeepScrapeWorker:
                     message=str(exc),
                 )
                 self._clear_not_found_state(request.vin)
+                self._fail_streak.pop(request.request_id, None)
                 self.logger.warning(
                     "Suppressing stale VPS detail request %s for VIN %s after terminal 404: %s",
                     request.request_id,
@@ -233,12 +286,34 @@ class DeepScrapeWorker:
                     request.vin,
                     exc,
                 )
+                self._fail_streak.pop(request.request_id, None)
+                return request.vin
+            error_category = self._classify_failure(exc)
+            # Per-request consecutive-same-category attempt cap. Escalate
+            # to /terminal once the streak hits the limit so the VPS
+            # stops re-queuing a request that cannot be recovered.
+            if self._record_and_check_fail_streak(request, error_category):
+                self._terminal_claimed_request(
+                    api_client,
+                    request,
+                    reason="max_attempts_exceeded",
+                    message=(
+                        f"Exceeded consecutive fail cap for category={error_category}; "
+                        f"last_error={exc}"
+                    ),
+                )
+                self.logger.error(
+                    "Detail request %s for VIN %s exceeded consecutive %s cap; resolved as terminal",
+                    request.request_id,
+                    request.vin,
+                    error_category,
+                )
                 return request.vin
             retry_after_seconds = self.settings.deep_scrape_retry_delay_seconds
             self._fail_claimed_request(
                 api_client,
                 request,
-                error_category=self._classify_failure(exc),
+                error_category=error_category,
                 error_message=str(exc),
                 retry_after_seconds=retry_after_seconds,
             )
@@ -438,6 +513,84 @@ class DeepScrapeWorker:
                 request.vin,
                 terminal_exc,
             )
+
+    def release_in_flight_claims(self) -> int:
+        """Send /fail with error_category='worker_shutdown' for every in-flight
+        request_id so the VPS can re-queue them immediately instead of waiting
+        for the lease to expire (default 900s). Called from main.py's
+        graceful-shutdown path.
+
+        Returns the number of claims released. Best-effort: per-claim failures
+        are logged but do not stop the loop.
+        """
+        with self._in_flight_lock:
+            in_flight = list(self._in_flight_claims)
+        released = 0
+        for request_id, vin in in_flight:
+            try:
+                self.api_client.fail_detail_request(
+                    request_id,
+                    worker_id=self.settings.detail_worker_id,
+                    error_category="worker_shutdown",
+                    error_message="Worker received shutdown signal; releasing lease for immediate re-claim",
+                    retry_after_seconds=0,
+                )
+                self.logger.warning(
+                    "Released in-flight claim %s for VIN %s on shutdown",
+                    request_id,
+                    vin,
+                )
+                released += 1
+            except ApiClientError as exc:
+                # 409 here means the VPS already terminal-resolved the
+                # request (e.g., the detail POST safety net beat us). Treat
+                # as success — the lease is no longer ours either way.
+                if self._is_already_resolved_conflict(exc):
+                    self.logger.info(
+                        "Shutdown release of %s VIN %s found request already resolved on VPS",
+                        request_id,
+                        vin,
+                    )
+                    released += 1
+                else:
+                    self.logger.warning(
+                        "Shutdown release of %s VIN %s failed: %s",
+                        request_id,
+                        vin,
+                        exc,
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "Shutdown release of %s VIN %s raised unexpectedly: %s",
+                    request_id,
+                    vin,
+                    exc,
+                )
+        return released
+
+    def _record_and_check_fail_streak(self, request: PendingDetailRequest, error_category: str) -> bool:
+        """Record a fail of the given category for this request_id and return
+        True if the consecutive-same-category streak has reached the cap.
+
+        The counter resets to 1 whenever the category changes — only
+        consistent failures of the same kind count as a streak. The not-found
+        category gets a tighter cap (3) because retrying a 404 cannot help.
+        """
+        cap = (
+            self.MAX_CONSECUTIVE_VIN_NOT_FOUND_FAILS
+            if error_category == "vin_not_found" or error_category == "temporarily_unavailable"
+            else self.MAX_CONSECUTIVE_FAILS_PER_CATEGORY
+        )
+        prior = self._fail_streak.get(request.request_id)
+        if prior is not None and prior.get("category") == error_category:
+            count = int(prior.get("count", 0)) + 1
+        else:
+            count = 1
+        self._fail_streak[request.request_id] = {"category": error_category, "count": count}
+        if count >= cap:
+            self._fail_streak.pop(request.request_id, None)
+            return True
+        return False
 
     def _is_already_resolved_conflict(self, exc: Exception) -> bool:
         # Detect the VPS 409 response that means "this request is no longer

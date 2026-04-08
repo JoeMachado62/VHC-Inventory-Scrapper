@@ -62,8 +62,13 @@ class Settings:
     not_found_confirm_attempts: int = 3
     ims_refresh_start_hour_eastern: int = 16
     ims_refresh_end_hour_eastern: int = 17
-    sync_window_start_hour_eastern: int = 9
-    sync_window_end_hour_eastern: int = 21
+    # Sync window in Eastern time. Per the 2026-04-08 VPS handoff, extended
+    # from 9 AM – 9 PM (12h) to 6 AM – 11 PM (17h) so the daemon spends
+    # less of the day idle and vehicles.updated_at stays fresher for the
+    # /health endpoint. Tunable via SYNC_WINDOW_START_HOUR_EASTERN and
+    # SYNC_WINDOW_END_HOUR_EASTERN env vars.
+    sync_window_start_hour_eastern: int = 6
+    sync_window_end_hour_eastern: int = 23
     ove_required_search_count: int = 6
     scraper_node_id: str = "unknown-node"
     scraper_profile_slug: str = "default"
@@ -130,8 +135,8 @@ class Settings:
             not_found_confirm_attempts=_get_int("NOT_FOUND_CONFIRM_ATTEMPTS", 3),
             ims_refresh_start_hour_eastern=_get_int("IMS_REFRESH_START_HOUR_EASTERN", 16),
             ims_refresh_end_hour_eastern=_get_int("IMS_REFRESH_END_HOUR_EASTERN", 17),
-            sync_window_start_hour_eastern=_get_int("SYNC_WINDOW_START_HOUR_EASTERN", 9),
-            sync_window_end_hour_eastern=_get_int("SYNC_WINDOW_END_HOUR_EASTERN", 21),
+            sync_window_start_hour_eastern=_get_int("SYNC_WINDOW_START_HOUR_EASTERN", 6),
+            sync_window_end_hour_eastern=_get_int("SYNC_WINDOW_END_HOUR_EASTERN", 23),
             ove_required_search_count=_get_int("OVE_REQUIRED_SEARCH_COUNT", 6),
             scraper_node_id=os.getenv("SCRAPER_NODE_ID", socket.gethostname().lower() or "unknown-node"),
             scraper_profile_slug=os.getenv("SCRAPER_PROFILE_SLUG", "default"),

@@ -433,20 +433,26 @@ def test_not_found_requires_multiple_misses_before_finalize(tmp_path) -> None:
 
 
 def test_sync_window_allows_daytime_hours(tmp_path) -> None:
+    # Default sync window is 6 AM – 11 PM ET (extended from 9–21 per the
+    # 2026-04-08 VPS handoff, item VPS-5).
     settings = Settings(
         vch_api_base_url="https://example.com/v1",
         vch_service_token="token",
         log_file_path=tmp_path / "sync.log",
     )
 
-    allowed = is_within_sync_window(settings, datetime(2026, 3, 23, 10, 0, tzinfo=EASTERN_TZ))
-    paused = is_within_sync_window(settings, datetime(2026, 3, 23, 22, 0, tzinfo=EASTERN_TZ))
+    allowed_morning = is_within_sync_window(settings, datetime(2026, 3, 23, 7, 0, tzinfo=EASTERN_TZ))
+    allowed_evening = is_within_sync_window(settings, datetime(2026, 3, 23, 22, 0, tzinfo=EASTERN_TZ))
+    paused = is_within_sync_window(settings, datetime(2026, 3, 23, 23, 30, tzinfo=EASTERN_TZ))
 
-    assert allowed is True
+    assert allowed_morning is True
+    assert allowed_evening is True
     assert paused is False
 
 
 def test_seconds_until_next_sync_window_targets_next_morning(tmp_path) -> None:
+    # Window is 6 AM – 11 PM ET. From 23:30 ET, the next 6 AM is 6.5 hours
+    # away → 23400 seconds.
     settings = Settings(
         vch_api_base_url="https://example.com/v1",
         vch_service_token="token",
@@ -455,7 +461,7 @@ def test_seconds_until_next_sync_window_targets_next_morning(tmp_path) -> None:
 
     seconds = seconds_until_next_sync_window(
         settings,
-        datetime(2026, 3, 23, 22, 30, tzinfo=EASTERN_TZ),
+        datetime(2026, 3, 23, 23, 30, tzinfo=EASTERN_TZ),
     )
 
-    assert seconds == 37800.0
+    assert seconds == 23400.0

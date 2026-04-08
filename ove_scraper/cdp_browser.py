@@ -439,6 +439,16 @@ class PlaywrightCdpBrowserSession:
         try:
             LOGGER.info("Stage open_listing: starting for VIN %s", vin)
             detail_page, result_card_report_link = self._open_listing_for_vin(page, vin, artifact_dir)
+            # The OVE detail panel is React-rendered and the CR link
+            # appears AFTER initial DOM mount. Verified empirically against
+            # VIN 1FTFW1E82MFB44312: the CR link was present in the saved
+            # listing.html (captured ~700ms after extraction) but absent
+            # from the DETAIL_EXTRACTION_SCRIPT result, so the script ran
+            # before React hydrated the link. Wait up to 8s for any of the
+            # known CR link selectors to appear before scraping. Not raising
+            # on timeout — VINs without a CR (rare under the East/West Hub
+            # filters but possible) should still produce a useful payload.
+            self._wait_for_cr_link_to_render(detail_page, timeout_ms=8000)
             LOGGER.info("Stage extract_payload: starting for VIN %s", vin)
             payload = detail_page.evaluate(
                 DETAIL_EXTRACTION_SCRIPT.replace("ROOT_SELECTOR", json.dumps(self.settings.ove_section_root_selector))
@@ -1795,6 +1805,45 @@ class PlaywrightCdpBrowserSession:
             # if we landed on a Manheim sign-in page.
             return page
         return None
+
+    def _wait_for_cr_link_to_render(self, detail_page: Page, *, timeout_ms: int = 8000) -> bool:
+        """Wait for any of the known CR link selectors to be present in the DOM.
+
+        The OVE React app mounts the CR link element AFTER the initial detail
+        panel render. Calling DETAIL_EXTRACTION_SCRIPT before the link
+        appears causes condition_report_link to come back None, which then
+        cascades into capture_condition_report being skipped entirely
+        (link present=False) and the worker pushing a payload with no CR.
+
+        Returns True if at least one CR-link selector matched within the
+        timeout, False otherwise. Does NOT raise on timeout — VINs that
+        legitimately have no CR should still produce a usable listing
+        snapshot. The pre-push validator (P1a rule 3) and the gallery-stable
+        wait (P2-C) gate the actual data quality downstream.
+        """
+        cr_selectors = [
+            "a[data-test-id='condition-report']",
+            "a.VehicleReportLink__condition-report-link",
+            "a[href*='insightcr.manheim.com']",
+            "a[href*='inspectionreport.manheim.com']",
+            "a[href*='content.liquidmotors.com/IR/']",
+            "a[href*='ECR2I.htm']",
+        ]
+        joined = ", ".join(cr_selectors)
+        try:
+            detail_page.wait_for_selector(joined, state="attached", timeout=timeout_ms)
+            LOGGER.info("Detail panel CR link is present in the DOM; proceeding with extraction")
+            return True
+        except PlaywrightTimeoutError:
+            LOGGER.warning(
+                "Detail panel CR link did not render within %sms; extraction will proceed without it. "
+                "Pre-push validator will reject the result if the captured data looks corrupt.",
+                timeout_ms,
+            )
+            return False
+        except Exception as exc:
+            LOGGER.warning("CR link wait raised unexpectedly: %s", exc)
+            return False
 
     def _wait_for_cr_gallery_stable(self, page: Page) -> None:
         """Wait for the OVE-internal CR image gallery to finish loading.
