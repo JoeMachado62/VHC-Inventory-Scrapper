@@ -293,6 +293,7 @@ def test_run_once_uploads_complete_deduped_snapshot_in_single_batch(tmp_path) ->
         vch_service_token="token",
         export_dir=tmp_path,
         log_file_path=tmp_path / "sync.log",
+        data_dir=tmp_path / "data",
         ove_required_search_count=6,
     )
     saved_searches = (
