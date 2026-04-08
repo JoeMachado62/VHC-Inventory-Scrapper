@@ -22,6 +22,14 @@ class ManheimAuthRedirectError(BrowserSessionError):
     failure — pushing the captured payload would corrupt the VPS."""
 
 
+class ConditionReportClickFailedError(BrowserSessionError):
+    """Raised when the OVE-internal CR link could not be clicked into the
+    expected #/details/{vin}/OVE/conditionInformation hash route after every
+    retry. The CR is reachable ONLY through this in-page click — there is no
+    valid direct-goto fallback for the raw insightcr.manheim.com URL because
+    Manheim requires an OVE-side SSO bounce that only fires from a click."""
+
+
 @dataclass(slots=True)
 class DeepScrapeResult:
     images: list[str] = field(default_factory=list)

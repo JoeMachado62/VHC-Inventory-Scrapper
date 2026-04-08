@@ -20,6 +20,7 @@ from playwright.sync_api import (
 
 from ove_scraper.browser import (
     BrowserSessionError,
+    ConditionReportClickFailedError,
     DeepScrapeResult,
     ListingNotFoundError,
     ManheimAuthRedirectError,
@@ -1522,6 +1523,15 @@ class PlaywrightCdpBrowserSession:
             page = self._open_condition_report_page(source_page, context, href, artifact_dir)
             if page is None:
                 return None
+            # Wait for the OVE-internal CR view to finish lazy-loading its
+            # image gallery BEFORE we snapshot the DOM. The gallery is
+            # React-rendered after the route mount; manual-rerun-payload-2
+            # and -3 captured 1 image while -4 captured all 17, all on the
+            # same VIN with the same code path — proof the timing race is
+            # real. We poll the rendered Manheim CDN <img> count until it
+            # is stable for 2 consecutive polls and matches the gallery
+            # widget's "of N" hint when present.
+            self._wait_for_cr_gallery_stable(page)
             snapshot = self._snapshot_page(page, artifact_dir / "condition-report")
             # Defense in depth: even after the popup/click navigation
             # appears to succeed, double-check the captured page is not an
@@ -1558,55 +1568,92 @@ class PlaywrightCdpBrowserSession:
         href: str,
         artifact_dir: Path,
     ) -> Page | None:
-        # The click-driven popup path is the ONLY path that goes through the
-        # Manheim OAuth handshake correctly. The direct goto fallback skips
-        # the handshake and lands on the login page, which is the silent
-        # data-corruption bug we are explicitly fixing here. So:
-        #   1. Try the popup-click path with retries.
-        #   2. Only fall back to direct goto if NO locator was ever found
-        #      (structural failure on the OVE side).
-        #   3. After every navigation, verify we are not on auth.manheim.com.
-        locator = self._find_condition_report_locator(source_page)
-        if locator is not None:
-            for attempt in range(2):
-                if attempt > 0:
-                    # Re-resolve the locator on retry — the popup attempt may
-                    # have rebuilt the DOM and the prior handle could be stale.
-                    locator = self._find_condition_report_locator(source_page)
-                    if locator is None:
-                        break
-                original_url = source_page.url
-                popup_page = self._click_condition_report_locator(source_page, locator)
-                if popup_page is not None:
-                    LOGGER.info(
-                        "Opened condition report in popup from OVE detail page (attempt %s)",
-                        attempt + 1,
-                    )
-                    self._raise_if_auth_redirect(popup_page, artifact_dir, "popup_click", href)
-                    return popup_page
-                if source_page.url != original_url:
-                    LOGGER.info(
-                        "Condition report click navigated the OVE detail page directly to %s",
-                        source_page.url,
-                    )
-                    self._raise_if_auth_redirect(source_page, artifact_dir, "in_page_nav", href)
-                    return source_page
+        # The OVE webapp serves its OWN condition-report viewer at the
+        # client-side hash route #/details/{vin}/OVE/conditionInformation.
+        # That route is reachable ONLY by clicking the CR link element on
+        # the OVE detail page — the click triggers an OVE React handler
+        # that performs an internal SSO bounce against Manheim's backend
+        # and renders the CR (with all images) inside the OVE webapp,
+        # without a popup, without an OAuth handshake the scraper can see.
+        #
+        # The previous code had a "direct goto" fallback that hit the raw
+        # insightcr.manheim.com URL from the CR link's href attribute. That
+        # path SKIPS the OVE-side SSO step, so Manheim's IDP responds with
+        # a fresh login redirect, the scraper captured the login form as
+        # if it were the CR, and we silently corrupted the VPS DB. The
+        # fallback is permanently removed — there is no valid recovery
+        # path that bypasses the click. If the click fails, the lease
+        # queue retries via the standard /fail flow.
+        #
+        # We do NOT pass `href` to a goto. We use the href ONLY to label
+        # debug artifacts on failure, and the click on the OVE locator
+        # element is the sole navigation mechanism.
+        max_attempts = 4
+        last_error: Exception | None = None
+        for attempt in range(max_attempts):
+            # Re-resolve the locator on every attempt — a previous click
+            # may have rebuilt the DOM and the prior handle could be stale.
+            locator = self._find_condition_report_locator(source_page)
+            if locator is None:
                 LOGGER.warning(
-                    "Condition report click attempt %s did not produce a navigation; will retry",
+                    "Condition report locator not found on OVE detail page (attempt %s/%s)",
                     attempt + 1,
+                    max_attempts,
                 )
+                source_page.wait_for_timeout(1500)
+                continue
+            try:
+                cr_page = self._click_condition_report_locator(source_page, locator)
+            except ManheimAuthRedirectError:
+                # The click DID navigate, but to an auth page. Propagate
+                # immediately — retrying with the same source page will
+                # not fix an auth state problem.
+                raise
+            except Exception as click_exc:
+                last_error = click_exc
+                LOGGER.warning(
+                    "Condition report click attempt %s/%s raised %s; will retry",
+                    attempt + 1,
+                    max_attempts,
+                    click_exc,
+                )
+                source_page.wait_for_timeout(1500)
+                continue
+            if cr_page is not None:
+                LOGGER.info(
+                    "Opened OVE-internal condition report view (attempt %s/%s, url=%s)",
+                    attempt + 1,
+                    max_attempts,
+                    cr_page.url,
+                )
+                self._raise_if_auth_redirect(cr_page, artifact_dir, "post_click", href)
+                return cr_page
+            LOGGER.warning(
+                "Condition report click attempt %s/%s produced no navigation; will retry",
+                attempt + 1,
+                max_attempts,
+            )
+            source_page.wait_for_timeout(1500)
 
-        LOGGER.warning(
-            "Falling back to direct condition report navigation for %s. This path skips the "
-            "Manheim OAuth handshake and may land on a login page; the post-goto auth check will "
-            "raise if that happens.",
-            href,
+        # All click attempts exhausted. We deliberately do NOT fall back to
+        # a direct goto on the raw Manheim URL. Capture a debug snapshot of
+        # the source page so a follow-up investigation can see why the click
+        # never produced a navigation, then raise so the lease retries.
+        try:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            (artifact_dir / "cr-click-failed-source.html").write_text(
+                source_page.content(), encoding="utf-8"
+            )
+            source_page.screenshot(
+                path=str(artifact_dir / "cr-click-failed-source.png"),
+                full_page=True,
+            )
+        except Exception as snap_exc:
+            LOGGER.warning("Could not capture cr-click-failed debug snapshot: %s", snap_exc)
+        raise ConditionReportClickFailedError(
+            f"Could not open OVE condition report after {max_attempts} click attempts; "
+            f"intended_href={href}; last_error={last_error}"
         )
-        page = context.new_page()
-        page.goto(href, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(2500)
-        self._raise_if_auth_redirect(page, artifact_dir, "direct_goto", href)
-        return page
 
     def _is_manheim_auth_page(self, page: Page) -> bool:
         try:
@@ -1683,33 +1730,169 @@ class PlaywrightCdpBrowserSession:
                 continue
         return None
 
-    def _click_condition_report_locator(self, page: Page, locator: Locator) -> Page | None:
-        # The popup-expect window must be long enough that the OAuth
-        # handshake has time to complete on slow connections. The previous
-        # 5s window was sometimes shorter than the actual popup arrival time,
-        # so the click silently fell through to the direct-goto fallback
-        # which is the corruption path. 15s gives the handshake real room.
-        try:
-            with page.expect_popup(timeout=15000) as popup_info:
-                self._click_locator(locator)
-            popup = popup_info.value
-            popup.wait_for_load_state("domcontentloaded", timeout=60000)
-            popup.wait_for_timeout(2500)
-            return popup
-        except PlaywrightTimeoutError:
-            pass
-        except Exception:
-            pass
+    # Hash-fragment route the OVE webapp navigates to when the user clicks
+    # the condition-report link from the detail page. The {vin} segment is
+    # the listing's VIN, OVE is the source platform marker, and
+    # conditionInformation is the route name. The fragment is what the
+    # OVE React router watches; window.location only updates the hash, so
+    # waiting on full navigation events does not work — we have to poll
+    # the URL fragment instead.
+    _CR_HASH_ROUTE_RE = re.compile(
+        r"#/details/[^/]+/[A-Z]+/conditionInformation", re.IGNORECASE
+    )
 
-        # No popup arrived. Try a direct click-and-navigate on the same page.
-        # The caller will look at source_page.url to detect whether this
-        # navigated successfully or not.
+    def _click_condition_report_locator(self, page: Page, locator: Locator) -> Page | None:
+        # The OVE detail page handles the CR-link click client-side via its
+        # React router. There is NO popup, NO new tab, NO OAuth handshake
+        # the scraper can intercept — only an in-page hash-route change to
+        # #/details/{vin}/OVE/conditionInformation. The previous code spent
+        # 15 seconds waiting for a popup that never arrived, then fell into
+        # a buggy fallback. We now skip the popup wait entirely and watch
+        # for the hash-route navigation directly.
+        original_url = page.url or ""
         try:
             self._click_locator(locator)
-            page.wait_for_load_state("domcontentloaded", timeout=60000)
-            page.wait_for_timeout(2500)
-        except Exception:
+        except Exception as exc:
+            LOGGER.warning("CR locator click raised: %s", exc)
             return None
+
+        # Poll for the hash-route navigation. We do NOT use page.expect_navigation
+        # here because pure hash changes do not always fire navigation events
+        # in Playwright reliably across Chromium versions; polling is the
+        # robust path. Total budget: 20 seconds.
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            try:
+                current_url = page.url or ""
+            except Exception:
+                current_url = ""
+            if self._CR_HASH_ROUTE_RE.search(current_url):
+                # Hash route confirmed. Give the OVE React app a moment to
+                # mount the CR view's container, then return.
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except PlaywrightTimeoutError:
+                    pass
+                return page
+            page.wait_for_timeout(250)
+
+        # Hash route never appeared. Maybe the click did nothing, or maybe
+        # the click navigated SOMEWHERE other than the OVE-internal CR view
+        # (e.g., a popup or auth redirect). Check page.url one more time —
+        # if it changed at all, surface that to the caller so the auth
+        # detector can flag it; otherwise return None to trigger the retry.
+        try:
+            final_url = page.url or ""
+        except Exception:
+            final_url = ""
+        if final_url and final_url != original_url:
+            LOGGER.warning(
+                "CR click navigated to unexpected URL %s (expected hash route, original=%s)",
+                final_url,
+                original_url,
+            )
+            # Returning the page lets the caller's auth-redirect check fire
+            # if we landed on a Manheim sign-in page.
+            return page
+        return None
+
+    def _wait_for_cr_gallery_stable(self, page: Page) -> None:
+        """Wait for the OVE-internal CR image gallery to finish loading.
+
+        Polls every 500ms for up to 30 seconds. Returns as soon as:
+          (a) the count of Manheim-CDN <img> elements is stable across two
+              consecutive polls, AND
+          (b) if the page text contains a gallery widget hint like "1 of N"
+              or "VIEWING ALL N", the count is at least N.
+
+        We do NOT raise on timeout — the pre-push validator (rule 3 in
+        deep_scrape._validate_cr_payload_or_raise) will refuse the push if
+        the gallery hint says N images and we captured zero. Returning
+        without an exception lets the snapshot proceed and lets that
+        downstream guard render a clean failure log instead of a Playwright
+        timeout traceback.
+        """
+        deadline = time.monotonic() + 30.0
+        previous_count = -1
+        stable_polls = 0
+        target_count: int | None = None
+        last_count = 0
+        while time.monotonic() < deadline:
+            try:
+                count_payload = page.evaluate(
+                    """
+                    () => {
+                      const imgs = Array.from(document.querySelectorAll("img"))
+                        .filter((img) => /images\\.cdn\\.manheim\\.com/i.test(img.currentSrc || img.src || ""));
+                      const text = document.body ? document.body.innerText : "";
+                      return { count: imgs.length, text: text || "" };
+                    }
+                    """
+                )
+            except Exception as exc:
+                LOGGER.debug("CR gallery poll evaluate failed: %s", exc)
+                page.wait_for_timeout(500)
+                continue
+            if not isinstance(count_payload, dict):
+                page.wait_for_timeout(500)
+                continue
+            count = int(count_payload.get("count") or 0)
+            last_count = count
+            if target_count is None:
+                text = str(count_payload.get("text") or "")
+                target_count = self._extract_gallery_target_count(text)
+                if target_count is not None:
+                    LOGGER.info(
+                        "CR gallery target count detected from page text: %s",
+                        target_count,
+                    )
+            if count == previous_count and count > 0:
+                stable_polls += 1
+            else:
+                stable_polls = 1 if count > 0 else 0
+            previous_count = count
+            target_satisfied = target_count is None or count >= target_count
+            if stable_polls >= 2 and target_satisfied:
+                LOGGER.info(
+                    "CR gallery stable at %s images (target=%s)",
+                    count,
+                    target_count if target_count is not None else "unknown",
+                )
+                return
+            page.wait_for_timeout(500)
+        LOGGER.warning(
+            "CR gallery did not stabilize within 30s (last_count=%s, target=%s); "
+            "snapshot will proceed and the pre-push validator will gate the result",
+            last_count,
+            target_count if target_count is not None else "unknown",
+        )
+
+    @staticmethod
+    def _extract_gallery_target_count(text: str) -> int | None:
+        """Pull the expected image count out of the OVE CR gallery widget.
+
+        The widget renders strings like "1 of 17" or "VIEWING ALL 17". We
+        prefer the "of N" form because it is the most universally present
+        marker in the OVE CR view. The "VIEWING ALL N" form appears only
+        after the user toggles the gallery to show every image.
+        """
+        if not text:
+            return None
+        # "1 of 17" — the "of N" widget. Constrain N to >= 2 because a
+        # single-image listing legitimately has no gallery counter.
+        m = re.search(r"\b\d+\s*of\s*([2-9]|\d{2,})\b", text, re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                pass
+        # "VIEWING ALL 17"
+        m = re.search(r"viewing\s+all\s+([2-9]|\d{2,})\b", text, re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                pass
         return None
 
     def _snapshot_page(self, page: Page, base_path: Path) -> dict[str, Any]:
