@@ -9,6 +9,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
 from zoneinfo import ZoneInfo
@@ -32,6 +33,22 @@ EASTERN_TZ = ZoneInfo("America/New_York")
 # Scheduler "stop" can drain in-flight work cleanly instead of being
 # killed mid-scrape and leaving claims dangling on the VPS.
 SHUTDOWN_EVENT = threading.Event()
+
+# Shared mutable heartbeat state. The main loop updates these fields as
+# it observes new events (sync_ok, poll_ok, claim taken, etc); the
+# background heartbeat ticker reads them every 30s and POSTs them to
+# the VPS. Heartbeats CANNOT be coupled to poll/sync ticks because the
+# hourly sync holds the OveAutomationLock for many minutes and would
+# block heartbeats long enough to trip the VPS health endpoint to
+# warning (5 min) and critical (15 min) while real work is in progress.
+_HEARTBEAT_STATE: dict[str, Any] = {
+    "last_sync_at": None,
+    "last_poll_at": None,
+    "last_claim_at": None,
+    "pending_claims": None,
+    "status_note": "starting",
+}
+_HEARTBEAT_INTERVAL_SECONDS = 30
 
 
 def _utc_now_iso() -> str:
@@ -85,12 +102,6 @@ def main() -> None:
     logger = configure_logging(settings.log_level, settings.log_file_path)
     _install_signal_handlers(logger)
     browser, api_client, sync_runner, deep_scrape_worker, notifier = build_runtime(settings, logger)
-    # Track the most-recent successful sync timestamp so heartbeats can
-    # report it to the VPS health endpoint. Initialized lazily on the
-    # first successful sync; remains None until then so the VPS can tell
-    # "scraper running but never synced" from "scraper synced X minutes ago".
-    last_sync_at_iso: str | None = None
-    last_poll_at_iso: str | None = None
 
     try:
         with KeepAwake(logger):
@@ -129,7 +140,22 @@ def main() -> None:
             next_sync_at = 0.0
             next_poll_at = 0.0
             next_keepalive_at = 0.0
+            # Heartbeat ticker is INDEPENDENT of poll/sync. The hourly
+            # sync can hold the OveAutomationLock for up to 30 minutes,
+            # during which the polling tick is skipped by the busy-lock
+            # path — so a heartbeat coupled to polling would let the VPS
+            # /health endpoint trip warning (5min) and critical (15min)
+            # while the scraper is doing real work. Heartbeats are pure
+            # HTTP, never touch the browser, never need the lock; we
+            # tick them every 30s on their own clock.
             next_heartbeat_at = 0.0
+            heartbeat_thread = threading.Thread(
+                target=_heartbeat_ticker,
+                args=(api_client, settings, logger),
+                name="ove-heartbeat-ticker",
+                daemon=True,
+            )
+            heartbeat_thread.start()
 
             while not SHUTDOWN_EVENT.is_set():
                 try:
@@ -146,15 +172,8 @@ def main() -> None:
                                 notifier=notifier,
                             )
                             if sync_result is not None and getattr(sync_result, "execution_status", None) == "Success":
-                                last_sync_at_iso = _utc_now_iso()
-                                send_heartbeat(
-                                    api_client,
-                                    settings,
-                                    logger,
-                                    last_sync_at=last_sync_at_iso,
-                                    last_poll_at=last_poll_at_iso,
-                                    status_note="snapshot_ok",
-                                )
+                                _HEARTBEAT_STATE["last_sync_at"] = _utc_now_iso()
+                                _HEARTBEAT_STATE["status_note"] = "snapshot_ok"
                             next_sync_at = now + settings.sync_interval_seconds
                         else:
                             pause_seconds = seconds_until_next_sync_window(settings)
@@ -176,22 +195,14 @@ def main() -> None:
                             deep_scrape_worker=deep_scrape_worker,
                             notifier=notifier,
                         )
-                        last_poll_at_iso = _utc_now_iso()
-                        send_heartbeat(
-                            api_client,
-                            settings,
-                            logger,
-                            last_sync_at=last_sync_at_iso,
-                            last_poll_at=last_poll_at_iso,
-                            last_claim_at=last_poll_at_iso if poll_result else None,
-                            pending_claims=len(poll_result) if isinstance(poll_result, list) else 0,
-                            status_note="poll_ok",
-                        )
+                        _HEARTBEAT_STATE["last_poll_at"] = _utc_now_iso()
+                        if isinstance(poll_result, list) and poll_result:
+                            _HEARTBEAT_STATE["last_claim_at"] = _HEARTBEAT_STATE["last_poll_at"]
+                            _HEARTBEAT_STATE["pending_claims"] = len(poll_result)
+                        else:
+                            _HEARTBEAT_STATE["pending_claims"] = 0
+                        _HEARTBEAT_STATE["status_note"] = "poll_ok"
                         next_poll_at = now + settings.deep_scrape_poll_interval_seconds
-                        # Polling triggers an explicit heartbeat above, so
-                        # the periodic heartbeat doesn't need to fire again
-                        # in the next ~30s. Defer it.
-                        next_heartbeat_at = now + 60
 
                     if SHUTDOWN_EVENT.is_set():
                         break
@@ -206,21 +217,6 @@ def main() -> None:
                             notifier=notifier,
                         )
                         next_keepalive_at = now + settings.browser_keepalive_interval_seconds
-
-                    if now >= next_heartbeat_at:
-                        # Periodic-only safety net: if neither poll nor sync
-                        # fired in the last 60s (e.g., paused outside sync
-                        # window AND poll deferred), still emit a liveness
-                        # heartbeat so the VPS health endpoint stays green.
-                        send_heartbeat(
-                            api_client,
-                            settings,
-                            logger,
-                            last_sync_at=last_sync_at_iso,
-                            last_poll_at=last_poll_at_iso,
-                            status_note="idle_tick",
-                        )
-                        next_heartbeat_at = now + 60
 
                     # Wait on the shutdown event instead of a plain sleep so
                     # SIGINT/SIGTERM/SIGBREAK wake the loop within 1s.
@@ -237,6 +233,10 @@ def main() -> None:
                     browser, api_client, sync_runner, deep_scrape_worker, notifier = build_runtime(settings, logger)
             logger.info("Shutdown event observed; exiting main loop cleanly")
     finally:
+        # Make sure SHUTDOWN_EVENT is set so the background heartbeat
+        # ticker exits its sleep promptly. Already set if we got here
+        # via signal, but defensive against the crash-and-rethrow path.
+        SHUTDOWN_EVENT.set()
         try:
             released = deep_scrape_worker.release_in_flight_claims()
             if released:
@@ -244,12 +244,15 @@ def main() -> None:
         except Exception as exc:
             logger.warning("Failed to release in-flight claims on shutdown: %s", exc)
         try:
+            _HEARTBEAT_STATE["status_note"] = "shutting_down"
             send_heartbeat(
                 api_client,
                 settings,
                 logger,
-                last_sync_at=last_sync_at_iso,
-                last_poll_at=last_poll_at_iso,
+                last_sync_at=_HEARTBEAT_STATE.get("last_sync_at"),
+                last_poll_at=_HEARTBEAT_STATE.get("last_poll_at"),
+                last_claim_at=_HEARTBEAT_STATE.get("last_claim_at"),
+                pending_claims=_HEARTBEAT_STATE.get("pending_claims"),
                 status_note="shutting_down",
             )
         except Exception:
@@ -318,6 +321,48 @@ def send_heartbeat(
             logger.debug("Heartbeat to VPS returned None (transient or non-200)")
     except Exception as exc:
         logger.debug("Heartbeat call raised unexpectedly: %s", exc)
+
+
+def _heartbeat_ticker(api_client: VCHApiClient, settings: Settings, logger) -> None:
+    """Background daemon thread that POSTs a heartbeat every
+    _HEARTBEAT_INTERVAL_SECONDS based on the latest _HEARTBEAT_STATE.
+
+    This is decoupled from the main loop's poll/sync ticks because the
+    hourly sync grabs the OveAutomationLock for many minutes, and the
+    polling tick is gated through the same lock — so a heartbeat coupled
+    to polling would not fire during a long sync run, tripping the VPS
+    health endpoint to warning (5min) then critical (15min) while real
+    work is in progress.
+
+    Heartbeats are pure HTTP, never touch the browser, never need the
+    lock. The thread is a daemon so it dies automatically with the
+    process; the SHUTDOWN_EVENT wake unblocks it for clean exit.
+    """
+    logger.info("Heartbeat ticker started (interval=%ss)", _HEARTBEAT_INTERVAL_SECONDS)
+    # Send one heartbeat immediately so the VPS sees the new boot quickly
+    # instead of waiting for the first interval to expire.
+    send_heartbeat(
+        api_client,
+        settings,
+        logger,
+        last_sync_at=_HEARTBEAT_STATE.get("last_sync_at"),
+        last_poll_at=_HEARTBEAT_STATE.get("last_poll_at"),
+        last_claim_at=_HEARTBEAT_STATE.get("last_claim_at"),
+        pending_claims=_HEARTBEAT_STATE.get("pending_claims"),
+        status_note=_HEARTBEAT_STATE.get("status_note") or "ticker_boot",
+    )
+    while not SHUTDOWN_EVENT.wait(timeout=_HEARTBEAT_INTERVAL_SECONDS):
+        send_heartbeat(
+            api_client,
+            settings,
+            logger,
+            last_sync_at=_HEARTBEAT_STATE.get("last_sync_at"),
+            last_poll_at=_HEARTBEAT_STATE.get("last_poll_at"),
+            last_claim_at=_HEARTBEAT_STATE.get("last_claim_at"),
+            pending_claims=_HEARTBEAT_STATE.get("pending_claims"),
+            status_note=_HEARTBEAT_STATE.get("status_note"),
+        )
+    logger.info("Heartbeat ticker exiting on shutdown event")
 
 
 def run_poll_once_with_recovery(
