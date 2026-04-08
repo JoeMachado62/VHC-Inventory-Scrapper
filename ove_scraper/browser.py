@@ -15,6 +15,13 @@ class ListingNotFoundError(BrowserSessionError):
     """Raised when a VIN cannot be found in the live OVE search results."""
 
 
+class ManheimAuthRedirectError(BrowserSessionError):
+    """Raised when a Manheim navigation lands on auth.manheim.com instead of the
+    expected condition-report page. Indicates the OAuth handshake failed and
+    the captured DOM is the login screen, not vehicle data. Treat as a hard
+    failure — pushing the captured payload would corrupt the VPS."""
+
+
 @dataclass(slots=True)
 class DeepScrapeResult:
     images: list[str] = field(default_factory=list)

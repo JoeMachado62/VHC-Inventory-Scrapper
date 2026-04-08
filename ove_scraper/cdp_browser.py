@@ -18,7 +18,12 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-from ove_scraper.browser import BrowserSessionError, DeepScrapeResult, ListingNotFoundError
+from ove_scraper.browser import (
+    BrowserSessionError,
+    DeepScrapeResult,
+    ListingNotFoundError,
+    ManheimAuthRedirectError,
+)
 from ove_scraper.condition_report_normalizer import normalize_condition_report
 from ove_scraper.config import Settings
 from ove_scraper.cr_parsers import identify_report_family
@@ -1437,11 +1442,28 @@ class PlaywrightCdpBrowserSession:
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page: Page | None = None
         try:
-            page = self._open_condition_report_page(source_page, context, href)
+            page = self._open_condition_report_page(source_page, context, href, artifact_dir)
             if page is None:
                 return None
-            return self._snapshot_page(page, artifact_dir / "condition-report")
-        except Exception:
+            snapshot = self._snapshot_page(page, artifact_dir / "condition-report")
+            # Defense in depth: even after the popup/click navigation
+            # appears to succeed, double-check the captured page is not an
+            # auth redirect. This protects against new OAuth failure modes
+            # we have not seen yet, and against quirks where a page redirects
+            # AFTER domcontentloaded but BEFORE we extract content.
+            self._raise_if_auth_redirect(page, artifact_dir, "post_snapshot", href)
+            return snapshot
+        except ManheimAuthRedirectError:
+            # Let auth-redirect errors propagate so the worker can route them
+            # via /fail with auth_expired (or pre-push validation can hard-stop
+            # the entire CR push). DO NOT swallow.
+            raise
+        except Exception as exc:
+            LOGGER.warning(
+                "Condition report capture failed (non-auth) for %s: %s",
+                href,
+                exc,
+            )
             return None
         finally:
             if page is not None and page is not source_page:
@@ -1452,23 +1474,122 @@ class PlaywrightCdpBrowserSession:
                 except Exception:
                     pass
 
-    def _open_condition_report_page(self, source_page: Page, context: BrowserContext, href: str) -> Page | None:
+    def _open_condition_report_page(
+        self,
+        source_page: Page,
+        context: BrowserContext,
+        href: str,
+        artifact_dir: Path,
+    ) -> Page | None:
+        # The click-driven popup path is the ONLY path that goes through the
+        # Manheim OAuth handshake correctly. The direct goto fallback skips
+        # the handshake and lands on the login page, which is the silent
+        # data-corruption bug we are explicitly fixing here. So:
+        #   1. Try the popup-click path with retries.
+        #   2. Only fall back to direct goto if NO locator was ever found
+        #      (structural failure on the OVE side).
+        #   3. After every navigation, verify we are not on auth.manheim.com.
         locator = self._find_condition_report_locator(source_page)
         if locator is not None:
-            original_url = source_page.url
-            popup_page = self._click_condition_report_locator(source_page, locator)
-            if popup_page is not None:
-                LOGGER.info("Opened condition report in popup from OVE detail page")
-                return popup_page
-            if source_page.url != original_url or "auth.manheim.com" in (source_page.url or "").lower():
-                LOGGER.info("Condition report click navigated the OVE detail page directly to %s", source_page.url)
-                return source_page
+            for attempt in range(2):
+                if attempt > 0:
+                    # Re-resolve the locator on retry — the popup attempt may
+                    # have rebuilt the DOM and the prior handle could be stale.
+                    locator = self._find_condition_report_locator(source_page)
+                    if locator is None:
+                        break
+                original_url = source_page.url
+                popup_page = self._click_condition_report_locator(source_page, locator)
+                if popup_page is not None:
+                    LOGGER.info(
+                        "Opened condition report in popup from OVE detail page (attempt %s)",
+                        attempt + 1,
+                    )
+                    self._raise_if_auth_redirect(popup_page, artifact_dir, "popup_click", href)
+                    return popup_page
+                if source_page.url != original_url:
+                    LOGGER.info(
+                        "Condition report click navigated the OVE detail page directly to %s",
+                        source_page.url,
+                    )
+                    self._raise_if_auth_redirect(source_page, artifact_dir, "in_page_nav", href)
+                    return source_page
+                LOGGER.warning(
+                    "Condition report click attempt %s did not produce a navigation; will retry",
+                    attempt + 1,
+                )
 
-        LOGGER.info("Falling back to direct condition report navigation for %s", href)
+        LOGGER.warning(
+            "Falling back to direct condition report navigation for %s. This path skips the "
+            "Manheim OAuth handshake and may land on a login page; the post-goto auth check will "
+            "raise if that happens.",
+            href,
+        )
         page = context.new_page()
         page.goto(href, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2500)
+        self._raise_if_auth_redirect(page, artifact_dir, "direct_goto", href)
         return page
+
+    def _is_manheim_auth_page(self, page: Page) -> bool:
+        try:
+            url = (page.url or "").lower()
+        except Exception:
+            url = ""
+        if "auth.manheim.com" in url or "/as/authorization" in url:
+            return True
+        try:
+            title = (page.title() or "").strip().lower()
+        except Exception:
+            title = ""
+        if title == "sign in" or title == "log in" or title == "login":
+            return True
+        return False
+
+    def _raise_if_auth_redirect(
+        self,
+        page: Page,
+        artifact_dir: Path,
+        navigation_label: str,
+        intended_href: str,
+    ) -> None:
+        if not self._is_manheim_auth_page(page):
+            return
+        captured_url = ""
+        captured_title = ""
+        try:
+            captured_url = page.url or ""
+        except Exception:
+            pass
+        try:
+            captured_title = page.title() or ""
+        except Exception:
+            pass
+        # Save the auth page DOM and a screenshot so a follow-up debugging
+        # session can see exactly which OAuth step failed (state token
+        # missing, cookie expired, referer wrong, etc).
+        try:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            html_path = artifact_dir / f"auth-redirect-{navigation_label}.html"
+            screenshot_path = artifact_dir / f"auth-redirect-{navigation_label}.png"
+            html_path.write_text(page.content(), encoding="utf-8")
+            page.screenshot(path=str(screenshot_path), full_page=True)
+            LOGGER.error(
+                "Manheim auth redirect detected during %s; saved debug artifacts to %s and %s",
+                navigation_label,
+                html_path,
+                screenshot_path,
+            )
+        except Exception as artifact_exc:
+            LOGGER.error(
+                "Manheim auth redirect detected during %s; failed to save debug artifact: %s",
+                navigation_label,
+                artifact_exc,
+            )
+        raise ManheimAuthRedirectError(
+            f"Condition report navigation ({navigation_label}) landed on Manheim auth page "
+            f"instead of {intended_href}: url={captured_url} title={captured_title!r}"
+        )
 
     def _find_condition_report_locator(self, page: Page) -> Locator | None:
         locators = [
@@ -1486,8 +1607,13 @@ class PlaywrightCdpBrowserSession:
         return None
 
     def _click_condition_report_locator(self, page: Page, locator: Locator) -> Page | None:
+        # The popup-expect window must be long enough that the OAuth
+        # handshake has time to complete on slow connections. The previous
+        # 5s window was sometimes shorter than the actual popup arrival time,
+        # so the click silently fell through to the direct-goto fallback
+        # which is the corruption path. 15s gives the handshake real room.
         try:
-            with page.expect_popup(timeout=5000) as popup_info:
+            with page.expect_popup(timeout=15000) as popup_info:
                 self._click_locator(locator)
             popup = popup_info.value
             popup.wait_for_load_state("domcontentloaded", timeout=60000)
@@ -1498,6 +1624,9 @@ class PlaywrightCdpBrowserSession:
         except Exception:
             pass
 
+        # No popup arrived. Try a direct click-and-navigate on the same page.
+        # The caller will look at source_page.url to detect whether this
+        # navigated successfully or not.
         try:
             self._click_locator(locator)
             page.wait_for_load_state("domcontentloaded", timeout=60000)

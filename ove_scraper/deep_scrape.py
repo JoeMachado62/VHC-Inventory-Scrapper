@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -10,7 +11,13 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from ove_scraper.api_client import ApiClientError, VCHApiClient
-from ove_scraper.browser import BrowserSession, BrowserSessionError, DeepScrapeResult, ListingNotFoundError
+from ove_scraper.browser import (
+    BrowserSession,
+    BrowserSessionError,
+    DeepScrapeResult,
+    ListingNotFoundError,
+    ManheimAuthRedirectError,
+)
 from ove_scraper.config import Settings
 from ove_scraper.schemas import DetailImage, ListingSnapshot, PendingDetailRequest
 
@@ -112,6 +119,12 @@ class DeepScrapeWorker:
                     return None
             payload = redact_detail(detail, request, self.settings)
             self._write_payload_artifact(request.vin, "detail-payload.json", payload)
+            # Defense-in-depth pre-push validation. Refuses to push payloads
+            # that look like silent CR-capture failures (auth redirects,
+            # zero-image CRs masquerading as success, wrong page captured).
+            # Without this guard the prior bug pushed Manheim sign-in pages
+            # to the VPS as if they were real condition reports.
+            self._validate_cr_payload_or_raise(request, payload)
             self.logger.info(
                 "Posting OVE detail payload for request_id=%s vin=%s images=%s has_condition_report=%s",
                 request.request_id,
@@ -185,6 +198,10 @@ class DeepScrapeWorker:
                 )
                 return None
         except (ApiClientError, BrowserSessionError, ValueError) as exc:
+            # ManheimAuthRedirectError is a BrowserSessionError subclass and
+            # is therefore caught here. _classify_failure routes it to
+            # auth_expired which is the correct retry semantics per
+            # SCRAPER_CONTRACT.md §5.1 (60s backoff after re-login).
             if isinstance(exc, ApiClientError) and self._is_terminal_missing_vehicle_error(exc):
                 self._terminal_claimed_request(
                     api_client,
@@ -442,6 +459,8 @@ class DeepScrapeWorker:
 
     def _classify_failure(self, exc: Exception) -> str:
         lowered = str(exc).lower()
+        if isinstance(exc, ManheimAuthRedirectError):
+            return "auth_expired"
         if isinstance(exc, BrowserSessionError):
             if "login page" in lowered or "not authenticated" in lowered or "auth.manheim" in lowered:
                 return "auth_expired"
@@ -474,6 +493,108 @@ class DeepScrapeWorker:
             return False
         lowered = str(exc).lower()
         return "status 422" in lowered or "status 400" in lowered
+
+    def _validate_cr_payload_or_raise(
+        self,
+        request: PendingDetailRequest,
+        payload: dict[str, object],
+    ) -> None:
+        """Refuse to push payloads that look like silent CR-capture failures.
+
+        This is the failsafe behind the Manheim auth-redirect detection in
+        cdp_browser.py. Even if a new auth failure mode lands on a page that
+        the upstream detector doesn't recognize, this guard inspects the
+        captured CR metadata one last time before the data hits the VPS, and
+        raises a ValueError loud enough to be visible in the failure logs and
+        routed via the standard /fail path.
+
+        Validation rules:
+          1. If the captured condition_report metadata reports a Manheim auth
+             URL or a "Sign In" page title, the capture is corrupt.
+          2. If the listing_snapshot metadata's nested condition_report_page
+             carries the same auth markers, ditto.
+          3. If a condition_report block exists but the merged image list is
+             empty AND the report_page's body_text contains the gallery hint
+             "of N" suggesting N>1 images were expected, the capture missed
+             every image — treat as failure.
+
+        Rule 3 is intentionally conservative. We do NOT yet enforce a
+        minimum image count for general CRs because some legitimate listings
+        have very few images; only obvious zero-vs-many mismatches fail here.
+        Tightening that bound is item P2 in the fix plan, after we have real
+        post-fix telemetry.
+        """
+        cr_block = payload.get("condition_report")
+        listing_snapshot = payload.get("listing_snapshot") or {}
+        snapshot_metadata = (
+            listing_snapshot.get("metadata", {}) if isinstance(listing_snapshot, dict) else {}
+        )
+        report_page = (
+            snapshot_metadata.get("condition_report_page") if isinstance(snapshot_metadata, dict) else None
+        )
+        if not isinstance(report_page, dict):
+            report_page = {}
+
+        # Rule 1+2: auth-URL / sign-in title in captured CR metadata.
+        candidate_urls: list[str] = []
+        candidate_titles: list[str] = []
+        for source in (cr_block, report_page):
+            if isinstance(source, dict):
+                meta = source.get("metadata") if "metadata" in source else None
+                report_page_in_cr = (
+                    meta.get("report_page") if isinstance(meta, dict) else None
+                )
+                if isinstance(report_page_in_cr, dict):
+                    candidate_urls.append(str(report_page_in_cr.get("url") or ""))
+                    candidate_titles.append(str(report_page_in_cr.get("title") or ""))
+                candidate_urls.append(str(source.get("url") or ""))
+                candidate_titles.append(str(source.get("title") or ""))
+
+        for url in candidate_urls:
+            lowered = url.lower()
+            if "auth.manheim.com" in lowered or "/as/authorization" in lowered:
+                self._write_payload_artifact(
+                    request.vin,
+                    "validation-failure-auth-redirect.json",
+                    payload,
+                )
+                raise ValueError(
+                    f"Refusing to push CR for VIN {request.vin}: captured page URL is "
+                    f"a Manheim auth redirect ({url}); upstream OAuth handshake failed"
+                )
+        for title in candidate_titles:
+            lowered = title.strip().lower()
+            if lowered in {"sign in", "log in", "login"}:
+                self._write_payload_artifact(
+                    request.vin,
+                    "validation-failure-signin-title.json",
+                    payload,
+                )
+                raise ValueError(
+                    f"Refusing to push CR for VIN {request.vin}: captured page title is "
+                    f"{title!r}; CR capture landed on a login page"
+                )
+
+        # Rule 3: zero images on a CR page that advertises a multi-image
+        # gallery. The "of N" / "1 of N" string is the OVE/Manheim gallery
+        # counter widget — if it's present and N>1, we should have captured
+        # at least one vehicle image.
+        images = payload.get("images") or []
+        if isinstance(cr_block, dict) and not images:
+            body_text = ""
+            if isinstance(report_page, dict):
+                body_text = str(report_page.get("body_text") or "")
+            advertises_gallery = bool(re.search(r"\b(?:1\s*of|of)\s*([2-9]|\d{2,})\b", body_text, re.IGNORECASE))
+            if advertises_gallery:
+                self._write_payload_artifact(
+                    request.vin,
+                    "validation-failure-empty-gallery.json",
+                    payload,
+                )
+                raise ValueError(
+                    f"Refusing to push CR for VIN {request.vin}: condition report present but "
+                    "image gallery is empty while page text advertises a multi-image gallery"
+                )
 
     def _retry_delay_for_not_found(self, reason: object) -> int:
         if reason == "ims_refresh_window":
