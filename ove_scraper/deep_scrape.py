@@ -34,6 +34,14 @@ class DeepScrapeWorker:
         self.settings = settings
         self._not_found_tracker_path = self.settings.artifact_dir / "_state" / "not_found_tracker.json"
         self._parallel_warning_emitted = False
+        # Process-local cooldown keyed by request_id. Whenever a request fails or
+        # is terminal-resolved, we record the monotonic timestamp at which it
+        # becomes eligible for re-processing locally. This prevents the worker
+        # from immediately re-claiming and re-failing the same request_id while
+        # the VPS retry backoff is still in effect — the bug behind the prior
+        # 3.5-hour /fail hot loop. Independent of the VPS-side `next_retry_at`
+        # filter (which is correct but cannot react instantly to a 409 race).
+        self._fail_cooldown: dict[str, float] = {}
 
     def process_pending_once(self) -> list[str]:
         self.logger.info(
@@ -42,11 +50,13 @@ class DeepScrapeWorker:
             max(1, self.settings.deep_scrape_max_workers),
             self.settings.deep_scrape_lease_seconds,
         )
-        requests = self._dedupe_requests(
-            self.api_client.claim_pending_detail_requests(
-                worker_id=self.settings.detail_worker_id,
-                limit=max(1, self.settings.deep_scrape_max_workers),
-                lease_seconds=self.settings.deep_scrape_lease_seconds,
+        requests = self._filter_requests_ready(
+            self._dedupe_requests(
+                self.api_client.claim_pending_detail_requests(
+                    worker_id=self.settings.detail_worker_id,
+                    limit=max(1, self.settings.deep_scrape_max_workers),
+                    lease_seconds=self.settings.deep_scrape_lease_seconds,
+                )
             )
         )
         if not requests:
@@ -190,6 +200,23 @@ class DeepScrapeWorker:
                     exc,
                 )
                 return request.vin
+            if self._is_terminal_validation_error(exc):
+                # 422/400 from the VPS — payload is permanently unacceptable.
+                # Send to /terminal so we never retry. Closest matching reason
+                # in SCRAPER_CONTRACT.md §5.2 is unsupported_listing_type.
+                self._terminal_claimed_request(
+                    api_client,
+                    request,
+                    reason="unsupported_listing_type",
+                    message=str(exc),
+                )
+                self.logger.error(
+                    "Detail request %s for VIN %s rejected by VPS as permanently invalid; resolved as terminal: %s",
+                    request.request_id,
+                    request.vin,
+                    exc,
+                )
+                return request.vin
             retry_after_seconds = self.settings.deep_scrape_retry_delay_seconds
             self._fail_claimed_request(
                 api_client,
@@ -198,7 +225,7 @@ class DeepScrapeWorker:
                 error_message=str(exc),
                 retry_after_seconds=retry_after_seconds,
             )
-            self.logger.error("Deep scrape failed for %s: %s", request.vin, exc)
+            self.logger.error("Deep scrape failed for %s: %s", request.vin, exc, exc_info=True)
             self.logger.warning(
                 "Released claimed detail request %s for VIN %s back to VPS with retry_after_seconds=%s",
                 request.request_id,
@@ -289,7 +316,35 @@ class DeepScrapeWorker:
         return unique
 
     def _filter_requests_ready(self, requests: list[PendingDetailRequest]) -> list[PendingDetailRequest]:
-        return requests
+        if not self._fail_cooldown:
+            return requests
+        now = time.monotonic()
+        # Drop expired cooldown entries so the dict can't grow forever in a
+        # long-running process. Done on every poll cycle so the cleanup cost is
+        # bounded by the number of in-flight requests.
+        expired = [request_id for request_id, eligible_at in self._fail_cooldown.items() if eligible_at <= now]
+        for request_id in expired:
+            self._fail_cooldown.pop(request_id, None)
+        ready: list[PendingDetailRequest] = []
+        for request in requests:
+            eligible_at = self._fail_cooldown.get(request.request_id)
+            if eligible_at is not None and eligible_at > now:
+                self.logger.info(
+                    "Skipping detail request %s for VIN %s; in local fail cooldown for %.0fs more",
+                    request.request_id,
+                    request.vin,
+                    eligible_at - now,
+                )
+                continue
+            ready.append(request)
+        return ready
+
+    def _record_fail_cooldown(self, request: PendingDetailRequest, retry_after_seconds: int) -> None:
+        # Always honor at least the VPS-suggested backoff, but never less than
+        # one minute. The lower bound stops a misconfigured retry_after of 0
+        # from defeating the cooldown entirely.
+        backoff = max(60, int(retry_after_seconds))
+        self._fail_cooldown[request.request_id] = time.monotonic() + backoff
 
     def _fail_claimed_request(
         self,
@@ -300,6 +355,12 @@ class DeepScrapeWorker:
         error_message: str,
         retry_after_seconds: int,
     ) -> None:
+        # Record the local cooldown BEFORE the API call. If the call raises or
+        # returns a race-y 409, we still want this worker to back off locally
+        # for at least the requested duration. Without this the prior bug
+        # caused the same request_id to be re-claimed and re-failed every
+        # ~6 minutes for hours.
+        self._record_fail_cooldown(request, retry_after_seconds)
         try:
             api_client.fail_detail_request(
                 request.request_id,
@@ -309,6 +370,18 @@ class DeepScrapeWorker:
                 retry_after_seconds=retry_after_seconds,
             )
         except ApiClientError as fail_exc:
+            if self._is_already_resolved_conflict(fail_exc):
+                # The VPS has already moved this request out of CLAIMED — most
+                # commonly because the detail POST safety net auto-completed
+                # it (see SCRAPER_CONTRACT.md §3.6). This is the expected
+                # outcome of a successful detail push, NOT a worker-side
+                # error. Treat as already resolved.
+                self.logger.info(
+                    "Detail request %s for VIN %s already resolved on VPS (likely auto-completed by detail POST); local fail no-op",
+                    request.request_id,
+                    request.vin,
+                )
+                return
             self.logger.error(
                 "Failed to release claimed detail request %s for VIN %s back to VPS: %s",
                 request.request_id,
@@ -324,6 +397,9 @@ class DeepScrapeWorker:
         reason: str,
         message: str,
     ) -> None:
+        # Terminal resolutions also get a long local cooldown so a 409 race
+        # cannot bring the request back into the worker's poll loop.
+        self._record_fail_cooldown(request, 24 * 60 * 60)
         try:
             api_client.terminal_detail_request(
                 request.request_id,
@@ -332,6 +408,13 @@ class DeepScrapeWorker:
                 message=message,
             )
         except ApiClientError as terminal_exc:
+            if self._is_already_resolved_conflict(terminal_exc):
+                self.logger.info(
+                    "Detail request %s for VIN %s already resolved on VPS (likely auto-completed by detail POST); local terminal no-op",
+                    request.request_id,
+                    request.vin,
+                )
+                return
             self.logger.error(
                 "Failed to terminal-resolve claimed detail request %s for VIN %s: %s",
                 request.request_id,
@@ -339,17 +422,39 @@ class DeepScrapeWorker:
                 terminal_exc,
             )
 
+    def _is_already_resolved_conflict(self, exc: Exception) -> bool:
+        # Detect the VPS 409 response that means "this request is no longer
+        # in CLAIMED state". Per the contract this is what the VPS returns
+        # when the detail POST already auto-completed the request, or another
+        # worker re-claimed an expired lease and finished it.
+        lowered = str(exc).lower()
+        if "status 409" not in lowered:
+            return False
+        return any(
+            marker in lowered
+            for marker in (
+                "is not currently claimed",
+                "status=completed",
+                "status=terminal",
+                "not in claimed state",
+            )
+        )
+
     def _classify_failure(self, exc: Exception) -> str:
         lowered = str(exc).lower()
         if isinstance(exc, BrowserSessionError):
-            if "login page" in lowered or "not authenticated" in lowered:
+            if "login page" in lowered or "not authenticated" in lowered or "auth.manheim" in lowered:
                 return "auth_expired"
             if "too many requests" in lowered or "rate limit" in lowered or "captcha" in lowered:
                 return "rate_limited"
+            if "temporarily" in lowered or "not yet" in lowered:
+                return "temporarily_unavailable"
             return "browser_error"
         if isinstance(exc, ApiClientError):
             if "status 429" in lowered or "rate limit" in lowered:
                 return "rate_limited"
+            if "status 5" in lowered:
+                return "transient_network"
             return "transient_network"
         if isinstance(exc, ValueError):
             return "page_structure_changed"
@@ -358,6 +463,17 @@ class DeepScrapeWorker:
     def _is_terminal_missing_vehicle_error(self, exc: Exception) -> bool:
         lowered = str(exc).lower()
         return "status 404" in lowered and "vehicle not found" in lowered
+
+    def _is_terminal_validation_error(self, exc: Exception) -> bool:
+        # 422 from the VPS means the payload structurally cannot be accepted
+        # (bad VIN format, schema violation, etc). Retrying with the same
+        # input cannot succeed, so this must go to /terminal, not /fail.
+        # Without this routing the prior bug caused the launcher to crash on
+        # repeated unhandled ApiClientErrors when a malformed VIN was queued.
+        if not isinstance(exc, ApiClientError):
+            return False
+        lowered = str(exc).lower()
+        return "status 422" in lowered or "status 400" in lowered
 
     def _retry_delay_for_not_found(self, reason: object) -> int:
         if reason == "ims_refresh_window":

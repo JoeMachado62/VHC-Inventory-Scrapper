@@ -354,7 +354,9 @@ class PlaywrightCdpBrowserSession:
         seed_page = self._get_ove_page(browser.contexts)
         page = self._create_worker_page(seed_page.context, start_url=self._vin_results_url())
         try:
+            LOGGER.info("Stage open_listing: starting for VIN %s", vin)
             detail_page, result_card_report_link = self._open_listing_for_vin(page, vin, artifact_dir)
+            LOGGER.info("Stage extract_payload: starting for VIN %s", vin)
             payload = detail_page.evaluate(
                 DETAIL_EXTRACTION_SCRIPT.replace("ROOT_SELECTOR", json.dumps(self.settings.ove_section_root_selector))
             )
@@ -366,6 +368,11 @@ class PlaywrightCdpBrowserSession:
             condition_report_link = self._select_valid_condition_report_link(
                 result_card_report_link,
                 payload.get("condition_report_link"),
+            )
+            LOGGER.info(
+                "Stage capture_condition_report: starting for VIN %s (link present=%s)",
+                vin,
+                bool(condition_report_link),
             )
             report_page_payload = self._capture_condition_report_page(browser, detail_page, condition_report_link, artifact_dir)
             report_page_text = report_page_payload.get("body_text") if report_page_payload else None
@@ -408,6 +415,12 @@ class PlaywrightCdpBrowserSession:
                 condition_report=condition_report,
                 seller_comments=seller_comments,
                 listing_snapshot=snapshot,
+            )
+            LOGGER.info(
+                "Stage assemble_result: complete for VIN %s (images=%d, has_condition_report=%s)",
+                vin,
+                len(images),
+                condition_report is not None,
             )
             return result
         finally:
