@@ -1,0 +1,98 @@
+from __future__ import annotations
+
+import smtplib
+import ssl
+import time
+from email.message import EmailMessage
+from typing import Any
+
+
+class AdminNotifier:
+    def __init__(
+        self,
+        *,
+        smtp_host: str = "",
+        smtp_port: int = 587,
+        smtp_username: str = "",
+        smtp_password: str = "",
+        smtp_use_tls: bool = True,
+        from_email: str = "",
+        admin_alert_email: str = "",
+        cooldown_seconds: int = 3600,
+    ) -> None:
+        self.smtp_host = smtp_host.strip()
+        self.smtp_port = smtp_port
+        self.smtp_username = smtp_username.strip()
+        self.smtp_password = smtp_password
+        self.smtp_use_tls = smtp_use_tls
+        self.from_email = from_email.strip()
+        self.admin_alert_email = admin_alert_email.strip()
+        self.cooldown_seconds = max(60, cooldown_seconds)
+        self._last_sent_by_key: dict[str, float] = {}
+
+    def notify_browser_auth_lost(self, *, reason: str, context: dict[str, Any] | None = None, logger=None) -> bool:
+        subject = "OVE scraper login required"
+        body_lines = [
+            "The OVE scraper lost its authenticated browser session and could not recover automatically.",
+            "",
+            f"Reason: {reason}",
+        ]
+        if context:
+            body_lines.append("")
+            body_lines.extend(f"{key}: {value}" for key, value in context.items())
+        body_lines.append("")
+        body_lines.append("Action required: log back into the dedicated OVE Chrome session.")
+        return self._send_with_cooldown(
+            key="browser-auth-lost",
+            subject=subject,
+            body="\n".join(body_lines),
+            logger=logger,
+        )
+
+    def _send_with_cooldown(self, *, key: str, subject: str, body: str, logger=None) -> bool:
+        if not self.is_configured():
+            if logger:
+                logger.warning("Admin notifier is not configured; skipping alert '%s'", key)
+            return False
+
+        now = time.monotonic()
+        last_sent = self._last_sent_by_key.get(key, 0.0)
+        if now - last_sent < self.cooldown_seconds:
+            if logger:
+                logger.info("Skipping alert '%s'; cooldown active", key)
+            return False
+
+        self._send_email(subject=subject, body=body)
+        self._last_sent_by_key[key] = now
+        if logger:
+            logger.warning("Sent admin alert '%s' to %s", key, self.admin_alert_email)
+        return True
+
+    def is_configured(self) -> bool:
+        return bool(
+            self.smtp_host
+            and self.from_email
+            and self.admin_alert_email
+            and (self.smtp_username or not self.smtp_password)
+        )
+
+    def _send_email(self, *, subject: str, body: str) -> None:
+        message = EmailMessage()
+        message["Subject"] = subject
+        message["From"] = self.from_email
+        message["To"] = self.admin_alert_email
+        message.set_content(body)
+
+        if self.smtp_use_tls:
+            context = ssl.create_default_context()
+            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30) as smtp:
+                smtp.starttls(context=context)
+                if self.smtp_username:
+                    smtp.login(self.smtp_username, self.smtp_password)
+                smtp.send_message(message)
+            return
+
+        with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=30) as smtp:
+            if self.smtp_username:
+                smtp.login(self.smtp_username, self.smtp_password)
+            smtp.send_message(message)

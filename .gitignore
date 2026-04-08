@@ -1,0 +1,16 @@
+.env
+.venv/
+.cache/
+.codex_pytest_cache/
+.codex_pytest_tmp/
+.pytest_cache/
+.pytest_tmp/
+.tmp/
+artifacts/
+exports/
+logs/
+ove_scraper.egg-info/
+pytest-cache-files-*/
+tmp*/
+__pycache__/
+*.pyc

@@ -1,0 +1,175 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class VehiclePayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    vin: str
+    year: int
+    make: str
+    model: str
+    trim: str | None = None
+    body_type: str | None = None
+    sub_body_type: str | None = None
+    engine_type: str | None = None
+    cylinders: int | None = None
+    forced_induction: str | None = None
+    drivetrain: str | None = None
+    mpg_combined: float | None = None
+    ev_range: int | None = None
+    towing_capacity_lbs: int | None = None
+    odometer: int | None = None
+    condition_grade: str | None = None
+    price_asking: float
+    price_wholesale_est: float | None = None
+    location_zip: str | None = None
+    location_state: str | None = None
+    listing_id: str | None = None
+    source_type: str = "ove"
+    source_platform: str
+    source_url: str | None = None
+    images: list[str] = Field(default_factory=list)
+    features_raw: list[str] = Field(default_factory=list)
+    features_normalized: dict[str, Any] = Field(default_factory=dict)
+    available: bool = True
+    ove_listing_timestamp: datetime | None = None
+    last_seen_active: datetime | None = None
+    quality_firewall_pass: bool = True
+
+    @field_validator("vin")
+    @classmethod
+    def validate_vin(cls, value: str) -> str:
+        vin = value.strip().upper()
+        if len(vin) != 17:
+            raise ValueError("vin must be 17 characters")
+        return vin
+
+    @field_validator("location_state")
+    @classmethod
+    def normalize_state(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        state = value.strip().upper()
+        return state or None
+
+
+class SyncMetadata(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    east_hub_record_count: int = 0
+    west_hub_record_count: int = 0
+    duplicates_removed: int = 0
+    skipped_no_vin: int = 0
+    scraper_node_id: str
+    scraper_version: str
+    source_platform: str | None = None
+    saved_search_names: list[str] = Field(default_factory=list)
+    completed_saved_search_names: list[str] = Field(default_factory=list)
+    expected_saved_search_count: int = 0
+    completed_saved_search_count: int = 0
+    missing_saved_search_names: list[str] = Field(default_factory=list)
+    full_snapshot: bool = False
+    snapshot_mode: str | None = None
+    verified_complete_snapshot: bool = False
+    upload_mode: str | None = None
+    replace_existing_snapshot: bool = False
+    single_batch_upload: bool = False
+
+
+class IngestPayload(BaseModel):
+    vehicles: list[VehiclePayload]
+    sync_metadata: SyncMetadata
+
+
+class ConditionReport(BaseModel):
+    overall_grade: str | None = None
+    structural_damage: bool | None = None
+    paint_condition: str | None = None
+    interior_condition: str | None = None
+    tire_condition: str | None = None
+    announcements: list[str] = Field(default_factory=list)
+    remarks: list[str] = Field(default_factory=list)
+    seller_comments_items: list[str] = Field(default_factory=list)
+    title_status: str | None = None
+    title_state: str | None = None
+    title_branding: str | None = None
+    tire_depths: dict[str, Any] = Field(default_factory=dict)
+    damage_items: list[dict[str, Any]] = Field(default_factory=list)
+    mechanical_findings: list[dict[str, Any]] = Field(default_factory=list)
+    diagnostic_codes: list[str] = Field(default_factory=list)
+    damage_summary: dict[str, Any] = Field(default_factory=dict)
+    vehicle_history: dict[str, Any] = Field(default_factory=dict)
+    problem_highlights: list[str] = Field(default_factory=list)
+    severity_summary: str | None = None
+    ai_summary: str | None = None
+    raw_text: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DetailImage(BaseModel):
+    url: str
+    role: str = "gallery"
+    display_order: int = 0
+    is_primary: bool = False
+    source_image_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ListingSnapshot(BaseModel):
+    title: str | None = None
+    subtitle: str | None = None
+    badges: list[dict[str, Any]] = Field(default_factory=list)
+    hero_facts: list[dict[str, Any]] = Field(default_factory=list)
+    sections: list[dict[str, Any]] = Field(default_factory=list)
+    icons: list[dict[str, Any]] = Field(default_factory=list)
+    page_url: str | None = None
+    screenshot_refs: list[str] = Field(default_factory=list)
+    raw_html_ref: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DetailPayload(BaseModel):
+    source_platform: str
+    images: list[DetailImage] = Field(default_factory=list)
+    condition_report: ConditionReport | None = None
+    seller_comments: str | None = None
+    listing_snapshot: ListingSnapshot | None = None
+    sync_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class PendingDetailRequest(BaseModel):
+    request_id: str
+    vin: str
+    source_platform: str
+    status: str = "CLAIMED"
+    priority: int = 100
+    attempts: int = 0
+    requested_at: datetime
+    claimed_at: datetime | None = None
+    lease_expires_at: datetime | None = None
+    last_polled_at: datetime | None = None
+    request_source: str | None = None
+    requested_by: str | None = None
+    reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SyncExecutionLog(BaseModel):
+    timestamp: datetime = Field(default_factory=utc_now)
+    execution_status: str
+    east_hub_record_count: int = 0
+    west_hub_record_count: int = 0
+    duplicates_removed: int = 0
+    skipped_no_vin: int = 0
+    api_push_status: str = "Skipped"
+    api_response: dict[str, Any] = Field(default_factory=dict)
+    error_details: list[str] = Field(default_factory=list)

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ove-scraper"
+version = "0.1.0"
+description = "Standalone OVE sync agent for Virtual CarHub."
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27,<1.0",
+  "pydantic>=2.8,<3.0",
+  "playwright>=1.53,<2.0",
+  "pgeocode>=0.5,<0.6",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2,<9.0",
+]
+
+[project.scripts]
+ove-scraper = "ove_scraper.main:main"
+
+[tool.setuptools.packages.find]
+include = ["ove_scraper*"]
+
+[tool.pytest.ini_options]
+addopts = "--basetemp=./.pytest_tmp"

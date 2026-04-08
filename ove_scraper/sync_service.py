@@ -1,0 +1,168 @@
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any
+
+from ove_scraper.api_client import ApiClientError, VCHApiClient
+from ove_scraper.browser import BrowserSession, BrowserSessionError
+from ove_scraper.config import Settings
+from ove_scraper.csv_transform import TransformResult, load_csv_rows, transform_rows
+from ove_scraper.logging_utils import append_sync_log
+from ove_scraper.schemas import SyncExecutionLog
+
+
+@dataclass(slots=True)
+class BatchResult:
+    responses: list[dict[str, Any]]
+    db_records_added: int = 0
+    db_records_updated: int = 0
+    db_records_skipped_priority: int = 0
+
+
+@dataclass(slots=True)
+class ExportGroupResult:
+    rows: list[dict[str, str]]
+    total_count: int
+    completed_searches: tuple[str, ...]
+
+
+class HourlySyncRunner:
+    def __init__(
+        self,
+        settings: Settings,
+        browser: BrowserSession,
+        api_client: VCHApiClient,
+        logger: logging.Logger,
+    ) -> None:
+        self.settings = settings
+        self.browser = browser
+        self.api_client = api_client
+        self.logger = logger
+
+    def run_once(self) -> SyncExecutionLog:
+        execution_log = SyncExecutionLog(execution_status="Failure")
+        try:
+            if not self.api_client.check_health():
+                raise ApiClientError("VCH API unreachable")
+
+            resolved_searches = self.resolve_saved_searches()
+            expected_search_count = self.settings.ove_required_search_count
+            if len(resolved_searches) != expected_search_count:
+                raise BrowserSessionError(
+                    f"Expected {expected_search_count} saved searches for a complete snapshot, found {len(resolved_searches)}"
+                )
+
+            east_searches = tuple(name for name in resolved_searches if "east" in name.lower())
+            west_searches = tuple(name for name in resolved_searches if "west" in name.lower())
+
+            east_export = self.export_search_group(east_searches)
+            west_export = self.export_search_group(west_searches)
+            completed_searches = east_export.completed_searches + west_export.completed_searches
+            missing_searches = [name for name in resolved_searches if name not in completed_searches]
+            if missing_searches:
+                raise BrowserSessionError(
+                    "Saved-search export incomplete; missing "
+                    f"{len(missing_searches)} of {len(resolved_searches)} searches: {', '.join(missing_searches)}"
+                )
+
+            east_rows, east_count = east_export.rows, east_export.total_count
+            west_rows, west_count = west_export.rows, west_export.total_count
+            transformed = transform_rows(
+                east_rows + west_rows,
+                source_platform=self.settings.ove_source_platform,
+            )
+
+            execution_log.east_hub_record_count = east_count
+            execution_log.west_hub_record_count = west_count
+            execution_log.duplicates_removed = transformed.duplicates_removed
+            execution_log.skipped_no_vin = transformed.skipped_no_vin
+            execution_log.error_details.extend(transformed.errors)
+
+            if not transformed.vehicles:
+                raise ValueError("No valid vehicles available for ingest")
+
+            sync_metadata = {
+                "east_hub_record_count": east_count,
+                "west_hub_record_count": west_count,
+                "duplicates_removed": transformed.duplicates_removed,
+                "skipped_no_vin": transformed.skipped_no_vin,
+                "scraper_node_id": self.settings.scraper_node_id,
+                "scraper_version": self.settings.scraper_version,
+                "source_platform": self.settings.ove_source_platform,
+                "saved_search_names": list(resolved_searches),
+                "completed_saved_search_names": list(completed_searches),
+                "expected_saved_search_count": len(resolved_searches),
+                "completed_saved_search_count": len(completed_searches),
+                "missing_saved_search_names": [],
+                "full_snapshot": True,
+                "snapshot_mode": "full_replace",
+                "verified_complete_snapshot": True,
+                "upload_mode": "single_batch_replace",
+                "replace_existing_snapshot": True,
+                "single_batch_upload": True,
+            }
+
+            batch_result = self.push_snapshot(transformed, sync_metadata)
+            execution_log.api_response = {
+                "inserted": batch_result.db_records_added,
+                "updated": batch_result.db_records_updated,
+                "skipped_priority": batch_result.db_records_skipped_priority,
+                "batches": batch_result.responses,
+            }
+            execution_log.api_push_status = "Success"
+            execution_log.execution_status = "Success"
+            return execution_log
+        except (ApiClientError, BrowserSessionError, ValueError) as exc:
+            execution_log.api_push_status = "Failure"
+            execution_log.error_details.append(str(exc))
+            self.logger.error("Hourly sync failed: %s", exc)
+            return execution_log
+        finally:
+            append_sync_log(self.settings.log_file_path, execution_log)
+
+    def export_search_group(self, search_names: tuple[str, ...]) -> ExportGroupResult:
+        rows: list[dict[str, str]] = []
+        total_count = 0
+        completed_searches: list[str] = []
+        for search_name in search_names:
+            csv_path = self.browser.export_saved_search(search_name, self.settings.export_dir)
+            exported_rows = load_csv_rows(csv_path)
+            if not exported_rows:
+                raise BrowserSessionError(f"Saved search '{search_name}' exported no inventory rows")
+            rows.extend(exported_rows)
+            total_count += len(exported_rows)
+            completed_searches.append(search_name)
+        return ExportGroupResult(
+            rows=rows,
+            total_count=total_count,
+            completed_searches=tuple(completed_searches),
+        )
+
+    def resolve_saved_searches(self) -> tuple[str, ...]:
+        configured = self.settings.ove_east_searches + self.settings.ove_west_searches
+        try:
+            discovered = self.browser.list_saved_searches()
+            if discovered:
+                self.logger.info("Discovered %s saved searches from OVE", len(discovered))
+                return discovered
+        except BrowserSessionError as exc:
+            self.logger.warning("Saved-search discovery failed; falling back to configured search names: %s", exc)
+
+        if not configured:
+            raise BrowserSessionError("No configured saved searches available for hourly sync fallback")
+        self.logger.warning("Using configured saved-search fallback list with %s entries", len(configured))
+        return configured
+
+    def push_snapshot(self, transformed: TransformResult, sync_metadata: dict[str, Any]) -> BatchResult:
+        vehicles = [vehicle.model_dump(mode="json") for vehicle in transformed.vehicles]
+        response = self.api_client.push_ove_ingest(vehicles, sync_metadata)
+        data = response.get("data", {})
+        return BatchResult(
+            responses=[response],
+            db_records_added=int(data.get("inserted", data.get("db_records_added", 0))),
+            db_records_updated=int(data.get("updated", data.get("db_records_updated", 0))),
+            db_records_skipped_priority=int(
+                data.get("skipped_priority", data.get("db_records_skipped_priority", 0))
+            ),
+        )
