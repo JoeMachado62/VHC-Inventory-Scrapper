@@ -150,8 +150,6 @@ def main() -> None:
 def build_runtime(settings: Settings, logger):
     browser = PlaywrightCdpBrowserSession(settings)
     api_client = VCHApiClient(settings.vch_api_base_url, settings.vch_service_token)
-    sync_runner = HourlySyncRunner(settings, browser, api_client, logger)
-    deep_scrape_worker = DeepScrapeWorker(api_client, browser, logger, settings)
     notifier = AdminNotifier(
         smtp_host=settings.smtp_host,
         smtp_port=settings.smtp_port,
@@ -162,6 +160,8 @@ def build_runtime(settings: Settings, logger):
         admin_alert_email=settings.admin_alert_email,
         cooldown_seconds=settings.admin_alert_cooldown_seconds,
     )
+    sync_runner = HourlySyncRunner(settings, browser, api_client, logger, notifier=notifier)
+    deep_scrape_worker = DeepScrapeWorker(api_client, browser, logger, settings)
     logger.info("Configured deep-scrape worker pool size: %s", settings.deep_scrape_max_workers)
     return browser, api_client, sync_runner, deep_scrape_worker, notifier
 
@@ -174,7 +174,7 @@ def run_sync_once_with_recovery(
     sync_runner: HourlySyncRunner | None = None,
     notifier: AdminNotifier | None = None,
 ) -> None:
-    runner = sync_runner or HourlySyncRunner(settings, browser, api_client, logger)
+    runner = sync_runner or HourlySyncRunner(settings, browser, api_client, logger, notifier=notifier)
     run_browser_operation(settings, browser, logger, runner.run_once, "hourly sync", notifier=notifier)
 
 

@@ -329,9 +329,25 @@ class PlaywrightCdpBrowserSession:
         page = self._open_dedicated_ove_page(browser)
         target_path = export_dir / f"{slugify(search_name)}.csv"
         last_error: Exception | None = None
+        max_attempts = max(1, getattr(self.settings, "ove_export_max_attempts", 5))
 
         try:
-            for attempt in range(3):
+            for attempt in range(max_attempts):
+                # Linear backoff between attempts: 0s, 3s, 6s, 9s, 12s.
+                # Short enough that the hourly sync still completes inside
+                # its window, long enough that an OVE backend hiccup or a
+                # render race has time to settle.
+                if attempt > 0:
+                    backoff_seconds = min(15, attempt * 3)
+                    LOGGER.info(
+                        "Saved-search export retry %s/%s for '%s' in %ss after error: %s",
+                        attempt + 1,
+                        max_attempts,
+                        search_name,
+                        backoff_seconds,
+                        last_error,
+                    )
+                    page.wait_for_timeout(backoff_seconds * 1000)
                 try:
                     self._remove_file_if_present(target_path)
                     self._open_saved_search(page, search_name)
@@ -341,14 +357,75 @@ class PlaywrightCdpBrowserSession:
                 except (BrowserSessionError, PlaywrightTimeoutError) as exc:
                     last_error = exc
 
-                page.goto(self._saved_searches_url(), wait_until="domcontentloaded")
-                page.wait_for_timeout(1500)
+                try:
+                    page.goto(self._saved_searches_url(), wait_until="domcontentloaded")
+                    page.wait_for_timeout(1500)
+                except Exception as nav_exc:
+                    LOGGER.warning(
+                        "Failed to reset page to saved-searches between export retries: %s",
+                        nav_exc,
+                    )
         finally:
+            # Capture debug artifacts BEFORE closing the page so a follow-up
+            # debugging session can see what OVE actually rendered when the
+            # export failed. Only fired on the failure path; the success
+            # path skips this entirely.
+            if last_error is not None:
+                self._capture_export_failure_artifacts(page, search_name, last_error)
             self._close_page(page)
 
         if last_error is None:
             raise BrowserSessionError(f"Could not export saved search '{search_name}'")
-        raise BrowserSessionError(str(last_error))
+        raise BrowserSessionError(
+            f"Could not export saved search '{search_name}' after {max_attempts} attempts: {last_error}"
+        )
+
+    def _capture_export_failure_artifacts(
+        self,
+        page: Page,
+        search_name: str,
+        last_error: Exception,
+    ) -> None:
+        try:
+            timestamp = time.strftime("%Y%m%dT%H%M%S")
+            slug = slugify(search_name)
+            failure_dir = self.settings.artifact_dir / "sync-failures" / f"{timestamp}-{slug}"
+            failure_dir.mkdir(parents=True, exist_ok=True)
+            html_path = failure_dir / "saved-search-page.html"
+            screenshot_path = failure_dir / "saved-search-page.png"
+            error_path = failure_dir / "error.txt"
+            try:
+                html_path.write_text(page.content(), encoding="utf-8")
+            except Exception as exc:
+                LOGGER.warning("Could not capture failure HTML for '%s': %s", search_name, exc)
+            try:
+                page.screenshot(path=str(screenshot_path), full_page=True)
+            except Exception as exc:
+                LOGGER.warning("Could not capture failure screenshot for '%s': %s", search_name, exc)
+            try:
+                error_path.write_text(
+                    f"Search: {search_name}\nLast error: {last_error}\n",
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+            LOGGER.error(
+                "Saved debug artifacts for failed export of '%s' to %s",
+                search_name,
+                failure_dir,
+            )
+            # Stash the directory on the exception so the sync layer can
+            # forward it to the notifier without re-deriving the path.
+            try:
+                setattr(last_error, "debug_artifact_dir", str(failure_dir))
+            except Exception:
+                pass
+        except Exception as outer_exc:
+            LOGGER.error(
+                "Failed to capture export failure artifacts for '%s': %s",
+                search_name,
+                outer_exc,
+            )
 
     def deep_scrape_vin(self, vin: str) -> DeepScrapeResult:
         self.ensure_session()

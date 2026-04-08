@@ -70,6 +70,13 @@ class Settings:
     scraper_version: str = "0.1.0"
     export_dir: Path = Path("./exports")
     artifact_dir: Path = Path("./artifacts")
+    data_dir: Path = Path("./data")
+    # Snapshot safety gate: refuse to push the new merged snapshot if it has
+    # fewer than this percentage of the rows in the last successfully pushed
+    # snapshot. Prevents a partial OVE export from clobbering the live VPS DB.
+    # Set to 0 to disable the gate entirely (NOT recommended).
+    ove_ingest_size_threshold_pct: int = 75
+    ove_export_max_attempts: int = 5
     log_level: str = "INFO"
     log_file_path: Path = Path("./logs/ove_scraper.log")
     enabled: bool = True
@@ -131,6 +138,9 @@ class Settings:
             scraper_version=os.getenv("SCRAPER_VERSION", "0.1.0"),
             export_dir=Path(os.getenv("EXPORT_DIR", "./exports")),
             artifact_dir=Path(os.getenv("ARTIFACT_DIR", "./artifacts")),
+            data_dir=Path(os.getenv("DATA_DIR", "./data")),
+            ove_ingest_size_threshold_pct=_get_int("OVE_INGEST_SIZE_THRESHOLD_PCT", 75),
+            ove_export_max_attempts=_get_int("OVE_EXPORT_MAX_ATTEMPTS", 5),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             log_file_path=Path(os.getenv("LOG_FILE_PATH", "./logs/ove_scraper.log")),
             enabled=_get_bool("OVE_SYNC_ENABLED", True),

@@ -49,6 +49,72 @@ class AdminNotifier:
             logger=logger,
         )
 
+    def notify_snapshot_safety_gate_blocked(
+        self,
+        *,
+        proposed_count: int,
+        last_count: int,
+        threshold_pct: int,
+        context: dict[str, Any] | None = None,
+        logger=None,
+    ) -> bool:
+        subject = "OVE scraper REFUSED to push undersized snapshot"
+        body_lines = [
+            "The OVE inventory sync produced a merged snapshot that fell below the safety threshold.",
+            "The push to the VPS was BLOCKED to prevent the live inventory from being clobbered by",
+            "a partial / broken OVE export. The current VPS inventory is unchanged.",
+            "",
+            f"Proposed row count:        {proposed_count}",
+            f"Last successful row count: {last_count}",
+            f"Required threshold:        {threshold_pct}% ({int(last_count * threshold_pct / 100)} rows minimum)",
+        ]
+        if context:
+            body_lines.append("")
+            body_lines.extend(f"{key}: {value}" for key, value in context.items())
+        body_lines.append("")
+        body_lines.append(
+            "Action required: investigate why the OVE export shrank. Check the saved-search "
+            "exports manually, look at logs/ove_scraper.log for selector / DOM warnings, and "
+            "re-run sync-once after the cause is resolved."
+        )
+        return self._send_with_cooldown(
+            key="snapshot-safety-gate-blocked",
+            subject=subject,
+            body="\n".join(body_lines),
+            logger=logger,
+        )
+
+    def notify_export_failed(
+        self,
+        *,
+        search_name: str,
+        attempts: int,
+        last_error: str,
+        debug_artifact_dir: str,
+        logger=None,
+    ) -> bool:
+        subject = f"OVE scraper export FAILED for saved search '{search_name}'"
+        body_lines = [
+            "The OVE inventory sync failed to export a saved search after exhausting all retries.",
+            "The hourly sync has been aborted because the merged snapshot would be incomplete.",
+            "",
+            f"Saved search:   {search_name}",
+            f"Attempts:       {attempts}",
+            f"Last error:     {last_error}",
+            f"Debug artifacts: {debug_artifact_dir}",
+            "",
+            "Action required: open the debug HTML / screenshot to see what the OVE saved-search",
+            "page looked like at failure time. Likely causes: OVE UI selector change, the saved",
+            "search has been deleted in OVE, the saved search is genuinely empty, or the dedicated",
+            "OVE Chrome profile has been logged out.",
+        ]
+        return self._send_with_cooldown(
+            key=f"export-failed:{search_name}",
+            subject=subject,
+            body="\n".join(body_lines),
+            logger=logger,
+        )
+
     def _send_with_cooldown(self, *, key: str, subject: str, body: str, logger=None) -> bool:
         if not self.is_configured():
             if logger:
