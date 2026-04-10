@@ -151,7 +151,7 @@ def main() -> None:
             next_heartbeat_at = 0.0
             heartbeat_thread = threading.Thread(
                 target=_heartbeat_ticker,
-                args=(api_client, settings, logger),
+                args=(settings, logger),
                 name="ove-heartbeat-ticker",
                 daemon=True,
             )
@@ -174,7 +174,12 @@ def main() -> None:
                             if sync_result is not None and getattr(sync_result, "execution_status", None) == "Success":
                                 _HEARTBEAT_STATE["last_sync_at"] = _utc_now_iso()
                                 _HEARTBEAT_STATE["status_note"] = "snapshot_ok"
-                            next_sync_at = now + settings.sync_interval_seconds
+                            wait_seconds = seconds_until_next_scheduled_sync(settings)
+                            next_sync_at = now + wait_seconds
+                            logger.info(
+                                "Next OVE saved-searches sync scheduled in %.0f seconds",
+                                wait_seconds,
+                            )
                         else:
                             pause_seconds = seconds_until_next_sync_window(settings)
                             logger.info(
@@ -323,45 +328,47 @@ def send_heartbeat(
         logger.debug("Heartbeat call raised unexpectedly: %s", exc)
 
 
-def _heartbeat_ticker(api_client: VCHApiClient, settings: Settings, logger) -> None:
+def _heartbeat_ticker(settings: Settings, logger) -> None:
     """Background daemon thread that POSTs a heartbeat every
     _HEARTBEAT_INTERVAL_SECONDS based on the latest _HEARTBEAT_STATE.
 
-    This is decoupled from the main loop's poll/sync ticks because the
-    hourly sync grabs the OveAutomationLock for many minutes, and the
-    polling tick is gated through the same lock — so a heartbeat coupled
-    to polling would not fire during a long sync run, tripping the VPS
-    health endpoint to warning (5min) then critical (15min) while real
-    work is in progress.
-
-    Heartbeats are pure HTTP, never touch the browser, never need the
-    lock. The thread is a daemon so it dies automatically with the
-    process; the SHUTDOWN_EVENT wake unblocks it for clean exit.
+    IMPORTANT: this thread creates its OWN lightweight httpx client for
+    heartbeats instead of sharing the main loop's VCHApiClient. This is
+    critical because the main loop's crash-recovery path tears down the
+    old api_client and builds a new one — if the ticker held a reference
+    to the old client, every heartbeat after a crash-recovery would fail
+    on a closed connection. The standalone client is cheap (one POST
+    every 30s) and immune to the main-loop rebuild cycle.
     """
+    import httpx as _httpx
+
     logger.info("Heartbeat ticker started (interval=%ss)", _HEARTBEAT_INTERVAL_SECONDS)
-    # Send one heartbeat immediately so the VPS sees the new boot quickly
-    # instead of waiting for the first interval to expire.
-    send_heartbeat(
-        api_client,
-        settings,
-        logger,
-        last_sync_at=_HEARTBEAT_STATE.get("last_sync_at"),
-        last_poll_at=_HEARTBEAT_STATE.get("last_poll_at"),
-        last_claim_at=_HEARTBEAT_STATE.get("last_claim_at"),
-        pending_claims=_HEARTBEAT_STATE.get("pending_claims"),
-        status_note=_HEARTBEAT_STATE.get("status_note") or "ticker_boot",
-    )
+    base_url = settings.vch_api_base_url.rstrip("/")
+    headers = {"X-Service-Token": settings.vch_service_token, "Content-Type": "application/json"}
+    endpoint = f"{base_url}/inventory/ove/scraper-heartbeat"
+
+    def _tick(note_override: str | None = None) -> None:
+        body: dict[str, Any] = {
+            "worker_id": settings.detail_worker_id,
+            "profile": settings.scraper_profile_slug,
+            "scraper_version": settings.scraper_version,
+            "node_id": settings.scraper_node_id,
+        }
+        for key in ("last_sync_at", "last_poll_at", "last_claim_at", "pending_claims"):
+            val = _HEARTBEAT_STATE.get(key)
+            if val is not None:
+                body[key] = val
+        body["status_note"] = note_override or _HEARTBEAT_STATE.get("status_note") or "ticker"
+        try:
+            resp = _httpx.post(endpoint, json=body, headers=headers, timeout=10.0)
+            if resp.status_code >= 400:
+                logger.debug("Heartbeat tick returned %s", resp.status_code)
+        except Exception as exc:
+            logger.debug("Heartbeat tick failed: %s", exc)
+
+    _tick(note_override="ticker_boot")
     while not SHUTDOWN_EVENT.wait(timeout=_HEARTBEAT_INTERVAL_SECONDS):
-        send_heartbeat(
-            api_client,
-            settings,
-            logger,
-            last_sync_at=_HEARTBEAT_STATE.get("last_sync_at"),
-            last_poll_at=_HEARTBEAT_STATE.get("last_poll_at"),
-            last_claim_at=_HEARTBEAT_STATE.get("last_claim_at"),
-            pending_claims=_HEARTBEAT_STATE.get("pending_claims"),
-            status_note=_HEARTBEAT_STATE.get("status_note"),
-        )
+        _tick()
     logger.info("Heartbeat ticker exiting on shutdown event")
 
 
@@ -483,6 +490,34 @@ def seconds_until_next_sync_window(settings: Settings, now: datetime | None = No
         target = start_today
     else:
         target = start_today + timedelta(days=1)
+    return max(1.0, (target - current).total_seconds())
+
+
+def seconds_until_next_scheduled_sync(
+    settings: Settings, now: datetime | None = None
+) -> float:
+    """Return seconds from `now` until the next wall-clock slot in
+    `settings.sync_schedule_eastern`. If no slot remains today, roll to the
+    first slot tomorrow. Clamped to >= 1.0 so the main loop never busy-loops.
+    """
+    current = now or datetime.now(EASTERN_TZ)
+    slots = settings.sync_schedule_eastern
+    if not slots:
+        # Defensive: empty schedule should never happen, but if it does,
+        # fall back to the legacy interval so the loop still makes progress.
+        return float(settings.sync_interval_seconds)
+    today_slots = [
+        current.replace(hour=h, minute=m, second=0, microsecond=0)
+        for h, m in slots
+    ]
+    future_today = [slot for slot in today_slots if slot > current]
+    if future_today:
+        target = future_today[0]
+    else:
+        first_h, first_m = slots[0]
+        target = (current + timedelta(days=1)).replace(
+            hour=first_h, minute=first_m, second=0, microsecond=0
+        )
     return max(1.0, (target - current).total_seconds())
 
 
