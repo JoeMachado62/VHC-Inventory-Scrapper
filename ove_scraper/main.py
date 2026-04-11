@@ -409,8 +409,9 @@ def ensure_browser_session(settings: Settings, browser, logger, notifier: AdminN
 
 def recover_browser_session(settings: Settings, browser, logger, notifier: AdminNotifier | None = None) -> None:
     browser.close()
+    _kill_stale_chrome(settings, logger)
     launch_browser_script(logger)
-    wait_for_cdp(settings, logger)
+    wait_for_cdp(settings, logger, timeout_seconds=45)
     try:
         browser.ensure_session()
     except BrowserSessionError as exc:
@@ -425,6 +426,36 @@ def recover_browser_session(settings: Settings, browser, logger, notifier: Admin
                 logger=logger,
             )
         raise
+
+
+def _kill_stale_chrome(settings: Settings, logger) -> None:
+    """Kill any Chrome process using the CDP profile that is no longer
+    listening on the debug port. Belt-and-suspenders with the TCP check
+    in start_ove_browser.ps1 — this Python-side kill runs BEFORE the
+    PS1 script so the script's 'existing process' check sees a clean
+    state. Failures here are non-fatal; the PS1 script's own check is
+    the fallback.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-Command",
+                (
+                    "Get-CimInstance Win32_Process | "
+                    "Where-Object { $_.Name -eq 'chrome.exe' -and "
+                    "$_.CommandLine -like '*--remote-debugging-port=9222*' -and "
+                    "$_.CommandLine -like '*chrome-cdp-profile*' } | "
+                    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+                ),
+            ],
+            capture_output=True,
+            timeout=15,
+        )
+        logger.info("Killed stale Chrome CDP processes (exit=%s)", result.returncode)
+        time.sleep(2)
+    except Exception as exc:
+        logger.warning("Failed to kill stale Chrome processes: %s", exc)
 
 
 def launch_browser_script(logger) -> None:

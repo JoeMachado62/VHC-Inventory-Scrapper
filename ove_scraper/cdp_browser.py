@@ -6,6 +6,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from playwright.sync_api import (
     Browser,
@@ -156,11 +157,33 @@ DETAIL_EXTRACTION_SCRIPT = """
       );
       const text = node.textContent?.trim() || null;
       const title = node.getAttribute?.("title") || node.getAttribute?.("aria-label") || null;
+      // Capture additional attributes that the scoring loop uses to
+      // distinguish the real CR badge from marketing footer links. The
+      // real OVE CR badge typically has empty visible text but carries
+      // data-test-id="condition-report", data-label-text="CR", and a
+      // data-value-text="<grade>". Marketing footer links have visible
+      // text like "Condition Reporting" but no test-id and no label-text.
+      const labelText = node.getAttribute?.("data-label-text") || null;
+      const valueText = node.getAttribute?.("data-value-text") || null;
+      const testId = node.getAttribute?.("data-test-id") || null;
+      const className = (node.className?.toString && node.className.toString()) || null;
       if (!href && !text) return;
-      candidates.push({ href, text, title, reason });
+      candidates.push({ href, text, title, labelText, valueText, testId, className, reason });
     };
 
-    root.querySelectorAll("a[data-test-id='condition-report'], a.VehicleReportLink__condition-report-link, a, button, [role='button']").forEach((node) => {
+    // Scan the WHOLE document, not just `root`. The OVE webapp does not
+    // render a <main> element on every detail variant; the configured root
+    // selector falls back to [role='main'] which on some VINs (verified
+    // 2026-04-09 against 1N4BL4EV2NN423240) does NOT contain the CR link
+    // element — the CR link lives in a sibling div outside the main role
+    // container. Restricting candidate collection to `root` was causing
+    // findConditionReportLink to return null even when the CR link was
+    // clearly present in the DOM (the wait_for_selector check that runs
+    // BEFORE this script does scan the whole document and was finding it).
+    // CR link elements are unique enough on the page that the scoring
+    // logic below filters out false positives without needing the root
+    // restriction.
+    document.querySelectorAll("a[data-test-id='condition-report'], a.VehicleReportLink__condition-report-link, a, button, [role='button']").forEach((node) => {
       const text = node.textContent?.trim() || "";
       const href = node.getAttribute?.("href") || "";
       const title = node.getAttribute?.("title") || node.getAttribute?.("aria-label") || "";
@@ -181,6 +204,11 @@ DETAIL_EXTRACTION_SCRIPT = """
       }
     });
 
+    // Score-pattern walk: only do this within `root` because the
+    // unrestricted whole-document version is too noisy (lots of "4.6"-style
+    // numbers in unrelated parts of the page). The score-pattern path is a
+    // fallback anyway — vehicles with a normal CR link will already be
+    // registered by the explicit-attribute pass above.
     root.querySelectorAll("*").forEach((node) => {
       const text = node.textContent?.trim() || "";
       if (!scorePattern.test(text)) return;
@@ -199,7 +227,35 @@ DETAIL_EXTRACTION_SCRIPT = """
 
     const scored = deduped.map((candidate) => {
       let score = 0;
-      const signal = `${candidate.href || ""} ${candidate.text || ""} ${candidate.title || ""}`.toLowerCase();
+      // Build the signal from EVERY attribute we have, not just href+text+title.
+      // The Nissan Altima 1N4BL4EV2NN423240 case revealed that the real CR
+      // badge has empty <a> text content (the score chip is rendered via
+      // ::before/::after CSS), so href+text+title-only signal scores it
+      // at +20 (host bonus alone) while the marketing footer link
+      // "Condition Reporting" scores +15 from text alone — the wrong
+      // candidate wins. Including className/labelText/valueText in the
+      // signal lifts the real badge well above the footer noise because
+      // its className is "VehicleReportLink__condition-report-link".
+      const signal = [
+        candidate.href || "",
+        candidate.text || "",
+        candidate.title || "",
+        candidate.labelText || "",
+        candidate.valueText || "",
+        candidate.className || "",
+        candidate.testId || "",
+      ].join(" ").toLowerCase();
+      // The single most reliable signal that this is THE CR badge (not a
+      // marketing footer link) is data-test-id="condition-report". Boost
+      // it heavily so it always wins over signal-keyword matches on links
+      // that just happen to mention "condition report" in their text.
+      if (candidate.testId === "condition-report") score += 100;
+      // data-label-text="CR" is the secondary high-confidence signal —
+      // OVE only sets this attribute on the actual CR badge element.
+      if (candidate.labelText === "CR") score += 50;
+      // The "VehicleReportLink__condition-report-link" class name is
+      // OVE-specific and only used on the real CR badge.
+      if ((candidate.className || "").includes("VehicleReportLink__condition-report-link")) score += 50;
       if ((candidate.text || "").match(scorePattern)) score += 4;
       if ((candidate.href || "").includes("inspectionreport.manheim.com")) score += 20;
       if ((candidate.href || "").includes("insightcr.manheim.com")) score += 20;
@@ -211,12 +267,38 @@ DETAIL_EXTRACTION_SCRIPT = """
       if (signal.includes("grade")) score += 2;
       if (signal.includes("/condition")) score += 6;
       if (signal.includes("/report")) score += 4;
+      // Negative signals: marketing pages and order-flow URLs are NOT
+      // CR data sources. Penalize heavily so they can never outrank a
+      // real CR badge even if their text is keyword-rich.
       if ((candidate.href || "").includes("order_condition_reports")) score -= 25;
+      if ((candidate.href || "").includes("site.manheim.com")) score -= 50;
       return { ...candidate, score };
     }).sort((a, b) => b.score - a.score);
 
-    return scored[0] || null;
+    return { result: scored[0] || null, debug: { candidate_count: candidates.length, deduped_count: deduped.length, scored_top: scored.slice(0, 3) } };
   };
+
+  // Diagnostic shape: findConditionReportLink now returns
+  // { result: <link>|null, debug: { candidate_count, deduped_count, scored_top } }
+  // so the Python side can log WHY the result is null when it shouldn't be.
+  // We also defensively check for whether the data-test-id="condition-report"
+  // anchor exists in the DOM at all at this exact moment, separately from
+  // the candidate-collection scoring path. If it does exist but the scoring
+  // returns null, the bug is in scoring; if it doesn't exist, the bug is
+  // upstream (React unmount race or wrong page).
+  const crLinkOutcome = findConditionReportLink();
+  const directProbe = (() => {
+    const direct = document.querySelector("a[data-test-id='condition-report']");
+    if (!direct) return { exists: false };
+    return {
+      exists: true,
+      href: direct.getAttribute("href") || null,
+      label_text: direct.getAttribute("data-label-text") || null,
+      value_text: direct.getAttribute("data-value-text") || null,
+      class_name: direct.className || null,
+      text_content: (direct.textContent || "").trim() || null,
+    };
+  })();
 
   return {
     title: pickText(["h1", "[class*='vehicle-title']", "[class*='listing-title']"]),
@@ -227,7 +309,9 @@ DETAIL_EXTRACTION_SCRIPT = """
     icons,
     images,
     seller_comments: pickText(["[class*='seller-comment']", "[class*='comments']", "#seller-comments"]),
-    condition_report_link: findConditionReportLink(),
+    condition_report_link: crLinkOutcome.result,
+    condition_report_link_debug: crLinkOutcome.debug,
+    condition_report_link_direct_probe: directProbe,
     page_url: window.location.href,
     body_text: root.innerText || ""
   };
@@ -258,7 +342,7 @@ class PlaywrightCdpBrowserSession:
             if self._is_login_page(page):
                 raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
             if self.settings.ove_base_url not in page.url or self._is_error_page(page):
-                page.goto(self._saved_searches_url(), wait_until="domcontentloaded")
+                page.goto(self._saved_searches_url(), wait_until="networkidle", timeout=30000)
         except Exception as exc:
             self.close()
             raise BrowserSessionError(f"OVE browser session unavailable: {exc}") from exc
@@ -268,8 +352,7 @@ class PlaywrightCdpBrowserSession:
             browser = self._connect_browser()
             page = self._open_dedicated_ove_page(browser)
             try:
-                page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(1000)
+                page.goto(self._saved_searches_url(), wait_until="networkidle", timeout=30000)
                 if self._is_login_page(page):
                     raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
             finally:
@@ -282,8 +365,11 @@ class PlaywrightCdpBrowserSession:
         browser = self._connect_browser()
         page = self._open_dedicated_ove_page(browser)
         try:
-            page.goto(self._saved_searches_url(), wait_until="domcontentloaded")
-            page.wait_for_timeout(2000)
+            page.goto(self._saved_searches_url(), wait_until="networkidle", timeout=30000)
+            try:
+                page.wait_for_selector("[data-test-id^='search name:']", timeout=15000)
+            except PlaywrightTimeoutError:
+                LOGGER.warning("Search-card elements did not render within 15s in list_saved_searches")
             names = page.evaluate(
                 """
                 () => {
@@ -359,8 +445,8 @@ class PlaywrightCdpBrowserSession:
                     last_error = exc
 
                 try:
-                    page.goto(self._saved_searches_url(), wait_until="domcontentloaded")
-                    page.wait_for_timeout(1500)
+                    page.goto(self._saved_searches_url(), wait_until="networkidle", timeout=30000)
+                    page.wait_for_selector("[data-test-id^='search name:']", timeout=15000)
                 except Exception as nav_exc:
                     LOGGER.warning(
                         "Failed to reset page to saved-searches between export retries: %s",
@@ -449,6 +535,22 @@ class PlaywrightCdpBrowserSession:
             # on timeout — VINs without a CR (rare under the East/West Hub
             # filters but possible) should still produce a useful payload.
             self._wait_for_cr_link_to_render(detail_page, timeout_ms=8000)
+            # NOTE: Earlier this session I added _wait_for_listing_gallery_to_render
+            # here, on the theory that the OVE listing panel's SimpleViewer
+            # gallery just needed time to lazy-load. Empirical test against
+            # 1N4BL4EV2NN423240 on 2026-04-09 16:06 disproved this: after
+            # 12s of polling the listing panel still had only 1 Manheim CDN
+            # image. The full image gallery for OVE listings does NOT live
+            # in the listing panel — it lives inside the CR popup, which is
+            # what the F-150 manual-rerun-payload-4 capture proved (the F-150
+            # listing.html only had the gallery because the CR popup had
+            # already been opened earlier in the session). The right strategy
+            # is to skip the listing-panel gallery wait entirely and rely on
+            # the CR popup capture as the canonical image source. The wait
+            # was removed to (a) save 12s per scrape and (b) avoid letting
+            # the OVE React app re-render the panel during the wait, which
+            # could move the CR badge between wait_for_selector and the
+            # extraction script.
             LOGGER.info("Stage extract_payload: starting for VIN %s", vin)
             payload = detail_page.evaluate(
                 DETAIL_EXTRACTION_SCRIPT.replace("ROOT_SELECTOR", json.dumps(self.settings.ove_section_root_selector))
@@ -458,14 +560,63 @@ class PlaywrightCdpBrowserSession:
             html_path.write_text(detail_page.content(), encoding="utf-8")
             detail_page.screenshot(path=str(screenshot_path), full_page=True)
 
+            # Diagnostic logging for CR link extraction. The findConditionReportLink
+            # JS now returns a debug bundle (candidate counts + scored top 3 +
+            # a direct querySelector probe) so we can see WHY the link is null
+            # when the badge appears in the saved listing.html. Empirically the
+            # Nissan Altima 1N4BL4EV2NN423240 hits this case every time despite
+            # the badge being structurally present in the saved DOM.
+            cr_link_value = payload.get("condition_report_link")
+            cr_link_debug = payload.get("condition_report_link_debug") or {}
+            cr_link_probe = payload.get("condition_report_link_direct_probe") or {}
+            if cr_link_value is None:
+                LOGGER.warning(
+                    "VIN %s: findConditionReportLink returned None. "
+                    "candidate_count=%s deduped_count=%s scored_top=%s direct_probe=%s",
+                    vin,
+                    cr_link_debug.get("candidate_count"),
+                    cr_link_debug.get("deduped_count"),
+                    cr_link_debug.get("scored_top"),
+                    cr_link_probe,
+                )
+            else:
+                # Always log the top-3 scored candidates so we can see when
+                # findConditionReportLink picks the wrong winner. The
+                # marketing footer "Condition Reporting" link bug on the
+                # Nissan Altima 1N4BL4EV2NN423240 was invisible until this
+                # diagnostic surfaced it.
+                LOGGER.info(
+                    "VIN %s: findConditionReportLink returned href=%s labelText=%s "
+                    "valueText=%s testId=%s (candidate_count=%s scored_top=%s direct_probe=%s)",
+                    vin,
+                    cr_link_value.get("href"),
+                    cr_link_value.get("labelText"),
+                    cr_link_value.get("valueText"),
+                    cr_link_value.get("testId"),
+                    cr_link_debug.get("candidate_count"),
+                    cr_link_debug.get("scored_top"),
+                    cr_link_probe,
+                )
+
             condition_report_link = self._select_valid_condition_report_link(
                 result_card_report_link,
                 payload.get("condition_report_link"),
             )
+            # Pull the full OVE listing JSON out of the detail page DOM. This
+            # is the structurally-stable source for announcements,
+            # conditionGrade, autocheck, conditionReportUrl, paint colors,
+            # and installedEquipment — none of which depend on the Manheim
+            # CR navigation succeeding. Capturing it BEFORE the CR click
+            # means we still get a usable payload even if the CR view fails
+            # to load.
+            listing_json = self._extract_ove_listing_json(detail_page)
+            if listing_json is None:
+                LOGGER.warning("Could not extract OVE listing JSON for VIN %s", vin)
             LOGGER.info(
-                "Stage capture_condition_report: starting for VIN %s (link present=%s)",
+                "Stage capture_condition_report: starting for VIN %s (link present=%s, listing_json=%s)",
                 vin,
                 bool(condition_report_link),
+                bool(listing_json),
             )
             report_page_payload = self._capture_condition_report_page(browser, detail_page, condition_report_link, artifact_dir)
             report_page_text = report_page_payload.get("body_text") if report_page_payload else None
@@ -491,6 +642,7 @@ class PlaywrightCdpBrowserSession:
                 condition_report,
                 raw_text=report_page_text or payload.get("body_text"),
                 report_link=condition_report_link,
+                listing_json=listing_json,
             )
             if condition_report and report_page_payload:
                 condition_report.metadata = {
@@ -583,7 +735,14 @@ class PlaywrightCdpBrowserSession:
         return page
 
     def _open_saved_search(self, page: Page, search_name: str) -> None:
-        page.goto(self._saved_searches_url(), wait_until="domcontentloaded")
+        page.goto(self._saved_searches_url(), wait_until="networkidle", timeout=30000)
+        try:
+            page.wait_for_selector("[data-test-id^='search name:']", timeout=15000)
+        except PlaywrightTimeoutError as exc:
+            raise BrowserSessionError(
+                "Saved search cards did not render within 15s after networkidle — "
+                "possible cold session or OVE outage"
+            ) from exc
         matched_name = self._resolve_saved_search_name(page, search_name)
         selectors = [
             f"[data-test-id='search name: {matched_name}']",
@@ -642,6 +801,15 @@ class PlaywrightCdpBrowserSession:
         return best
 
     def _collect_saved_search_names(self, page: Page) -> tuple[str, ...]:
+        # Defensive: ensure search-card elements are in the DOM before
+        # querying. The caller (_resolve_saved_search_name via
+        # _open_saved_search) should have already waited, but this method
+        # is also reachable from list_saved_searches which has its own
+        # navigation path.
+        try:
+            page.wait_for_selector("[data-test-id^='search name:']", timeout=10000)
+        except PlaywrightTimeoutError:
+            LOGGER.warning("Search-card elements not found in DOM; _collect_saved_search_names may return empty")
         names = page.evaluate(
             """
             () => {
@@ -1571,10 +1739,144 @@ class PlaywrightCdpBrowserSession:
                 except Exception:
                     pass
 
+    # Hosts that serve their CR HTML directly without bouncing through
+    # Manheim SSO. For these we use a simple context.new_page().goto(href).
+    # Empirical justification per host:
+    #
+    #   inspectionreport.manheim.com - WAUE Audi (03-19) and 5N1B Nissan
+    #     (03-26) captures both produced cleanly structured Manheim CR text
+    #     that the per-family parsers extract perfectly via direct popup
+    #     load. Accepts OVE session cookies, no SSO bounce.
+    #
+    #   mmsc400.manheim.com - Manheim Express ECR endpoint. Same pattern:
+    #     plain HTML, no SSO bounce. Has its own per-family parser
+    #     (_parse_manheim_ecr).
+    #
+    #   content.liquidmotors.com - Third-party CR provider used by some
+    #     OVE Partner Auction listings. Per user 2026-04-09: the "Auto Grade
+    #     only" saved-search filter does NOT actually exclude liquidmotors-
+    #     hosted CRs; OVE Partner Auction listings still slip through with
+    #     content.liquidmotors.com/IR/{dealer_id}/{cr_id}.html links.
+    #     Verified live against VIN 1N4BL4EV2NN423240. The href carries the
+    #     OVE session token via ?username=CIAplatform query param, so a
+    #     direct goto loads the CR HTML without an SSO bounce. Has its own
+    #     per-family parser (_parse_liquidmotors_ir at cr_parsers.py:120)
+    #     which dispatches to the inspectionreport or ECR parser based on
+    #     text markers.
+    _DIRECT_GOTO_CR_HOSTS = frozenset(
+        {
+            "inspectionreport.manheim.com",
+            "mmsc400.manheim.com",
+            "content.liquidmotors.com",
+        }
+    )
+
+    # Host that requires Manheim SSO (which the scraper has no credentials
+    # for). Direct goto on this host always 302s to auth.manheim.com and the
+    # scraper captures the login form in place of the CR. We must instead
+    # click the CR link on the OVE detail page and let the OVE webapp
+    # perform the SSO bounce server-side, which renders the CR inside an
+    # iframe at the #/details/{vin}/OVE/conditionInformation hash route.
+    _OVE_INTERNAL_CR_HOSTS = frozenset(
+        {
+            "insightcr.manheim.com",
+        }
+    )
+
     def _open_condition_report_page(
         self,
         source_page: Page,
         context: BrowserContext,
+        href: str,
+        artifact_dir: Path,
+    ) -> Page | None:
+        # Dispatch by CR-link host. The two Manheim CR providers in scope
+        # (per the "Auto Grade only" filter) require completely different
+        # navigation strategies:
+        #
+        #   inspectionreport.manheim.com / mmsc400.manheim.com (Manheim Express)
+        #     -> direct context.new_page().goto(href). Accepts OVE session
+        #        cookies, no SSO bounce, CR HTML loads cleanly.
+        #
+        #   insightcr.manheim.com
+        #     -> click the CR link on the OVE detail page and wait for the
+        #        OVE webapp's internal hash route. Direct goto on this host
+        #        ALWAYS lands on auth.manheim.com because Manheim requires
+        #        an SSO bounce that only the OVE webapp itself can perform.
+        #
+        # An earlier version of this function (commit d6136d4) deleted the
+        # direct-goto path globally to fix the insightcr auth-corruption
+        # bug, but in doing so it forced the previously-working
+        # inspectionreport vehicles through the same fragile click+hash-route
+        # flow as the broken insightcr ones. The fix is to keep the direct
+        # goto for the hosts that work with it.
+        host = ""
+        try:
+            host = (urlparse(href).netloc or "").lower()
+        except Exception:
+            host = ""
+
+        if host in self._DIRECT_GOTO_CR_HOSTS:
+            return self._open_via_direct_goto(context, href, artifact_dir)
+
+        if host in self._OVE_INTERNAL_CR_HOSTS:
+            return self._open_via_ove_internal_viewer(source_page, href, artifact_dir)
+
+        # Unknown / new host. Default to the OVE-internal viewer because it
+        # is the safer choice (server-side SSO is harmless on hosts that
+        # don't require it). Log loudly so the host can be added to the
+        # explicit dispatch table.
+        LOGGER.warning(
+            "Unknown CR host %r; defaulting to OVE-internal viewer for href=%s",
+            host,
+            href,
+        )
+        return self._open_via_ove_internal_viewer(source_page, href, artifact_dir)
+
+    def _open_via_direct_goto(
+        self,
+        context: BrowserContext,
+        href: str,
+        artifact_dir: Path,
+    ) -> Page | None:
+        # Direct popup load for inspectionreport.manheim.com /
+        # mmsc400.manheim.com. Returns the new Page on success. On failure
+        # we close the page and return None so the lease queue retries via
+        # the standard /fail flow.
+        page: Page | None = None
+        try:
+            page = context.new_page()
+            LOGGER.info("Opening CR via direct goto: %s", href)
+            page.goto(href, wait_until="domcontentloaded", timeout=30000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except PlaywrightTimeoutError:
+                # networkidle is best-effort. Manheim CR pages occasionally
+                # keep a long-lived analytics socket open; the DOM we need
+                # is already there by the time domcontentloaded fires.
+                pass
+            # Defense in depth: if Manheim ever adds an SSO bounce on a host
+            # that previously didn't need one, the auth detector at
+            # _capture_condition_report_page will catch it post-snapshot
+            # and route the request via /fail with auth_expired. We do NOT
+            # silently swallow that case here.
+            return page
+        except Exception as exc:
+            LOGGER.warning("Direct-goto CR open failed for %s: %s", href, exc)
+            if page is not None:
+                self._close_page(page)
+            try:
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                (artifact_dir / "cr-direct-goto-failed.txt").write_text(
+                    f"href={href}\nerror={exc!r}\n", encoding="utf-8"
+                )
+            except Exception:
+                pass
+            return None
+
+    def _open_via_ove_internal_viewer(
+        self,
+        source_page: Page,
         href: str,
         artifact_dir: Path,
     ) -> Page | None:
@@ -1586,18 +1888,9 @@ class PlaywrightCdpBrowserSession:
         # and renders the CR (with all images) inside the OVE webapp,
         # without a popup, without an OAuth handshake the scraper can see.
         #
-        # The previous code had a "direct goto" fallback that hit the raw
-        # insightcr.manheim.com URL from the CR link's href attribute. That
-        # path SKIPS the OVE-side SSO step, so Manheim's IDP responds with
-        # a fresh login redirect, the scraper captured the login form as
-        # if it were the CR, and we silently corrupted the VPS DB. The
-        # fallback is permanently removed — there is no valid recovery
-        # path that bypasses the click. If the click fails, the lease
-        # queue retries via the standard /fail flow.
-        #
-        # We do NOT pass `href` to a goto. We use the href ONLY to label
-        # debug artifacts on failure, and the click on the OVE locator
-        # element is the sole navigation mechanism.
+        # We do NOT pass `href` to a goto here. We use the href ONLY to
+        # label debug artifacts on failure, and the click on the OVE
+        # locator element is the sole navigation mechanism.
         max_attempts = 4
         last_error: Exception | None = None
         for attempt in range(max_attempts):
@@ -1845,6 +2138,78 @@ class PlaywrightCdpBrowserSession:
             LOGGER.warning("CR link wait raised unexpectedly: %s", exc)
             return False
 
+    def _wait_for_listing_gallery_to_render(
+        self, detail_page: Page, *, timeout_ms: int = 12000
+    ) -> bool:
+        """Wait for the OVE detail panel's SimpleViewer image gallery to load.
+
+        The OVE detail panel embeds a SimpleViewer carousel
+        (`div.svfy_carousel` + `span.svfy_count` showing "1 of N") that
+        lazy-loads after the initial React render. The number of Manheim
+        CDN <img> elements present in the panel HTML jumps from 1 (just
+        the hero) to 10–35 (full gallery) once SimpleViewer initializes.
+
+        Wait for either signal:
+          (a) `span.svfy_count` element appears (the "1 of N" widget), or
+          (b) at least 5 Manheim CDN <img> elements are visible
+
+        Polls every 500ms. Does NOT raise on timeout — vehicles whose
+        listing panel legitimately has no gallery (rare) should still
+        produce a payload, and the pre-push contract validator will
+        refuse the result if the image count is too low.
+
+        Returns True if either signal fired within the timeout.
+        """
+        deadline = time.monotonic() + (timeout_ms / 1000.0)
+        last_count = 0
+        while time.monotonic() < deadline:
+            try:
+                state = detail_page.evaluate(
+                    """
+                    () => {
+                      const svfy = document.querySelector("span.svfy_count");
+                      const cdnImgs = Array.from(document.querySelectorAll("img"))
+                        .map((img) => img.currentSrc || img.src || "")
+                        .filter((src) => /images\\.cdn\\.manheim\\.com/i.test(src));
+                      const uniqueCdn = new Set(
+                        cdnImgs.map((src) => src.replace(/[?#].*$/, ""))
+                      );
+                      return {
+                        svfy_text: svfy ? (svfy.textContent || "").trim() : null,
+                        cdn_count: uniqueCdn.size,
+                      };
+                    }
+                    """
+                )
+            except Exception as exc:
+                LOGGER.debug("Listing gallery poll evaluate failed: %s", exc)
+                detail_page.wait_for_timeout(500)
+                continue
+            if not isinstance(state, dict):
+                detail_page.wait_for_timeout(500)
+                continue
+            cdn_count = int(state.get("cdn_count") or 0)
+            last_count = cdn_count
+            svfy_text = state.get("svfy_text")
+            if svfy_text or cdn_count >= 5:
+                LOGGER.info(
+                    "OVE listing gallery rendered (svfy=%r, cdn_count=%s)",
+                    svfy_text,
+                    cdn_count,
+                )
+                # One more 500ms settle pause so any in-flight image src
+                # assignments finish before _extract_page_image_urls runs.
+                detail_page.wait_for_timeout(500)
+                return True
+            detail_page.wait_for_timeout(500)
+        LOGGER.warning(
+            "OVE listing gallery did not render within %sms (last cdn_count=%s); "
+            "extraction will proceed and the pre-push validator will gate the result",
+            timeout_ms,
+            last_count,
+        )
+        return False
+
     def _wait_for_cr_gallery_stable(self, page: Page) -> None:
         """Wait for the OVE-internal CR image gallery to finish loading.
 
@@ -1947,11 +2312,37 @@ class PlaywrightCdpBrowserSession:
     def _snapshot_page(self, page: Page, base_path: Path) -> dict[str, Any]:
         html_path = base_path.with_suffix(".html")
         screenshot_path = base_path.with_suffix(".png")
+        # Always capture the OUTER page's HTML and full-page screenshot for
+        # debugging artifacts — those need to reflect what a human would see
+        # when opening the OVE webapp at this point.
         page_html = page.content()
         html_path.write_text(page_html, encoding="utf-8")
         page.screenshot(path=str(screenshot_path), full_page=True)
 
-        payload = page.evaluate(
+        # Find the Manheim CR iframe if present. The OVE-internal viewer wraps
+        # insightcr.manheim.com inside an <iframe>, and the actual CR text/DOM
+        # lives inside that frame, NOT in the outer OVE document. Reading
+        # body.innerText on the outer page returns OVE chrome plus the listing
+        # JSON dump, which the per-family parsers in cr_parsers.py cannot
+        # recognize as CR content. Switching the snapshot target to the iframe
+        # lets the existing _parse_manheim_insightcr parser see the section
+        # markers it was designed for ("ANNOUNCEMENTS & COMMENTS",
+        # "TIRES AND WHEELS", "EQUIPMENT & OPTIONS", etc.).
+        #
+        # The direct-goto path (inspectionreport.manheim.com / Manheim Express)
+        # opens a top-level Manheim page with no iframe, so this lookup
+        # returns None and we snapshot the outer page as before — that path
+        # was already producing clean CR text on the WAUE Audi (03-19) and
+        # 5N1B Nissan (03-26) captures.
+        cr_frame = self._find_manheim_cr_frame(page)
+        snapshot_target: Any = cr_frame if cr_frame is not None else page
+        if cr_frame is not None:
+            LOGGER.info(
+                "Snapshotting CR from Manheim iframe (url=%s) instead of outer OVE page",
+                getattr(cr_frame, "url", "?"),
+            )
+
+        payload = snapshot_target.evaluate(
             """
             () => ({
               title: document.title,
@@ -1962,8 +2353,92 @@ class PlaywrightCdpBrowserSession:
         )
         payload["html_ref"] = str(html_path)
         payload["screenshot_ref"] = str(screenshot_path)
-        payload["images"] = self._extract_page_image_urls(page, page_html)
+        payload["images"] = self._extract_page_image_urls(snapshot_target, page_html)
+        payload["captured_from_iframe"] = cr_frame is not None
         return payload
+
+    # Hosts that can legitimately render the actual CR document inside an
+    # iframe nested in the OVE-internal viewer. Anything in this set is a
+    # valid snapshot target. auth.manheim.com is explicitly excluded — that
+    # would be an SSO bounce, not the CR.
+    _CR_FRAME_HOSTS = ("manheim.com", "content.liquidmotors.com")
+
+    def _find_manheim_cr_frame(self, page: Page) -> Any:
+        """Locate the iframe rendering the Manheim/liquidmotors CR, if present.
+
+        Returns a Playwright Frame whose URL is on a known CR-provider host
+        (other than auth.manheim.com), or None when no such frame exists
+        (e.g. the direct-goto path where the CR is the top-level document).
+        """
+        try:
+            frames = list(page.frames)
+        except Exception:
+            return None
+        try:
+            outer_url = (page.url or "").lower()
+        except Exception:
+            outer_url = ""
+        for frame in frames:
+            try:
+                frame_url = (frame.url or "").lower()
+            except Exception:
+                continue
+            if not frame_url:
+                continue
+            if "auth.manheim.com" in frame_url:
+                continue
+            # Skip the outer OVE document itself — page.frames includes the
+            # main frame as the first entry.
+            if frame_url == outer_url:
+                continue
+            if any(host in frame_url for host in self._CR_FRAME_HOSTS):
+                return frame
+        return None
+
+    def _extract_ove_listing_json(self, page: Page) -> dict[str, Any] | None:
+        """Pull the OVE listing JSON object embedded in the detail page.
+
+        The OVE detail page renders the full listing data as a JSON blob
+        inside a stockwave-info element. The blob is structurally stable
+        (it's the OVE backend's serialized listing object) and contains:
+        announcementsEnrichment, autocheck (owners/accidents),
+        conditionGrade, conditionReportUrl, installedEquipment, gallery
+        image URLs, and many more fields. Parsing this object directly
+        gives us a CR data source that does NOT depend on regex parsing
+        of rendered HTML, which is what was failing intermittently when
+        Manheim migrated CR delivery between providers.
+
+        Returns the parsed dict on success, or None when no listing JSON
+        was found in the DOM (rare — happens for VINs that fail to load
+        the OVE detail panel at all).
+        """
+        try:
+            blobs = page.evaluate(
+                """
+                () => Array.from(
+                  document.querySelectorAll("[data-test-id='stockwave-info'], .stockwave-vehicle-info")
+                )
+                  .map((node) => node.textContent || "")
+                  .filter((text) => text && text.trim().startsWith("{"))
+                """
+            )
+        except Exception as exc:
+            LOGGER.warning("Failed to query OVE listing JSON blobs: %s", exc)
+            return None
+        if not isinstance(blobs, list):
+            return None
+        for blob in blobs:
+            if not isinstance(blob, str):
+                continue
+            try:
+                data = json.loads(blob)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(data, dict) and (
+                data.get("source") == "OVE" or "conditionReportUrl" in data or "announcementsEnrichment" in data
+            ):
+                return data
+        return None
 
     def _extract_page_image_urls(self, page: Page, page_html: str | None = None) -> list[str]:
         image_urls: list[str] = []
@@ -1977,6 +2452,46 @@ class PlaywrightCdpBrowserSession:
             )
             if isinstance(dom_images, list):
                 image_urls.extend(str(value) for value in dom_images if isinstance(value, str))
+        except Exception:
+            pass
+
+        # Liquid Motors CR pages render their gallery as <ul id="lightgallery">
+        # with one <li data-src="https://assets.cai-media-management.com/.../{uuid}.jpg">
+        # per image (verified 2026-04-09 against the live CR for VIN
+        # 1N4BL4EV2NN423240). The <img> tags inside the gallery are tiny
+        # placeholder thumbnails on a different host; the full-resolution
+        # source URLs only exist as data-src attributes. Read them
+        # explicitly. Targets:
+        #   #lightgallery        — all photos
+        #   #lightgallery_normal — non-damage photos
+        #   #lightgallery_damage — damage-only photos
+        # Reading all three (with dedup downstream via unique_urls) gives
+        # us the complete set without missing damage-only photos on CRs
+        # where the lists are split.
+        try:
+            lightgallery_urls = page.evaluate(
+                """
+                () => {
+                  const selectors = [
+                    "#lightgallery li[data-src]",
+                    "#lightgallery_normal li[data-src]",
+                    "#lightgallery_damage li[data-src]",
+                  ];
+                  const urls = [];
+                  for (const sel of selectors) {
+                    document.querySelectorAll(sel).forEach((node) => {
+                      const v = node.getAttribute("data-src");
+                      if (v && /^https?:/i.test(v)) urls.push(v);
+                    });
+                  }
+                  return urls;
+                }
+                """
+            )
+            if isinstance(lightgallery_urls, list):
+                image_urls.extend(
+                    str(value) for value in lightgallery_urls if isinstance(value, str)
+                )
         except Exception:
             pass
 

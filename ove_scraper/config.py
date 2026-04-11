@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 import socket
@@ -47,7 +48,12 @@ class Settings:
     chrome_debug_port: int = 9222
     sync_interval_seconds: int = 3600
     deep_scrape_poll_interval_seconds: int = 30
-    browser_keepalive_interval_seconds: int = 900
+    # Reduced from 900s (15 min) to 300s (5 min) per the 2026-04-11
+    # investigation: the 15-min interval was too slow to detect Chrome CDP
+    # drops and left the OVE session cold overnight, causing 9 AM React
+    # hydration failures. 5-min keepalives keep the session warm and detect
+    # dead CDP within one cycle. Tunable via BROWSER_KEEPALIVE_INTERVAL_SECONDS.
+    browser_keepalive_interval_seconds: int = 300
     deep_scrape_max_workers: int = 1
     deep_scrape_lease_seconds: int = 900
     deep_scrape_retry_delay_seconds: int = 300
@@ -69,6 +75,15 @@ class Settings:
     # SYNC_WINDOW_END_HOUR_EASTERN env vars.
     sync_window_start_hour_eastern: int = 6
     sync_window_end_hour_eastern: int = 23
+    # Fixed wall-clock slots (Eastern Time) at which the saved-searches sync
+    # fires. Replaces the legacy interval-based cadence (sync_interval_seconds
+    # is retained as a no-op compat field). The 17:30 slot is shifted from
+    # 17:00 to clear the Manheim IMS refresh window (~4-5 PM ET) which causes
+    # transient "not found" results. Tunable via SYNC_SCHEDULE_EASTERN env
+    # var as a comma-separated list of HH or HH:MM entries.
+    sync_schedule_eastern: tuple[tuple[int, int], ...] = (
+        (9, 0), (11, 0), (13, 0), (15, 0), (17, 30), (19, 0), (21, 0), (23, 0),
+    )
     ove_required_search_count: int = 6
     scraper_node_id: str = "unknown-node"
     scraper_profile_slug: str = "default"
@@ -137,6 +152,10 @@ class Settings:
             ims_refresh_end_hour_eastern=_get_int("IMS_REFRESH_END_HOUR_EASTERN", 17),
             sync_window_start_hour_eastern=_get_int("SYNC_WINDOW_START_HOUR_EASTERN", 6),
             sync_window_end_hour_eastern=_get_int("SYNC_WINDOW_END_HOUR_EASTERN", 23),
+            sync_schedule_eastern=_get_schedule_slots(
+                "SYNC_SCHEDULE_EASTERN",
+                ((9, 0), (11, 0), (13, 0), (15, 0), (17, 30), (19, 0), (21, 0), (23, 0)),
+            ),
             ove_required_search_count=_get_int("OVE_REQUIRED_SEARCH_COUNT", 6),
             scraper_node_id=os.getenv("SCRAPER_NODE_ID", socket.gethostname().lower() or "unknown-node"),
             scraper_profile_slug=os.getenv("SCRAPER_PROFILE_SLUG", "default"),
@@ -198,3 +217,42 @@ def _get_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
         return default
     items = tuple(part.strip() for part in value.split("|") if part.strip())
     return items or default
+
+
+def _get_schedule_slots(
+    name: str,
+    default: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int], ...]:
+    """Parse a comma-separated list of HH or HH:MM entries (Eastern time)
+    into a sorted tuple of (hour, minute) pairs. On any parse error, log a
+    warning and fall back to the supplied default rather than crashing —
+    a malformed schedule env var should not take down the scraper.
+    """
+    value = os.getenv(name)
+    if value is None:
+        return default
+    parsed: list[tuple[int, int]] = []
+    try:
+        for raw in value.split(","):
+            entry = raw.strip()
+            if not entry:
+                continue
+            if ":" in entry:
+                hour_str, minute_str = entry.split(":", 1)
+                hour = int(hour_str)
+                minute = int(minute_str)
+            else:
+                hour = int(entry)
+                minute = 0
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError(f"slot out of range: {entry}")
+            parsed.append((hour, minute))
+    except (ValueError, IndexError) as exc:
+        logging.getLogger(__name__).warning(
+            "Failed to parse %s=%r (%s); falling back to default schedule %s",
+            name, value, exc, default,
+        )
+        return default
+    if not parsed:
+        return default
+    return tuple(sorted(set(parsed)))
