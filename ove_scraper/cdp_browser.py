@@ -744,26 +744,83 @@ class PlaywrightCdpBrowserSession:
                 "possible cold session or OVE outage"
             ) from exc
         matched_name = self._resolve_saved_search_name(page, search_name)
-        selectors = [
-            f"[data-test-id='search name: {matched_name}']",
-            self.settings.ove_saved_search_link_selector.format(search_name=matched_name),
-        ]
-        for selector in selectors:
-            locator = page.locator(selector).first
+        # The saved-search card in the OVE UI is a nested div structure:
+        #   <div data-test-id="search name: East Hub 2022-2024">      ← outer wrapper (NOT clickable)
+        #     <div class="SavedSearchItem__container">
+        #       <div class="SavedSearchItem__top-row">
+        #         <div class="SavedSearchItem__title-container">
+        #           <span class="Tracker__container">
+        #             <div class="SavedSearchItem__title">            ← React click handler lives HERE
+        #               East Hub 2022-2024
+        #               <div class="newListingText">New (5759)</div>
+        #
+        # The previous code clicked the outer wrapper div (line 748's
+        # data-test-id selector). That div does NOT have a React click
+        # handler — only the inner title div does. The click "succeeded"
+        # from Playwright's POV but no navigation happened, and the code
+        # returned as if it had navigated, then _trigger_export tried to
+        # find the export button on the LIST page and failed.
+        #
+        # Fix: locate the card wrapper by data-test-id, then drill into
+        # the inner title element and click THAT. If the inner title
+        # selector changes in the future, fall back to clicking the text.
+        card_selector = f"[data-test-id='search name: {matched_name}']"
+        card = page.locator(card_selector).first
+        original_url = page.url
+        if card.count():
+            # Strategy 1: click the inner title div inside the card
+            title_in_card = card.locator(".SavedSearchItem__title, .SavedSearchItem__title-container").first
+            click_target = title_in_card if title_in_card.count() else card
             try:
-                if locator.count():
-                    locator.click(timeout=10000)
-                    page.wait_for_load_state("networkidle")
+                click_target.click(timeout=10000)
+                # Wait for the page to actually navigate away from the
+                # saved-searches list. The previous code used
+                # wait_for_load_state("networkidle") which returns
+                # immediately if no navigation happened. We now verify
+                # the URL actually changed.
+                page.wait_for_timeout(2000)
+                if page.url != original_url and "/saved_searches" not in page.url:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                    LOGGER.info("Navigated to saved search '%s' results at %s", matched_name, page.url)
+                    return
+                LOGGER.warning(
+                    "Click on saved search '%s' did not navigate away from list page (url=%s)",
+                    matched_name,
+                    page.url,
+                )
+            except PlaywrightTimeoutError:
+                LOGGER.warning("Click on saved search '%s' card timed out", matched_name)
+
+        # Strategy 2: configured link selector (a:has-text / button:has-text)
+        link_selector = self.settings.ove_saved_search_link_selector.format(search_name=matched_name)
+        link_locator = page.locator(link_selector).first
+        if link_locator.count():
+            try:
+                link_locator.click(timeout=10000)
+                page.wait_for_timeout(2000)
+                if page.url != original_url and "/saved_searches" not in page.url:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                    LOGGER.info("Navigated to saved search '%s' via link selector at %s", matched_name, page.url)
                     return
             except PlaywrightTimeoutError:
-                continue
+                pass
+
+        # Strategy 3: click the text directly
         title_locator = page.get_by_text(matched_name, exact=False).first
         try:
             title_locator.click(timeout=10000)
-            page.wait_for_load_state("networkidle")
-            return
-        except PlaywrightTimeoutError as exc:
-            raise BrowserSessionError(f"Unable to locate saved search '{search_name}'") from exc
+            page.wait_for_timeout(2000)
+            if page.url != original_url and "/saved_searches" not in page.url:
+                page.wait_for_load_state("networkidle", timeout=15000)
+                LOGGER.info("Navigated to saved search '%s' via text click at %s", matched_name, page.url)
+                return
+        except PlaywrightTimeoutError:
+            pass
+
+        raise BrowserSessionError(
+            f"Unable to navigate into saved search '{search_name}': all click strategies failed "
+            f"(card found={card.count() > 0}, url after attempts={page.url})"
+        )
 
     def _resolve_saved_search_name(self, page: Page, search_name: str) -> str:
         available = self._collect_saved_search_names(page)
