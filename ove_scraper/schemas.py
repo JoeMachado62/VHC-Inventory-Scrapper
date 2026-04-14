@@ -112,6 +112,53 @@ class ConditionReport(BaseModel):
     severity_summary: str | None = None
     ai_summary: str | None = None
     raw_text: str | None = None
+    # Paint color / code lifted from the OVE listing JSON's
+    # designatedDescriptionEnrichment.designatedDescription.colors.exterior[]
+    # block. The normalized name (e.g. "Red") is the short label; oem_name is
+    # the full manufacturer description (e.g. "Rapid Red Metallic Tinted
+    # Clearcoat"); paint_code is the OEM option code (e.g. "D4"); rgb_hex is
+    # the swatch (e.g. "A0222D"). All optional — populated only when the
+    # listing JSON included the colors.exterior block.
+    exterior_color: str | None = None
+    exterior_color_oem_name: str | None = None
+    exterior_paint_code: str | None = None
+    exterior_color_rgb: str | None = None
+    interior_color: str | None = None
+    has_prior_paint: bool | None = None
+    # Full normalized list of installed options/equipment lifted from the OVE
+    # listing JSON's installedEquipment array. Each entry is a dict with the
+    # keys: id, primary_description, extended_description, classification,
+    # installed_reason, oem_option_code, msrp, invoice, generics. Empty when
+    # the listing JSON did not include installedEquipment (rare).
+    #
+    # SOURCE: OVE listing JSON. Populated for Manheim CRs and any other
+    # listing that exposes the structured equipment data. NOT populated by
+    # the Liquid Motors text parser (no MSRP data available there).
+    installed_equipment: list[dict[str, Any]] = Field(default_factory=list)
+    # Filtered + sorted view of installed_equipment: items the user is most
+    # likely to care about for enriching listing display. Selection rule:
+    # installed_reason in {"Build Data", "Optional"} AND msrp > 0, sorted by
+    # msrp descending. Mandatory standard equipment ($0 build data) is
+    # excluded — it adds noise without adding value.
+    #
+    # SOURCE: derived from installed_equipment. Same source caveat — only
+    # populated for vehicles with structured OVE listing JSON equipment.
+    high_value_options: list[dict[str, Any]] = Field(default_factory=list)
+    # Flat ordered list of free-text vehicle features. Per the user's
+    # 2026-04-09 feedback, the Liquid Motors CR HTML has a VEHICLE
+    # INFORMATION section listing 50–80+ dealer-supplied features per
+    # vehicle (e.g. "BLUETOOTH HANDS FREE MOBILE", "NAVIGATION SYSTEM",
+    # "POWER MOONROOF") with NO pricing data, NO classification, NO option
+    # codes — just the dealer's marketing feature list. This field
+    # captures that list verbatim for the VPS template to render as a
+    # "Vehicle Features" or "Standard Equipment" section.
+    #
+    # SOURCE: Liquid Motors CR text parser. NOT populated for Manheim CRs
+    # (which don't have an equivalent free-text section — they use
+    # installed_equipment / high_value_options instead). Both lists may
+    # coexist when both source formats are available; the VPS template
+    # renders whichever is populated.
+    equipment_features: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

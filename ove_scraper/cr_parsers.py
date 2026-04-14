@@ -49,15 +49,6 @@ PARSER_DESCRIPTORS: tuple[ReportParserDescriptor, ...] = (
         notes="Insight CR layout. Similar inspection data, but different section/component structure.",
     ),
     ReportParserDescriptor(
-        family="liquidmotors_ir",
-        host="content.liquidmotors.com",
-        path_hint="/IR/",
-        supports_structured_damage=True,
-        supports_tire_depths=True,
-        supports_vehicle_history=False,
-        notes="Liquid Motors hosted inspection report HTML with legacy table-based layout.",
-    ),
-    ReportParserDescriptor(
         family="manheim_ecr",
         host="mmsc400.manheim.com",
         path_hint="/MABEL/ECR2I.htm",
@@ -65,6 +56,18 @@ PARSER_DESCRIPTORS: tuple[ReportParserDescriptor, ...] = (
         supports_tire_depths=True,
         supports_vehicle_history=True,
         notes="Legacy Manheim ECR endpoint linked from CR score chips on OVE result cards.",
+    ),
+    ReportParserDescriptor(
+        family="liquidmotors_ir",
+        host="content.liquidmotors.com",
+        path_hint="/IR/",
+        supports_structured_damage=True,
+        supports_tire_depths=True,
+        supports_vehicle_history=False,
+        notes="Liquid Motors hosted inspection report HTML. Still served by some "
+              "Auto Grade vehicles in 2026-04 — verified live against VIN "
+              "1N4BL4EV2NN423240. Do not remove without empirical proof that no "
+              "current OVE listings route through this host.",
     ),
 )
 
@@ -115,9 +118,285 @@ def _merge_parsed_reports(primary: dict[str, Any], fallback: dict[str, Any]) -> 
 
 
 def _parse_liquidmotors_ir(report_text: str) -> dict[str, Any]:
+    """Parse a Liquid Motors / NCR-style condition report.
+
+    Liquid Motors CRs have their own format that is structurally distinct
+    from the Manheim inspection report and Manheim ECR formats. The body
+    text the scraper sees has these section headers in order:
+
+      VEHICLE INFORMATION   - vehicle details (year/make/model/VIN/grade)
+      VEHICLE INFORMATION   - equipment list (free-form, repeats above)
+      VEHICLE ANNOUNCEMENTS - colon-separated key/value pairs
+      VEHICLE DAMAGES       - tabular: LOCATION, DAMAGE TYPE, SEVERITY,
+                              DESCRIPTION, PICS, then row data
+      VEHICLE TIRES         - 4 blocks of Condition/Brand/Tread Depth/Size
+                              in fixed order: front-left, front-right,
+                              rear-left, rear-right
+      SPARE TIRE            - one block, same format
+
+    Verified live against
+    tests/fixtures/liquidmotors_cr_1N4BL4EV2NN423240.txt (a 2022 Nissan
+    Altima with grade 4.6 captured 2026-04-09).
+
+    Falls back to the Manheim ECR parser if the text contains the ECR
+    marker "DAMAGE SUMMARY AND ADDITIONAL IMAGES" — some Liquid Motors
+    hosted reports are actually re-skinned ECR reports.
+    """
     if "DAMAGE SUMMARY AND ADDITIONAL IMAGES" in report_text or "Engine Starts-" in report_text:
         return _parse_manheim_ecr(report_text)
-    return _parse_manheim_inspectionreport(report_text)
+
+    parsed: dict[str, Any] = {}
+    text = report_text.replace("\r", "")
+
+    # NAAA Grade — appears as "NAAA Grade:\n4.6" in the body text
+    grade_match = re.search(
+        r"NAAA Grade:\s*\n?\s*([0-5](?:\.\d)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if grade_match:
+        parsed["overall_grade"] = grade_match.group(1)
+
+    # VEHICLE INFORMATION equipment list. Liquid Motors CRs include a
+    # second VEHICLE INFORMATION section (after the vehicle-details block)
+    # that contains 50–80+ free-text equipment lines like
+    # "BLUETOOTH HANDS FREE MOBILE", "NAVIGATION SYSTEM", "POWER MOONROOF".
+    # The user calls this "the factory check list" — it's the dealer's
+    # marketing feature list. There are TWO VEHICLE INFORMATION headers
+    # in the text; the equipment list is in the SECOND one (the first is
+    # the title block with VIN/year/make/model/etc.). We anchor between
+    # the second VEHICLE INFORMATION header and the next VEHICLE *
+    # section header (typically VEHICLE ANNOUNCEMENTS).
+    # Use m.end() not m.start()+len() — m.start() includes any leading
+    # whitespace the ^\s* anchor matched, and naive length-offset arithmetic
+    # lands inside the title text. Verified 2026-04-09 against the saved
+    # fixture: m.start() at the second header is at position 497 which
+    # corresponds to "\n\nVEHICLE INFORMATION\n", so adding 19 (the literal
+    # length) lands at position 516 — mid-word inside "INFORMATION" — and
+    # the first "line" of the equipment block becomes the trailing "ON"
+    # fragment. m.end() correctly lands AFTER the trailing whitespace.
+    info_header_matches = list(re.finditer(r"^\s*VEHICLE INFORMATION\s*$", text, flags=re.IGNORECASE | re.MULTILINE))
+    if len(info_header_matches) >= 2:
+        equipment_start = info_header_matches[1].end()
+        next_section = re.search(
+            r"\n\s*(?:VEHICLE ANNOUNCEMENTS|VEHICLE DAMAGES|VEHICLE TIRES|SPARE TIRE)\s*\n",
+            text[equipment_start:],
+            flags=re.IGNORECASE,
+        )
+        if next_section:
+            equipment_block = text[equipment_start : equipment_start + next_section.start()]
+        else:
+            equipment_block = text[equipment_start:]
+        # Each equipment line is its own line in the body text. Strip
+        # surrounding whitespace and the **bold markers** Liquid Motors
+        # uses for headlined features. Skip empty lines.
+        equipment_features: list[str] = []
+        seen_features: set[str] = set()
+        for raw_line in equipment_block.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            # Strip **bold** markers but keep the content
+            cleaned = line.strip("*").strip()
+            if not cleaned:
+                continue
+            # Dedupe (some CRs repeat features)
+            cleaned_key = cleaned.lower()
+            if cleaned_key in seen_features:
+                continue
+            seen_features.add(cleaned_key)
+            equipment_features.append(cleaned)
+        if equipment_features:
+            parsed["equipment_features"] = equipment_features
+
+    # Tires — extract the four tire blocks from the VEHICLE TIRES section.
+    # Format: each tire is 4 lines of "Key: Value" in fixed order
+    # Condition/Brand/Tread Depth/Size, four tires total before SPARE TIRE.
+    tire_section_match = re.search(
+        r"VEHICLE TIRES\s*\n(.*?)(?:SPARE TIRE|$)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if tire_section_match:
+        tire_block = tire_section_match.group(1)
+        # Capture each Condition/Brand/Tread Depth/Size group. Brand may
+        # be empty (the line still ends with ":") and tread depth may
+        # contain quote characters and slashes.
+        tire_entries = re.findall(
+            r"Condition:\s*([^\n]*)\n\s*Brand:\s*([^\n]*)\n\s*Tread Depth:\s*([^\n]*)\n\s*Size:\s*([^\n]*)",
+            tire_block,
+            flags=re.IGNORECASE,
+        )
+        # Liquid Motors orders tires as front-left, front-right,
+        # rear-left, rear-right (verified 2026-04-09 against the saved
+        # condition-report.html which uses car-top-left/car-top-right/
+        # car-bottom-left/car-bottom-right CSS classes for the same
+        # positions). Map to the descriptive keys; the lf/rf/lr/rr
+        # aliases are added downstream by _add_tire_depth_aliases.
+        position_keys = ["driver_front", "passenger_front", "driver_rear", "passenger_rear"]
+        position_labels = ["Driver Front", "Passenger Front", "Driver Rear", "Passenger Rear"]
+        tire_depths: dict[str, dict[str, str]] = {}
+        for i, entry in enumerate(tire_entries[:4]):
+            condition, brand, tread_depth, size = (s.strip() for s in entry)
+            key = position_keys[i]
+            tire_depths[key] = {
+                "position_label": position_labels[i],
+                "condition": condition,
+                "brand": brand or None,
+                "tread_depth": tread_depth,
+                "size": size or None,
+            }
+        if tire_depths:
+            parsed["tire_depths"] = tire_depths
+
+    # Spare tire — separate single block after SPARE TIRE marker.
+    spare_match = re.search(
+        r"SPARE TIRE\s*\n\s*Condition:\s*([^\n]*)\n\s*Brand:\s*([^\n]*)\n\s*Tread Depth:\s*([^\n]*)\n\s*Size:\s*([^\n]*)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if spare_match:
+        condition, brand, tread_depth, size = (s.strip() for s in spare_match.groups())
+        # Only add spare if it has any meaningful content (not all blanks
+        # or N/A)
+        if condition and condition.lower() not in {"n/a", "na", ""}:
+            tire_depths_existing = parsed.get("tire_depths") or {}
+            tire_depths_existing["spare"] = {
+                "position_label": "Spare",
+                "condition": condition,
+                "brand": brand or None,
+                "tread_depth": tread_depth or None,
+                "size": size or None,
+            }
+            parsed["tire_depths"] = tire_depths_existing
+
+    # Announcements — extract the VEHICLE ANNOUNCEMENTS section as
+    # colon-separated key/value pairs. Surface ALL keys as a structured
+    # dict in the parsed output, but ALSO build a list of human-readable
+    # "issue" announcements (anything where the value isn't No/Unknown/0)
+    # for the announcements field.
+    announcements_match = re.search(
+        r"VEHICLE ANNOUNCEMENTS\s*\n(.*?)(?:VEHICLE DAMAGES|VEHICLE TIRES|$)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    announcement_dict: dict[str, str] = {}
+    announcements: list[str] = []
+    title_status: str | None = None
+    title_state: str | None = None
+    drivable: bool | None = None
+    if announcements_match:
+        ann_block = announcements_match.group(1)
+        for line in ann_block.splitlines():
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            key, _, value = line.partition(":")
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                continue
+            announcement_dict[key] = value
+            # Pull specific structured fields out for the typed CR fields
+            kl = key.lower()
+            if kl == "title status":
+                title_status = value or None
+            elif kl == "title state":
+                # Pass "Unknown" through as the literal value — that's the
+                # auctioneer's disclosure, not a missing field. Only treat
+                # a truly empty string as absent.
+                if value:
+                    title_state = value
+            elif kl == "driveable" or kl == "drivable":
+                if value.lower() == "yes":
+                    drivable = True
+                elif value.lower() == "no":
+                    drivable = False
+            # Per user 2026-04-09: ALL 26 disclosure key/value pairs from
+            # VEHICLE ANNOUNCEMENTS go into the announcements list as a
+            # flat list of "{Field}: {Value}" strings. The fact that the
+            # auctioneer explicitly disclosed "Hail Damage: No" /
+            # "Frame Damage: No" / "Theft Recovery: No" is itself
+            # important — it's the buyer's confidence that these checks
+            # were performed and answered. Even "Smoker: Unknown" or
+            # "Title State: Unknown" must flow through verbatim.
+            #
+            # Skip only:
+            #   - empty values (truly blank field with no answer)
+            #   - "Additional Notes" (a free-form text field that's
+            #     usually empty for clean vehicles and would clutter
+            #     the list when populated)
+            if not value:
+                continue
+            if kl == "additional notes":
+                continue
+            announcements.append(f"{key}: {value}")
+
+    if announcements:
+        parsed["announcements"] = announcements
+    if title_status:
+        parsed["title_status"] = title_status
+    if title_state:
+        parsed["title_state"] = title_state
+    if drivable is not None:
+        parsed["drivable"] = drivable
+
+    # Damages — parse the VEHICLE DAMAGES section. Format is a header row
+    # (LOCATION, DAMAGE TYPE, SEVERITY, DESCRIPTION, PICS) followed by
+    # rows of 5 lines each starting with a row number.
+    damages_match = re.search(
+        r"VEHICLE DAMAGES\s*\n.*?LOCATION\s*\n\s*DAMAGE TYPE\s*\n\s*SEVERITY\s*\n\s*DESCRIPTION\s*\n\s*PICS\s*\n(.*?)(?:VEHICLE TIRES|$)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    damage_items: list[dict[str, Any]] = []
+    if damages_match:
+        damages_block = damages_match.group(1)
+        # Each row: row_number, location, damage_type, severity, description
+        # Lines may have extra whitespace; the description may span multiple
+        # lines if it contains punctuation. We split on lines and take groups
+        # of 5 starting from each numeric row marker.
+        lines = [line.strip() for line in damages_block.splitlines() if line.strip()]
+        i = 0
+        while i < len(lines):
+            # Skip until we find a numeric row marker
+            if not lines[i].isdigit():
+                i += 1
+                continue
+            row_num = lines[i]
+            if i + 4 >= len(lines):
+                break
+            location = lines[i + 1]
+            damage_type = lines[i + 2]
+            severity = lines[i + 3]
+            description = lines[i + 4]
+            damage_items.append({
+                "row": int(row_num),
+                "section": location.lower().replace(" ", "_"),
+                "section_label": location,
+                "panel": location,
+                "condition": damage_type,
+                "reported_severity": severity,
+                "severity_label": severity,
+                "severity_color": "yellow" if severity.lower() not in {"none", "minor"} else "gray",
+                "severity_rank": 1,
+                "description": description,
+            })
+            i += 5
+    if damage_items:
+        parsed["damage_items"] = damage_items
+        parsed["damage_summary"] = {
+            "total_items": len(damage_items),
+            "by_section": {},
+            "structural_issue": False,
+        }
+
+    # Stash the full announcement key/value dict as additional metadata
+    # for the VPS template to render however it wants.
+    if announcement_dict:
+        parsed["liquidmotors_announcements_raw"] = announcement_dict
+
+    return parsed
 
 
 def _parse_generic_condition_report(report_text: str) -> dict[str, Any]:

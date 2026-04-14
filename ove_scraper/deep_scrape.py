@@ -625,6 +625,18 @@ class DeepScrapeWorker:
         if isinstance(exc, ApiClientError):
             if "status 429" in lowered or "rate limit" in lowered:
                 return "rate_limited"
+            # 422 = payload validation failure on the VPS side. The contract
+            # may be tightening or the upstream Manheim CR capture may have
+            # produced something the VPS rejects. Either way the right
+            # category is page_structure_changed: retry the scrape, and
+            # the consecutive-fail cap will eventually terminal the
+            # request as max_attempts_exceeded if it never recovers.
+            #
+            # Per user 2026-04-09: 422 must NOT terminal as
+            # unsupported_listing_type because that conflates "VPS rejected
+            # the payload" with "this listing has no CR".
+            if "status 422" in lowered:
+                return "page_structure_changed"
             if "status 5" in lowered:
                 return "transient_network"
             return "transient_network"
@@ -637,15 +649,19 @@ class DeepScrapeWorker:
         return "status 404" in lowered and "vehicle not found" in lowered
 
     def _is_terminal_validation_error(self, exc: Exception) -> bool:
-        # 422 from the VPS means the payload structurally cannot be accepted
-        # (bad VIN format, schema violation, etc). Retrying with the same
-        # input cannot succeed, so this must go to /terminal, not /fail.
-        # Without this routing the prior bug caused the launcher to crash on
-        # repeated unhandled ApiClientErrors when a malformed VIN was queued.
+        # 400 = malformed request URL (bad VIN format, etc). Retrying
+        # cannot succeed, so this remains terminal.
+        #
+        # 422 was previously terminal here but per user 2026-04-09 it must
+        # NOT be terminal — 422 means the VPS rejected the payload content,
+        # which is recoverable on a future scrape (the upstream Manheim CR
+        # might load on retry). 422 is now routed via _classify_failure to
+        # page_structure_changed and the consecutive-fail cap handles
+        # eventual termination.
         if not isinstance(exc, ApiClientError):
             return False
         lowered = str(exc).lower()
-        return "status 422" in lowered or "status 400" in lowered
+        return "status 400" in lowered
 
     def _validate_cr_payload_or_raise(
         self,
@@ -749,6 +765,74 @@ class DeepScrapeWorker:
                     "image gallery is empty while page text advertises a multi-image gallery"
                 )
 
+        # Rule 4: image count below the contract minimum. Per the user's
+        # 2026-04-09 guidance, no real Manheim CR will contain fewer than
+        # 10 images (normal is 17+). Anything below that means the
+        # SimpleViewer gallery on the OVE listing panel did not finish
+        # loading AND/OR the CR popup capture failed. Both are recoverable
+        # on retry — refuse the push and let the lease queue requeue.
+        image_count = len(images)
+        if isinstance(cr_block, dict) and image_count < self._MIN_IMAGES_PER_CR:
+            self._write_payload_artifact(
+                request.vin,
+                "validation-failure-low-image-count.json",
+                payload,
+            )
+            raise ValueError(
+                f"Refusing to push CR for VIN {request.vin}: only {image_count} images "
+                f"captured (contract minimum is {self._MIN_IMAGES_PER_CR}; real Manheim CRs "
+                "have 10+, normal is 17+). Listing-panel SimpleViewer gallery and/or CR "
+                "popup capture did not produce a full gallery."
+            )
+
+        # Rule 5: empty tire_depths. Per the user's 2026-04-09 guidance,
+        # tire depths are ALWAYS populated on a real Manheim CR — there is
+        # no "vehicle without tire data" edge case. Empty tire_depths means
+        # the CR HTML capture failed (auth, click race, iframe missed,
+        # parser couldn't find the section markers). All recoverable on
+        # retry. Refuse the push.
+        tire_depths = (cr_block or {}).get("tire_depths") if isinstance(cr_block, dict) else None
+        if isinstance(cr_block, dict) and not tire_depths:
+            self._write_payload_artifact(
+                request.vin,
+                "validation-failure-empty-tire-depths.json",
+                payload,
+            )
+            raise ValueError(
+                f"Refusing to push CR for VIN {request.vin}: condition_report.tire_depths "
+                "is empty. Real Manheim CRs always include tire depth data; an empty dict "
+                "means the CR popup capture failed before the tire section was parsed."
+            )
+
+        # Rule 6: missing condition_report.metadata.report_link.href. The
+        # VPS extracts the original CR deep-link from this exact path; the
+        # "See Original Condition Report" button on the VPS template
+        # depends on it. The href should always be set when a CR link was
+        # found in the OVE listing DOM (which is true for any vehicle that
+        # has a CR popup at all).
+        cr_metadata = (cr_block or {}).get("metadata") if isinstance(cr_block, dict) else None
+        if isinstance(cr_block, dict):
+            href = ""
+            if isinstance(cr_metadata, dict):
+                report_link = cr_metadata.get("report_link") or {}
+                if isinstance(report_link, dict):
+                    href = str(report_link.get("href") or "").strip()
+            if not href:
+                self._write_payload_artifact(
+                    request.vin,
+                    "validation-failure-missing-report-link.json",
+                    payload,
+                )
+                raise ValueError(
+                    f"Refusing to push CR for VIN {request.vin}: "
+                    "condition_report.metadata.report_link.href is missing. "
+                    "VPS template depends on this for the 'See Original Condition Report' button."
+                )
+
+    # Per user 2026-04-09: real Manheim CRs always have 10+ images,
+    # normal is 17+. Anything below this floor is a capture failure.
+    _MIN_IMAGES_PER_CR = 10
+
     def _retry_delay_for_not_found(self, reason: object) -> int:
         if reason == "ims_refresh_window":
             now = datetime.now(EASTERN_TZ)
@@ -827,10 +911,24 @@ class DeepScrapeWorker:
         return self.settings.ims_refresh_start_hour_eastern <= now.hour < self.settings.ims_refresh_end_hour_eastern
 
 
+_RAW_TEXT_MAX_BYTES = 16 * 1024
+
+
 def redact_detail(detail: DeepScrapeResult, request: PendingDetailRequest, settings: Settings) -> dict[str, object]:
     if contains_redacted_term(detail.seller_comments):
         raise ValueError("Redacted auction data detected in deep scrape payload")
     snapshot = redact_snapshot(detail.listing_snapshot)
+    # Cap condition_report.raw_text before serialization. The VPS template
+    # uses raw_text only as a last-resort fallback when structured fields
+    # are missing, and previously a 51KB JSON blob leaked into a single
+    # Announcements bullet through that fallback. Capping at 16KB matches
+    # the VPS contract guidance and means the fallback can never produce
+    # a multi-screen blob even if the VPS-side fix is delayed.
+    if detail.condition_report and detail.condition_report.raw_text:
+        if len(detail.condition_report.raw_text.encode("utf-8")) > _RAW_TEXT_MAX_BYTES:
+            truncated = detail.condition_report.raw_text.encode("utf-8")[:_RAW_TEXT_MAX_BYTES]
+            # Decode safely; trailing partial multi-byte chars are dropped
+            detail.condition_report.raw_text = truncated.decode("utf-8", errors="ignore") + " […truncated]"
     payload = {
         "source_platform": request.source_platform or settings.ove_source_platform,
         "images": build_detail_images(detail.images),
