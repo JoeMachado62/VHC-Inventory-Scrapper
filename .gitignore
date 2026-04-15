@@ -31,3 +31,5 @@ memory/
 # Runtime data snapshots
 data/*.csv
 data/*.db
+data/*.db-shm
+data/*.db-wal

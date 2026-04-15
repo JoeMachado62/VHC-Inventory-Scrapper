@@ -342,7 +342,7 @@ class PlaywrightCdpBrowserSession:
             if self._is_login_page(page):
                 raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
             if self.settings.ove_base_url not in page.url or self._is_error_page(page):
-                page.goto(self._saved_searches_url(), wait_until="networkidle", timeout=30000)
+                page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
         except Exception as exc:
             self._browser = None  # drop stale browser handle, keep Playwright alive
             raise BrowserSessionError(f"OVE browser session unavailable: {exc}") from exc
@@ -352,7 +352,7 @@ class PlaywrightCdpBrowserSession:
             browser = self._connect_browser()
             page = self._open_dedicated_ove_page(browser)
             try:
-                page.goto(self._saved_searches_url(), wait_until="networkidle", timeout=30000)
+                page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
                 if self._is_login_page(page):
                     raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
             finally:
@@ -365,7 +365,7 @@ class PlaywrightCdpBrowserSession:
         browser = self._connect_browser()
         page = self._open_dedicated_ove_page(browser)
         try:
-            page.goto(self._saved_searches_url(), wait_until="networkidle", timeout=30000)
+            page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
             try:
                 page.wait_for_selector("[data-test-id^='search name:']", timeout=15000)
             except PlaywrightTimeoutError:
@@ -413,10 +413,30 @@ class PlaywrightCdpBrowserSession:
     def export_saved_search(self, search_name: str, export_dir: Path) -> Path:
         export_dir.mkdir(parents=True, exist_ok=True)
         browser = self._connect_browser()
-        page = self._open_dedicated_ove_page(browser)
         target_path = export_dir / f"{slugify(search_name)}.csv"
         last_error: Exception | None = None
         max_attempts = max(1, getattr(self.settings, "ove_export_max_attempts", 5))
+
+        # Open the dedicated page with retry — the initial goto to
+        # /saved_searches#/ can time out on transient OVE slowness; letting
+        # a single goto failure bypass the retry loop (previous behavior)
+        # meant one bad attempt killed the whole export.
+        page: Page | None = None
+        for open_attempt in range(3):
+            try:
+                page = self._open_dedicated_ove_page(browser)
+                break
+            except Exception as exc:
+                LOGGER.warning(
+                    "Failed to open dedicated OVE page (attempt %s/3) for '%s': %s",
+                    open_attempt + 1, search_name, exc,
+                )
+                last_error = exc
+                time.sleep(3 * (open_attempt + 1))
+        if page is None:
+            raise BrowserSessionError(
+                f"Could not open dedicated OVE page for '{search_name}' after 3 attempts: {last_error}"
+            )
 
         try:
             for attempt in range(max_attempts):
@@ -445,7 +465,7 @@ class PlaywrightCdpBrowserSession:
                     last_error = exc
 
                 try:
-                    page.goto(self._saved_searches_url(), wait_until="networkidle", timeout=30000)
+                    page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
                     page.wait_for_selector("[data-test-id^='search name:']", timeout=15000)
                 except Exception as nav_exc:
                     LOGGER.warning(
@@ -741,12 +761,18 @@ class PlaywrightCdpBrowserSession:
         return page
 
     def _open_saved_search(self, page: Page, search_name: str) -> None:
-        page.goto(self._saved_searches_url(), wait_until="networkidle", timeout=30000)
+        # Use domcontentloaded rather than networkidle: the OVE saved-searches
+        # page runs continuous analytics/polling XHRs that prevent networkidle
+        # from ever firing (verified 2026-04-15 — the page renders fully but
+        # the 500ms-idle condition never clears, so goto times out at 30s even
+        # though the saved-search cards are visible). The wait_for_selector
+        # below is the real readiness signal.
+        page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
         try:
             page.wait_for_selector("[data-test-id^='search name:']", timeout=15000)
         except PlaywrightTimeoutError as exc:
             raise BrowserSessionError(
-                "Saved search cards did not render within 15s after networkidle — "
+                "Saved search cards did not render within 15s — "
                 "possible cold session or OVE outage"
             ) from exc
         matched_name = self._resolve_saved_search_name(page, search_name)
@@ -786,7 +812,11 @@ class PlaywrightCdpBrowserSession:
                 # the URL actually changed.
                 page.wait_for_timeout(2000)
                 if page.url != original_url and "/saved_searches" not in page.url:
-                    page.wait_for_load_state("networkidle", timeout=15000)
+                    # Don't wait for networkidle — OVE has persistent XHR
+                    # polling that never settles. domcontentloaded is the
+                    # real signal, and the subsequent export selector wait
+                    # ensures the results rendered.
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
                     LOGGER.info("Navigated to saved search '%s' results at %s", matched_name, page.url)
                     return
                 LOGGER.warning(
@@ -805,7 +835,11 @@ class PlaywrightCdpBrowserSession:
                 link_locator.click(timeout=10000)
                 page.wait_for_timeout(2000)
                 if page.url != original_url and "/saved_searches" not in page.url:
-                    page.wait_for_load_state("networkidle", timeout=15000)
+                    # Don't wait for networkidle — OVE has persistent XHR
+                    # polling that never settles. domcontentloaded is the
+                    # real signal, and the subsequent export selector wait
+                    # ensures the results rendered.
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
                     LOGGER.info("Navigated to saved search '%s' via link selector at %s", matched_name, page.url)
                     return
             except PlaywrightTimeoutError:
@@ -817,7 +851,7 @@ class PlaywrightCdpBrowserSession:
             title_locator.click(timeout=10000)
             page.wait_for_timeout(2000)
             if page.url != original_url and "/saved_searches" not in page.url:
-                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_load_state("domcontentloaded", timeout=15000)
                 LOGGER.info("Navigated to saved search '%s' via text click at %s", matched_name, page.url)
                 return
         except PlaywrightTimeoutError:

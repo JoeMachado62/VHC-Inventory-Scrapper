@@ -147,7 +147,9 @@ class HotDealPipelineRunner:
         for path in csv_paths:
             rows = load_csv_rows(path)
             for row in rows:
-                vin = (row.get("VIN") or row.get("vin") or "").strip().upper()
+                # OVE CSV column is "Vin" (title case). Also accept "VIN" /
+                # "vin" for robustness if OVE changes its casing.
+                vin = (row.get("Vin") or row.get("VIN") or row.get("vin") or "").strip().upper()
                 if vin and len(vin) == 17 and vin not in seen_vins:
                     seen_vins.add(vin)
                     all_rows.append({
@@ -156,10 +158,19 @@ class HotDealPipelineRunner:
                         "make": row.get("Make") or row.get("make"),
                         "model": row.get("Model") or row.get("model"),
                         "trim": row.get("Trim") or row.get("trim"),
-                        "odometer": _safe_int(row.get("Mileage") or row.get("Odometer") or row.get("odometer")),
-                        "price_asking": _safe_float(row.get("Asking Price") or row.get("Buy Now") or row.get("Floor Price")),
-                        "condition_grade": row.get("Condition") or row.get("Grade"),
-                        "location_state": row.get("State") or row.get("Pickup Location"),
+                        "odometer": _safe_int(
+                            row.get("Odometer Value") or row.get("Mileage")
+                            or row.get("Odometer") or row.get("odometer")
+                        ),
+                        "price_asking": _safe_float(
+                            row.get("Buy Now Price") or row.get("Asking Price")
+                            or row.get("Buy Now") or row.get("Floor Price")
+                        ),
+                        "condition_grade": (
+                            row.get("Condition Report Grade") or row.get("Condition")
+                            or row.get("Grade")
+                        ),
+                        "location_state": row.get("Pickup Location") or row.get("State"),
                     })
 
         return insert_vins(self.db, run_id, all_rows)
