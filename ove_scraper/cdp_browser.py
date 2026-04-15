@@ -344,7 +344,7 @@ class PlaywrightCdpBrowserSession:
             if self.settings.ove_base_url not in page.url or self._is_error_page(page):
                 page.goto(self._saved_searches_url(), wait_until="networkidle", timeout=30000)
         except Exception as exc:
-            self.close()
+            self._browser = None  # drop stale browser handle, keep Playwright alive
             raise BrowserSessionError(f"OVE browser session unavailable: {exc}") from exc
 
     def touch_session(self) -> None:
@@ -358,7 +358,7 @@ class PlaywrightCdpBrowserSession:
             finally:
                 self._close_page(page)
         except Exception as exc:
-            self.close()
+            self._browser = None
             raise BrowserSessionError(f"OVE browser keepalive failed: {exc}") from exc
 
     def list_saved_searches(self) -> tuple[str, ...]:
@@ -727,11 +727,17 @@ class PlaywrightCdpBrowserSession:
 
     def _create_worker_page(self, context: BrowserContext, *, start_url: str | None = None) -> Page:
         page = context.new_page()
-        page.goto(start_url or self._saved_searches_url(), wait_until="domcontentloaded")
-        page.wait_for_timeout(1500)
-        if self._is_login_page(page) or self._is_error_page(page):
+        try:
+            page.goto(start_url or self._saved_searches_url(), wait_until="domcontentloaded")
+            page.wait_for_timeout(1500)
+            if self._is_login_page(page) or self._is_error_page(page):
+                self._close_page(page)
+                raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
+        except BrowserSessionError:
+            raise
+        except Exception:
             self._close_page(page)
-            raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
+            raise
         return page
 
     def _open_saved_search(self, page: Page, search_name: str) -> None:
@@ -1040,6 +1046,298 @@ class PlaywrightCdpBrowserSession:
             path.unlink(missing_ok=True)
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # AutoCheck modal scraping (Hot Deal pipeline)
+    # ------------------------------------------------------------------
+
+    _AUTOCHECK_BUTTON_SELECTORS = [
+        "[data-test-id='autocheck']",
+        "[data-test-id='auto-check']",
+        "a[data-label-text='AutoCheck']",
+        "a[data-label-text='AC']",
+        ".VehicleReportLink__autocheck-link",
+        "button:has-text('Auto Check')",
+        "a:has-text('Auto Check')",
+        "button:has-text('AutoCheck')",
+        "a:has-text('AutoCheck')",
+        "button:has-text('View Report')",
+        "a:has-text('View Report')",
+    ]
+
+    # JavaScript to extract inline AutoCheck data from OVE listing page.
+    # The AutoCheck section uses data-test-id attributes for each field.
+    _AUTOCHECK_INLINE_EXTRACT_JS = """
+    () => {
+        const result = {raw_text: '', score: null, owners: null, accidents: null,
+                        title_probs: '', odo: '', use_event: '', view_report_href: ''};
+        const section = document.querySelector('[data-test-id="auto-check"]')
+                     || document.querySelector('[data-test-id="auto-check-data"]');
+        if (!section) return result;
+        result.raw_text = section.innerText || '';
+        const scoreEl = section.querySelector('[data-test-id="score-data"]')
+                     || section.querySelector('[data-test-id="score"]');
+        if (scoreEl) {
+            const m = scoreEl.innerText.match(/(\\d+)/);
+            if (m) result.score = parseInt(m[1]);
+        }
+        // Walk text nodes looking for structured data
+        const text = result.raw_text;
+        const ownersMatch = text.match(/Owners\\s*(\\d+)/i);
+        if (ownersMatch) result.owners = parseInt(ownersMatch[1]);
+        const accMatch = text.match(/Accidents?\\s*(?:ACDNT)?\\s*(\\d+)/i);
+        if (accMatch) result.accidents = parseInt(accMatch[1]);
+        // Check for title/problem indicators
+        if (/Titles?\\/Probs?/i.test(text)) {
+            // Look for icon indicators near it
+            const titleSection = text.match(/Titles?\\/Probs?(.{0,50})/i);
+            result.title_probs = titleSection ? titleSection[1].trim() : '';
+        }
+        if (/\\bODO\\b/i.test(text)) {
+            const odoSection = text.match(/ODO(.{0,50})/i);
+            result.odo = odoSection ? odoSection[1].trim() : '';
+        }
+        // VIEW REPORT link
+        const reportLink = section.querySelector('[data-test-id="auto-report-data"] a')
+                        || section.querySelector('a[href*="vehiclehistservice"]')
+                        || section.querySelector('a[href*="autocheck"]');
+        if (reportLink) result.view_report_href = reportLink.href || '';
+        return result;
+    }
+    """
+
+    def scrape_autocheck_modal(self, vin: str, artifact_dir: Path) -> dict[str, Any]:
+        """Extract AutoCheck data for a VIN from the OVE listing page.
+
+        Primary strategy: extract inline AutoCheck data from the listing
+        page's data-test-id elements (score, owners, accidents, title/probs).
+        Fallback: click VIEW REPORT to open the full Experian popup.
+        """
+        self.ensure_session()
+        ac_artifact_dir = artifact_dir / "autocheck"
+        ac_artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        browser = self._connect_browser()
+        seed_page = self._get_ove_page(browser.contexts)
+        page = self._create_worker_page(seed_page.context, start_url=self._vin_results_url())
+
+        try:
+            LOGGER.info("AutoCheck scrape: opening listing for VIN %s", vin)
+            detail_page, _ = self._open_listing_for_vin(page, vin, artifact_dir)
+            self._wait_for_cr_link_to_render(detail_page, timeout_ms=8000)
+
+            # Strategy 1: Extract inline AutoCheck data (most reliable)
+            LOGGER.info("AutoCheck: trying inline extraction for VIN %s", vin)
+            inline_data = detail_page.evaluate(self._AUTOCHECK_INLINE_EXTRACT_JS)
+            if inline_data and inline_data.get("score") is not None:
+                detail_page.screenshot(path=str(ac_artifact_dir / "autocheck-inline.png"), full_page=True)
+                (ac_artifact_dir / "autocheck-inline.html").write_text(detail_page.content(), encoding="utf-8")
+                LOGGER.info(
+                    "AutoCheck inline: score=%s owners=%s accidents=%s for VIN %s",
+                    inline_data.get("score"), inline_data.get("owners"),
+                    inline_data.get("accidents"), vin,
+                )
+                return self._parse_autocheck_inline(inline_data)
+
+            # Strategy 2: Click VIEW REPORT to open full Experian popup
+            LOGGER.info("AutoCheck: inline extraction empty, trying VIEW REPORT popup for VIN %s", vin)
+            report_link = detail_page.locator("[data-test-id='auto-report-data'] a").first
+            if report_link.is_visible(timeout=3000):
+                try:
+                    with detail_page.expect_popup(timeout=10000) as popup_info:
+                        report_link.click(timeout=5000)
+                    popup = popup_info.value
+                    popup.wait_for_load_state("domcontentloaded", timeout=15000)
+                    popup.wait_for_timeout(3000)
+                    popup.screenshot(path=str(ac_artifact_dir / "autocheck-popup.png"), full_page=True)
+                    (ac_artifact_dir / "autocheck-popup.html").write_text(popup.content(), encoding="utf-8")
+                    content = popup.inner_text("body")
+                    popup.close()
+                    LOGGER.info("AutoCheck captured via VIEW REPORT popup for VIN %s (%d chars)", vin, len(content))
+                    return self._parse_autocheck_content(content)
+                except Exception as popup_exc:
+                    LOGGER.warning("AutoCheck VIEW REPORT popup failed for VIN %s: %s", vin, popup_exc)
+
+            # Strategy 3: Fall back to clicking AutoCheck button
+            ac_button = self._find_autocheck_button(detail_page)
+            if ac_button is not None:
+                LOGGER.info("AutoCheck: trying button click fallback for VIN %s", vin)
+                modal_content = self._open_autocheck_modal(detail_page, ac_button, ac_artifact_dir, vin)
+                return self._parse_autocheck_content(modal_content)
+
+            LOGGER.warning("AutoCheck: no data found for VIN %s", vin)
+            detail_page.screenshot(path=str(ac_artifact_dir / "autocheck-none.png"), full_page=True)
+            return {"error": "No AutoCheck data found", "raw_text": ""}
+
+        except Exception as exc:
+            LOGGER.error("AutoCheck scrape failed for VIN %s: %s", vin, exc)
+            try:
+                self._capture_debug_state(page, ac_artifact_dir, "autocheck-error", vin, exc)
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _parse_autocheck_inline(data: dict) -> dict[str, Any]:
+        """Convert inline JS extraction result into the structured format
+        expected by the screener."""
+        raw_text = data.get("raw_text", "")
+        result: dict[str, Any] = {"raw_text": raw_text}
+        result["autocheck_score"] = data.get("score")
+        result["owner_count"] = data.get("owners")
+        result["accident_count"] = data.get("accidents")
+        result["view_report_href"] = data.get("view_report_href", "")
+
+        # Derive screening-compatible fields from inline indicators.
+        # The inline section shows icons/text for title problems and
+        # odometer issues but doesn't spell out "Problem Reported" —
+        # a non-empty title_probs or odo field indicates an issue.
+        title_probs = data.get("title_probs", "").strip()
+        odo = data.get("odo", "").strip()
+
+        # The inline view shows checkmark/X icons via CSS classes.
+        # If the raw_text around Titles/Probs contains indicator text
+        # (anything other than whitespace), flag it.
+        result["title_brand_check"] = "Problem Reported" if title_probs else "OK"
+        result["odometer_check"] = "Problem Reported" if odo else "OK"
+        accidents = data.get("accidents") or 0
+        result["accident_check"] = (
+            f"{accidents} accident(s) reported" if accidents > 0 else "OK"
+        )
+        result["damage_check"] = ""
+        result["vehicle_use"] = ""
+        result["buyback_protection"] = ""
+        return result
+
+    def _find_autocheck_button(self, page: Page) -> Locator | None:
+        """Try each selector to find the AutoCheck button on the detail page."""
+        for selector in self._AUTOCHECK_BUTTON_SELECTORS:
+            try:
+                loc = page.locator(selector).first
+                if loc.is_visible(timeout=1000):
+                    LOGGER.info("Found AutoCheck button via selector: %s", selector)
+                    return loc
+            except Exception:
+                continue
+        return None
+
+    def _open_autocheck_modal(
+        self,
+        page: Page,
+        button: Locator,
+        artifact_dir: Path,
+        vin: str,
+    ) -> str:
+        """Click the AutoCheck button and extract the modal/popup content."""
+
+        # Strategy 1: Popup window
+        try:
+            with page.expect_popup(timeout=5000) as popup_info:
+                button.click(timeout=5000)
+            popup = popup_info.value
+            popup.wait_for_load_state("domcontentloaded", timeout=15000)
+            popup.wait_for_timeout(3000)  # Let dynamic content render
+            popup.screenshot(path=str(artifact_dir / "autocheck-popup.png"), full_page=True)
+            (artifact_dir / "autocheck-popup.html").write_text(popup.content(), encoding="utf-8")
+            content = popup.inner_text("body")
+            popup.close()
+            LOGGER.info("AutoCheck captured via popup window for VIN %s (%d chars)", vin, len(content))
+            return content
+        except Exception as popup_exc:
+            LOGGER.debug("AutoCheck popup strategy failed for VIN %s: %s", vin, popup_exc)
+
+        # Strategy 2: Inline modal/overlay
+        try:
+            button.click(timeout=5000)
+            page.wait_for_timeout(2000)
+
+            # Look for common modal selectors
+            modal_selectors = [
+                "[role='dialog']",
+                ".modal-content",
+                ".modal-body",
+                ".overlay-content",
+                "[class*='modal']",
+                "[class*='Modal']",
+                "[class*='autocheck']",
+                "[class*='AutoCheck']",
+            ]
+            for selector in modal_selectors:
+                try:
+                    modal = page.locator(selector).first
+                    if modal.is_visible(timeout=2000):
+                        page.screenshot(path=str(artifact_dir / "autocheck-modal.png"), full_page=True)
+                        (artifact_dir / "autocheck-modal.html").write_text(page.content(), encoding="utf-8")
+                        content = modal.inner_text()
+                        LOGGER.info(
+                            "AutoCheck captured via inline modal (%s) for VIN %s (%d chars)",
+                            selector, vin, len(content),
+                        )
+                        return content
+                except Exception:
+                    continue
+        except Exception as modal_exc:
+            LOGGER.debug("AutoCheck inline modal strategy failed for VIN %s: %s", vin, modal_exc)
+
+        # Strategy 3: iframe
+        try:
+            for frame in page.frames:
+                url = frame.url.lower()
+                if "autocheck" in url or "experian" in url:
+                    frame.wait_for_load_state("domcontentloaded", timeout=10000)
+                    page.screenshot(path=str(artifact_dir / "autocheck-iframe.png"), full_page=True)
+                    (artifact_dir / "autocheck-iframe.html").write_text(frame.content(), encoding="utf-8")
+                    content = frame.inner_text("body")
+                    LOGGER.info("AutoCheck captured via iframe for VIN %s (%d chars)", vin, len(content))
+                    return content
+        except Exception as iframe_exc:
+            LOGGER.debug("AutoCheck iframe strategy failed for VIN %s: %s", vin, iframe_exc)
+
+        # Fallback: capture full page content for debugging
+        page.screenshot(path=str(artifact_dir / "autocheck-fallback.png"), full_page=True)
+        (artifact_dir / "autocheck-fallback.html").write_text(page.content(), encoding="utf-8")
+        LOGGER.warning("All AutoCheck modal strategies exhausted for VIN %s; returning full page text", vin)
+        return page.inner_text("body")
+
+    @staticmethod
+    def _parse_autocheck_content(raw_text: str) -> dict[str, Any]:
+        """Parse raw AutoCheck modal text into structured sections."""
+        result: dict[str, Any] = {"raw_text": raw_text}
+
+        sections = {
+            "title_brand_check": r"(?:Major\s*)?(?:State\s*)?Title\s*Brand\s*Check\s*[-–—]?\s*(.*?)(?=\n[A-Z]|\Z)",
+            "accident_check": r"Accident\s*Check\s*[-–—]?\s*(.*?)(?=\n[A-Z]|\Z)",
+            "damage_check": r"Damage\s*Check\s*[-–—]?\s*(.*?)(?=\n[A-Z]|\Z)",
+            "odometer_check": r"Odometer\s*Check\s*[-–—]?\s*(.*?)(?=\n[A-Z]|\Z)",
+            "vehicle_use": r"Vehicle\s*Usage?\s*Check\s*[-–—]?\s*(.*?)(?=\n[A-Z]|\Z)",
+            "buyback_protection": r"(?:AutoCheck\s*)?Buyback\s*Protection\s*[-–—]?\s*(.*?)(?=\n[A-Z]|\Z)",
+        }
+
+        for key, pattern in sections.items():
+            match = re.search(pattern, raw_text, re.IGNORECASE | re.DOTALL)
+            result[key] = match.group(1).strip() if match else ""
+
+        # Extract score if present
+        score_match = re.search(r"(?:AutoCheck\s*Score|score)\s*:?\s*(\d+)", raw_text, re.IGNORECASE)
+        if score_match:
+            result["autocheck_score"] = int(score_match.group(1))
+
+        # Extract accident count
+        accident_match = re.search(r"Number\s*of\s*Accidents?\s*:?\s*(\d+)", raw_text, re.IGNORECASE)
+        if accident_match:
+            result["accident_count"] = int(accident_match.group(1))
+
+        # Extract owner count
+        owner_match = re.search(r"(?:Calculated\s*)?Owners?\s*:?\s*(\d+)", raw_text, re.IGNORECASE)
+        if owner_match:
+            result["owner_count"] = int(owner_match.group(1))
+
+        return result
 
     def _open_listing_for_vin(self, page: Page, vin: str, artifact_dir: Path) -> tuple[Page, dict[str, str] | None]:
         page = self._prepare_vin_search_page(page)

@@ -115,6 +115,20 @@ class AdminNotifier:
             logger=logger,
         )
 
+    def notify_hot_deal_complete(
+        self,
+        *,
+        run_summary: dict[str, Any],
+        hot_deals: list[dict[str, Any]],
+        logger=None,
+    ) -> bool:
+        from ove_scraper.hot_deal_report import format_hot_deal_email_html, format_hot_deal_summary
+        found = run_summary.get("hot_deals", 0)
+        total = run_summary.get("total_vins", 0)
+        subject = f"Hot Deal Screening Complete: {found} candidates found ({total} screened)"
+        body = format_hot_deal_summary(run_summary, hot_deals)
+        return self._send_with_cooldown(key="hot-deal-complete", subject=subject, body=body, logger=logger)
+
     def _send_with_cooldown(self, *, key: str, subject: str, body: str, logger=None) -> bool:
         if not self.is_configured():
             if logger:

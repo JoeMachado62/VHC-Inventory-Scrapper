@@ -89,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     scrape_vin = subparsers.add_parser("scrape-vin")
     scrape_vin.add_argument("vin")
     scrape_vin.add_argument("--output", default="")
+    subparsers.add_parser("hot-deal", help="Run Hot Deal vehicle screening pipeline")
     return parser
 
 
@@ -111,6 +112,21 @@ def main() -> None:
 
             if args.command == "poll-once":
                 run_poll_once_with_recovery(settings, browser, api_client, logger, notifier=notifier)
+                return
+
+            if args.command == "hot-deal":
+                from ove_scraper.hot_deal_db import init_db
+                from ove_scraper.hot_deal_pipeline import HotDealPipelineRunner
+                db_conn = init_db(settings.hot_deal_db_path)
+                try:
+                    runner = HotDealPipelineRunner(
+                        settings=settings, browser=browser, db_conn=db_conn,
+                        log=logger, notifier=notifier,
+                    )
+                    result = runner.run_once()
+                    logger.info("Hot Deal pipeline finished: %s", result.get("status", "unknown"))
+                finally:
+                    db_conn.close()
                 return
 
             if args.command == "scrape-vin":

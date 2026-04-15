@@ -14,3 +14,20 @@ pytest-cache-files-*/
 tmp*/
 __pycache__/
 *.pyc
+
+# Agent tooling (Claude Code, OpenClaw)
+.claude/
+.clawhub/
+.openclaw/
+skills/
+AGENTS.md
+SOUL.md
+USER.md
+IDENTITY.md
+HEARTBEAT.md
+TOOLS.md
+memory/
+
+# Runtime data snapshots
+data/*.csv
+data/*.db

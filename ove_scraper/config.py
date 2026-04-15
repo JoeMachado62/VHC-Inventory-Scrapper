@@ -118,6 +118,14 @@ class Settings:
     ove_export_button_selector: str = "button:has-text('Export'), a:has-text('Export')"
     ove_saved_search_link_selector: str = "a:has-text('{search_name}'), button:has-text('{search_name}')"
     ove_section_root_selector: str = "main, [role='main'], body"
+    # Hot Deal pipeline settings
+    hot_deal_searches: tuple[str, ...] = (
+        "Factory Warranty Active",
+        "VCH Marketing List",
+    )
+    hot_deal_db_path: Path = Path("./data/hot_deal.db")
+    openai_api_key: str = ""
+    openai_model: str = "gpt-5.4"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -135,7 +143,7 @@ class Settings:
             chrome_debug_port=_get_int("CHROME_DEBUG_PORT", 9222),
             sync_interval_seconds=_get_int("SYNC_INTERVAL_SECONDS", 3600),
             deep_scrape_poll_interval_seconds=_get_int("DEEP_SCRAPE_POLL_INTERVAL_SECONDS", 30),
-            browser_keepalive_interval_seconds=_get_int("BROWSER_KEEPALIVE_INTERVAL_SECONDS", 900),
+            browser_keepalive_interval_seconds=_get_int("BROWSER_KEEPALIVE_INTERVAL_SECONDS", 300),
             deep_scrape_max_workers=_get_int("DEEP_SCRAPE_MAX_WORKERS", recommend_deep_scrape_workers()),
             deep_scrape_lease_seconds=_get_int("DEEP_SCRAPE_LEASE_SECONDS", 900),
             deep_scrape_retry_delay_seconds=_get_int("DEEP_SCRAPE_RETRY_DELAY_SECONDS", 300),
@@ -204,6 +212,13 @@ class Settings:
                 "a:has-text('{search_name}'), button:has-text('{search_name}')",
             ),
             ove_section_root_selector=os.getenv("OVE_SECTION_ROOT_SELECTOR", "main, [role='main'], body"),
+            hot_deal_searches=_get_list(
+                "HOT_DEAL_SEARCHES",
+                ("Factory Warranty Active", "VCH Marketing List"),
+            ),
+            hot_deal_db_path=Path(os.getenv("HOT_DEAL_DB_PATH", "./data/hot_deal.db")),
+            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+            openai_model=os.getenv("OPENAI_MODEL", "gpt-5.4"),
         )
 
     @property
