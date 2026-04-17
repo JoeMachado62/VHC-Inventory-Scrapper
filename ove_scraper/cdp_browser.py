@@ -1317,54 +1317,69 @@ class PlaywrightCdpBrowserSession:
             )
             result = self._parse_autocheck_inline(inline_data)
 
-            # Also try to get full Experian popup for complete report
-            try:
-                report_link = detail_page.locator("[data-test-id='auto-report-data'] a").first
-                if report_link.is_visible(timeout=2000):
-                    with detail_page.expect_popup(timeout=10000) as popup_info:
-                        report_link.click(timeout=5000)
-                    popup = popup_info.value
-                    popup.wait_for_load_state("domcontentloaded", timeout=15000)
-                    popup.wait_for_timeout(3000)
-                    popup.screenshot(path=str(ac_artifact_dir / "autocheck-popup.png"), full_page=True)
-                    (ac_artifact_dir / "autocheck-popup.html").write_text(popup.content(), encoding="utf-8")
-                    full_text = popup.inner_text("body")
-                    popup.close()
-                    result["full_report_text"] = full_text
-                    # Merge full popup details into result
-                    full_parsed = self._parse_autocheck_content(full_text)
-                    for key in ("title_brand_check", "odometer_check", "accident_check",
-                                "damage_check", "vehicle_use", "buyback_protection"):
-                        if full_parsed.get(key) and not result.get(key):
-                            result[key] = full_parsed[key]
-                    LOGGER.info("AutoCheck full report also captured for VIN %s (%d chars)", vin, len(full_text))
-            except Exception as popup_exc:
-                LOGGER.debug("AutoCheck full popup skipped for VIN %s: %s", vin, popup_exc)
+            # Try to get full Experian report by navigating to the
+            # AutoCheck URL in a new tab (same context = same cookies).
+            # Using context.new_page().goto() instead of expect_popup
+            # because popup windows don't reliably inherit Manheim SSO.
+            view_href = result.get("view_report_href", "")
+            if not view_href:
+                # Try extracting href from the inline data's link element
+                try:
+                    report_link = detail_page.locator("[data-test-id='auto-report-data'] a").first
+                    if report_link.is_visible(timeout=2000):
+                        view_href = report_link.get_attribute("href", timeout=2000) or ""
+                except Exception:
+                    pass
+            if view_href:
+                try:
+                    report_page = detail_page.context.new_page()
+                    report_page.goto(view_href, wait_until="domcontentloaded", timeout=20000)
+                    report_page.wait_for_timeout(3000)
+                    report_page.screenshot(path=str(ac_artifact_dir / "autocheck-report.png"), full_page=True)
+                    (ac_artifact_dir / "autocheck-report.html").write_text(report_page.content(), encoding="utf-8")
+                    full_text = report_page.inner_text("body")
+                    report_page.close()
+                    # Check if we got a login page or actual content
+                    if "sign in" in full_text.lower()[:200] or "username" in full_text.lower()[:200]:
+                        LOGGER.debug("AutoCheck full report returned login page for VIN %s; skipping", vin)
+                    else:
+                        result["full_report_text"] = full_text
+                        full_parsed = self._parse_autocheck_content(full_text)
+                        for key in ("title_brand_check", "odometer_check", "accident_check",
+                                    "damage_check", "vehicle_use", "buyback_protection"):
+                            if full_parsed.get(key) and not result.get(key):
+                                result[key] = full_parsed[key]
+                        LOGGER.info("AutoCheck full report captured for VIN %s (%d chars)", vin, len(full_text))
+                except Exception as report_exc:
+                    LOGGER.debug("AutoCheck full report skipped for VIN %s: %s", vin, report_exc)
 
             result["scrape_status"] = "success"
             return result
 
-        # Strategy 2: Click VIEW REPORT to open full Experian popup directly
-        LOGGER.info("AutoCheck: inline extraction empty, trying VIEW REPORT popup for VIN %s", vin)
-        report_link = detail_page.locator("[data-test-id='auto-report-data'] a").first
+        # Strategy 2: Navigate to VIEW REPORT URL in a new tab (same context)
+        LOGGER.info("AutoCheck: inline extraction empty, trying VIEW REPORT for VIN %s", vin)
         try:
+            report_link = detail_page.locator("[data-test-id='auto-report-data'] a").first
+            view_href = ""
             if report_link.is_visible(timeout=3000):
-                with detail_page.expect_popup(timeout=10000) as popup_info:
-                    report_link.click(timeout=5000)
-                popup = popup_info.value
-                popup.wait_for_load_state("domcontentloaded", timeout=15000)
-                popup.wait_for_timeout(3000)
-                popup.screenshot(path=str(ac_artifact_dir / "autocheck-popup.png"), full_page=True)
-                (ac_artifact_dir / "autocheck-popup.html").write_text(popup.content(), encoding="utf-8")
-                content = popup.inner_text("body")
-                popup.close()
-                LOGGER.info("AutoCheck captured via VIEW REPORT popup for VIN %s (%d chars)", vin, len(content))
-                result = self._parse_autocheck_content(content)
-                result["full_report_text"] = content
-                result["scrape_status"] = "success"
-                return result
-        except Exception as popup_exc:
-            LOGGER.warning("AutoCheck VIEW REPORT popup failed for VIN %s: %s", vin, popup_exc)
+                view_href = report_link.get_attribute("href", timeout=2000) or ""
+            if view_href:
+                report_page = detail_page.context.new_page()
+                report_page.goto(view_href, wait_until="domcontentloaded", timeout=20000)
+                report_page.wait_for_timeout(3000)
+                report_page.screenshot(path=str(ac_artifact_dir / "autocheck-report.png"), full_page=True)
+                (ac_artifact_dir / "autocheck-report.html").write_text(report_page.content(), encoding="utf-8")
+                content = report_page.inner_text("body")
+                report_page.close()
+                if "sign in" not in content.lower()[:200]:
+                    LOGGER.info("AutoCheck captured via VIEW REPORT for VIN %s (%d chars)", vin, len(content))
+                    result = self._parse_autocheck_content(content)
+                    result["full_report_text"] = content
+                    result["scrape_status"] = "success"
+                    return result
+                LOGGER.debug("AutoCheck VIEW REPORT returned login page for VIN %s", vin)
+        except Exception as report_exc:
+            LOGGER.warning("AutoCheck VIEW REPORT failed for VIN %s: %s", vin, report_exc)
 
         # Strategy 3: Fall back to clicking AutoCheck button
         ac_button = self._find_autocheck_button(detail_page)
@@ -2941,18 +2956,33 @@ class PlaywrightCdpBrowserSession:
         payload["captured_from_iframe"] = cr_frame is not None
         return payload
 
-    # Hosts that can legitimately render the actual CR document inside an
-    # iframe nested in the OVE-internal viewer. Anything in this set is a
-    # valid snapshot target. auth.manheim.com is explicitly excluded — that
-    # would be an SSO bounce, not the CR.
-    _CR_FRAME_HOSTS = ("manheim.com", "content.liquidmotors.com")
+    # Specific hostnames that legitimately render CR content inside an
+    # iframe. Must be exact subdomain matches to avoid false positives
+    # from tracking pixels (e.g. manheim.demdex.net matched the old
+    # broad "manheim.com" check and returned a tracking iframe instead
+    # of the CR, producing a payload with listing JSON as raw_text
+    # instead of inspection report text).
+    _CR_FRAME_HOSTS = (
+        "inspectionreport.manheim.com",
+        "insightcr.manheim.com",
+        "mmsc400.manheim.com",
+        "content.liquidmotors.com",
+    )
+
+    # Hosts that should NEVER be selected as the CR snapshot target.
+    _CR_FRAME_EXCLUDE = (
+        "auth.manheim.com",
+        "demdex.net",
+        "omtrdc.net",
+        "assets.adobedtm.com",
+    )
 
     def _find_manheim_cr_frame(self, page: Page) -> Any:
         """Locate the iframe rendering the Manheim/liquidmotors CR, if present.
 
-        Returns a Playwright Frame whose URL is on a known CR-provider host
-        (other than auth.manheim.com), or None when no such frame exists
-        (e.g. the direct-goto path where the CR is the top-level document).
+        Returns a Playwright Frame whose URL is on a known CR-provider host,
+        or None when no such frame exists (e.g. the direct-goto path where
+        the CR is the top-level document).
         """
         try:
             frames = list(page.frames)
@@ -2969,7 +2999,8 @@ class PlaywrightCdpBrowserSession:
                 continue
             if not frame_url:
                 continue
-            if "auth.manheim.com" in frame_url:
+            # Skip known non-CR iframes (tracking, auth, analytics)
+            if any(excluded in frame_url for excluded in self._CR_FRAME_EXCLUDE):
                 continue
             # Skip the outer OVE document itself — page.frames includes the
             # main frame as the first entry.

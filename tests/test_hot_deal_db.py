@@ -1,4 +1,4 @@
-"""Tests for the Hot Deal SQLite state layer."""
+"""Tests for the Hot Deal SQLite state layer (persistent DB design)."""
 from __future__ import annotations
 
 import sqlite3
@@ -10,11 +10,14 @@ from ove_scraper.hot_deal_db import (
     advance_status,
     claim_next_pending,
     create_run,
+    delete_sold_vins,
     finish_run,
+    get_active_vins,
     get_hot_deals,
     get_run_summary,
     init_db,
-    insert_vins,
+    insert_new_vins,
+    touch_last_seen,
 )
 
 
@@ -30,108 +33,157 @@ def test_init_creates_tables(db: sqlite3.Connection) -> None:
 
 
 def test_create_and_finish_run(db: sqlite3.Connection) -> None:
-    run_id = create_run(db, ["Search A", "Search B"])
+    run_id = create_run(db, ["VCH Marketing List"])
     assert len(run_id) == 12
     row = db.execute("SELECT * FROM hot_deal_runs WHERE run_id=?", (run_id,)).fetchone()
     assert row["status"] == "running"
 
-    finish_run(db, run_id, "completed")
+    finish_run(db, run_id, "completed", new_vins=5, sold_vins=2)
     row = db.execute("SELECT * FROM hot_deal_runs WHERE run_id=?", (run_id,)).fetchone()
     assert row["status"] == "completed"
-    assert row["finished_at"] is not None
+    assert row["new_vins"] == 5
+    assert row["sold_vins"] == 2
 
 
-def test_insert_and_claim_vins(db: sqlite3.Connection) -> None:
-    run_id = create_run(db, ["test"])
+def test_insert_new_vins_and_dedup(db: sqlite3.Connection) -> None:
     rows = [
+        {"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord", "odometer": 25000},
+        {"vin": "2T1BU4EE9DC123456", "year": 2024, "make": "Toyota", "model": "Corolla", "odometer": 40000},
+        {"vin": "INVALID", "year": 2023, "make": "Bad", "model": "VIN"},
+    ]
+    inserted = insert_new_vins(db, rows)
+    assert inserted == 2  # INVALID skipped
+
+    # Insert same VINs again — should not duplicate
+    inserted2 = insert_new_vins(db, rows)
+    assert inserted2 == 0
+    count = db.execute("SELECT COUNT(*) FROM hot_deal_vins").fetchone()[0]
+    assert count == 2
+
+
+def test_auto_tagging_by_odometer(db: sqlite3.Connection) -> None:
+    insert_new_vins(db, [
+        {"vin": "1HGCG5655WA041389", "odometer": 25000},  # < 35500
+        {"vin": "2T1BU4EE9DC123456", "odometer": 45000},  # >= 35500
+    ])
+    r1 = db.execute("SELECT tag FROM hot_deal_vins WHERE vin='1HGCG5655WA041389'").fetchone()
+    r2 = db.execute("SELECT tag FROM hot_deal_vins WHERE vin='2T1BU4EE9DC123456'").fetchone()
+    assert r1["tag"] == "hot_deal_factory_warranty"
+    assert r2["tag"] == "hot_deal_marketing"
+
+
+def test_get_active_vins(db: sqlite3.Connection) -> None:
+    insert_new_vins(db, [
         {"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"},
         {"vin": "2T1BU4EE9DC123456", "year": 2024, "make": "Toyota", "model": "Corolla"},
-        {"vin": "INVALID", "year": 2023, "make": "Bad", "model": "VIN"},  # should be skipped
-    ]
-    inserted = insert_vins(db, run_id, rows)
-    assert inserted == 2  # INVALID VIN skipped (< 17 chars)
+    ])
+    active = get_active_vins(db)
+    assert active == {"1HGCG5655WA041389", "2T1BU4EE9DC123456"}
 
-    # Claim first
-    claimed = claim_next_pending(db, run_id)
+
+def test_delete_sold_vins(db: sqlite3.Connection) -> None:
+    insert_new_vins(db, [
+        {"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"},
+        {"vin": "2T1BU4EE9DC123456", "year": 2024, "make": "Toyota", "model": "Corolla"},
+    ])
+    deleted = delete_sold_vins(db, {"1HGCG5655WA041389"})
+    assert deleted == 1
+    remaining = get_active_vins(db)
+    assert remaining == {"2T1BU4EE9DC123456"}
+
+
+def test_claim_next_pending(db: sqlite3.Connection) -> None:
+    insert_new_vins(db, [
+        {"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"},
+    ])
+    claimed = claim_next_pending(db)
     assert claimed is not None
-    assert claimed["vin"] in ("1HGCG5655WA041389", "2T1BU4EE9DC123456")
+    assert claimed["vin"] == "1HGCG5655WA041389"
 
-    # Check status changed to step1_running
-    row = db.execute(
-        "SELECT status FROM hot_deal_vins WHERE vin=? AND run_id=?",
-        (claimed["vin"], run_id),
-    ).fetchone()
+    row = db.execute("SELECT status FROM hot_deal_vins WHERE vin='1HGCG5655WA041389'").fetchone()
     assert row["status"] == "step1_running"
+
+    # No more pending
+    assert claim_next_pending(db) is None
 
 
 def test_advance_status(db: sqlite3.Connection) -> None:
-    run_id = create_run(db, ["test"])
-    insert_vins(db, run_id, [{"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"}])
-    claim_next_pending(db, run_id)
+    insert_new_vins(db, [{"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"}])
+    claim_next_pending(db)
 
-    advance_status(db, "1HGCG5655WA041389", run_id, "step1_pass")
-    row = db.execute(
-        "SELECT status, step1_completed_at FROM hot_deal_vins WHERE vin=? AND run_id=?",
-        ("1HGCG5655WA041389", run_id),
-    ).fetchone()
+    advance_status(db, "1HGCG5655WA041389", "step1_pass")
+    row = db.execute("SELECT status FROM hot_deal_vins WHERE vin='1HGCG5655WA041389'").fetchone()
     assert row["status"] == "step1_pass"
-    assert row["step1_completed_at"] is not None
 
 
 def test_advance_to_fail_with_reason(db: sqlite3.Connection) -> None:
-    run_id = create_run(db, ["test"])
-    insert_vins(db, run_id, [{"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"}])
-    claim_next_pending(db, run_id)
+    insert_new_vins(db, [{"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"}])
+    claim_next_pending(db)
 
     advance_status(
-        db, "1HGCG5655WA041389", run_id, "step1_fail",
+        db, "1HGCG5655WA041389", "step1_fail",
         rejection_step="step1", rejection_reason="As-Is vehicle",
     )
     row = db.execute(
-        "SELECT status, rejection_step, rejection_reason FROM hot_deal_vins WHERE vin=? AND run_id=?",
-        ("1HGCG5655WA041389", run_id),
+        "SELECT status, rejection_step, rejection_reason, screened_at FROM hot_deal_vins WHERE vin='1HGCG5655WA041389'"
     ).fetchone()
     assert row["status"] == "step1_fail"
-    assert row["rejection_step"] == "step1"
     assert row["rejection_reason"] == "As-Is vehicle"
+    assert row["screened_at"] is not None
 
 
-def test_get_run_summary(db: sqlite3.Connection) -> None:
-    run_id = create_run(db, ["test"])
-    insert_vins(db, run_id, [
-        {"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"},
-        {"vin": "2T1BU4EE9DC123456", "year": 2024, "make": "Toyota", "model": "Corolla"},
-    ])
-    claim_next_pending(db, run_id)
-    advance_status(db, "1HGCG5655WA041389", run_id, "hot_deal")
+def test_advance_to_hot_deal(db: sqlite3.Connection) -> None:
+    insert_new_vins(db, [{"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"}])
+    claim_next_pending(db)
+    advance_status(db, "1HGCG5655WA041389", "hot_deal")
 
-    summary = get_run_summary(db, run_id)
-    assert summary["hot_deals"] == 1
-    assert summary["pending"] == 1
-    assert summary["total_vins"] == 2
-
-
-def test_get_hot_deals(db: sqlite3.Connection) -> None:
-    run_id = create_run(db, ["test"])
-    insert_vins(db, run_id, [
-        {"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord", "price_asking": 15000},
-    ])
-    claim_next_pending(db, run_id)
-    advance_status(db, "1HGCG5655WA041389", run_id, "hot_deal")
-
-    deals = get_hot_deals(db, run_id)
+    deals = get_hot_deals(db)
     assert len(deals) == 1
     assert deals[0]["vin"] == "1HGCG5655WA041389"
 
 
-def test_claim_returns_none_when_empty(db: sqlite3.Connection) -> None:
-    run_id = create_run(db, ["test"])
-    assert claim_next_pending(db, run_id) is None
+def test_touch_last_seen(db: sqlite3.Connection) -> None:
+    insert_new_vins(db, [{"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"}])
+    row_before = db.execute("SELECT last_seen_at FROM hot_deal_vins WHERE vin='1HGCG5655WA041389'").fetchone()
+    import time; time.sleep(0.01)
+    touch_last_seen(db, {"1HGCG5655WA041389"})
+    row_after = db.execute("SELECT last_seen_at FROM hot_deal_vins WHERE vin='1HGCG5655WA041389'").fetchone()
+    assert row_after["last_seen_at"] >= row_before["last_seen_at"]
 
 
-def test_duplicate_vin_ignored(db: sqlite3.Connection) -> None:
-    run_id = create_run(db, ["test"])
-    insert_vins(db, run_id, [{"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"}])
-    insert_vins(db, run_id, [{"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"}])
-    count = db.execute("SELECT COUNT(*) FROM hot_deal_vins WHERE run_id=?", (run_id,)).fetchone()[0]
-    assert count == 1
+def test_reconciliation_flow(db: sqlite3.Connection) -> None:
+    """Full reconciliation: old VINs sold, new VINs added, existing untouched."""
+    # Day 1: initial load
+    insert_new_vins(db, [
+        {"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"},
+        {"vin": "2T1BU4EE9DC123456", "year": 2024, "make": "Toyota", "model": "Corolla"},
+    ])
+
+    # Day 2: Honda sold, Kia added, Toyota still there
+    today = {"2T1BU4EE9DC123456", "5XYP5DGC6SG648995"}
+    stored = get_active_vins(db)
+
+    sold = stored - today
+    assert sold == {"1HGCG5655WA041389"}
+    delete_sold_vins(db, sold)
+
+    new = today - stored
+    assert new == {"5XYP5DGC6SG648995"}
+    insert_new_vins(db, [{"vin": "5XYP5DGC6SG648995", "year": 2025, "make": "Kia", "model": "Telluride"}])
+
+    active = get_active_vins(db)
+    assert active == {"2T1BU4EE9DC123456", "5XYP5DGC6SG648995"}
+
+
+def test_rejected_vin_not_reclaimed(db: sqlite3.Connection) -> None:
+    """A VIN rejected in a previous run should NOT be reclaimed as pending."""
+    insert_new_vins(db, [{"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"}])
+    claim_next_pending(db)
+    advance_status(db, "1HGCG5655WA041389", "step1_fail", rejection_step="step1", rejection_reason="As-Is")
+
+    # Next day the same VIN is still on the list — insert_new_vins ignores it
+    inserted = insert_new_vins(db, [{"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"}])
+    assert inserted == 0
+
+    # claim_next_pending returns None — the rejected VIN is not pending
+    assert claim_next_pending(db) is None

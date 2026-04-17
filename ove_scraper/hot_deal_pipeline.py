@@ -1,14 +1,18 @@
 """Hot Deal vehicle screening pipeline orchestrator.
 
-Exports two saved searches, loads VINs into SQLite, and runs each VIN
-through a 3-step screening pipeline: CR analysis → AutoCheck modal →
-Google VIN search. Shares the browser via OveAutomationLock.
+Daily workflow:
+1. Export "VCH Marketing List" saved search (single list)
+2. Reconcile against persistent SQLite DB:
+   - VINs on list + in DB → skip (already processed)
+   - VINs on list + NOT in DB → new, add and screen
+   - VINs in DB + NOT on list → sold, hard-delete
+3. Screen each NEW VIN through 3-step pipeline
+4. Report results
 """
 from __future__ import annotations
 
 import json
 import logging
-import time
 from pathlib import Path
 from typing import Any
 
@@ -20,10 +24,13 @@ from ove_scraper.hot_deal_db import (
     advance_status,
     claim_next_pending,
     create_run,
+    delete_sold_vins,
     finish_run,
+    get_active_vins,
     get_hot_deals,
     get_run_summary,
-    insert_vins,
+    insert_new_vins,
+    touch_last_seen,
 )
 from ove_scraper.hot_deal_report import format_hot_deal_summary
 from ove_scraper.hot_deal_screener import (
@@ -33,8 +40,6 @@ from ove_scraper.hot_deal_screener import (
 )
 from ove_scraper.notifier import AdminNotifier
 from ove_scraper.openai_web_search import search_vin_salvage_history
-from ove_scraper.condition_report_normalizer import normalize_condition_report
-from ove_scraper.cr_parsers import parse_condition_report_text
 
 logger = logging.getLogger(__name__)
 
@@ -57,52 +62,76 @@ class HotDealPipelineRunner:
         self.notifier = notifier
 
     def run_once(self) -> dict[str, Any]:
-        """Run the full pipeline: export → load → screen → report."""
-        search_names = list(self.settings.hot_deal_searches)
-        run_id = create_run(self.db, search_names)
+        """Run the full pipeline: export → reconcile → screen → report."""
+        # Use only VCH Marketing List (Factory Warranty Active is a subset)
+        search_name = self.settings.hot_deal_searches[-1]  # "VCH Marketing List"
+        run_id = create_run(self.db, [search_name])
         errors: list[str] = []
-        self.log.info("Hot Deal pipeline started: run_id=%s searches=%s", run_id, search_names)
+        new_count = 0
+        sold_count = 0
+        self.log.info("Hot Deal pipeline started: run_id=%s search=%s", run_id, search_name)
 
         try:
-            # Phase 1: Export saved searches
-            csv_paths = self._export_searches(search_names)
-            if not csv_paths:
-                raise RuntimeError("No CSV files exported from saved searches")
+            # Phase 1: Export saved search
+            csv_path = self._export_search(search_name)
+            if csv_path is None:
+                raise RuntimeError(f"Failed to export saved search '{search_name}'")
 
-            # Phase 2: Load VINs into SQLite
-            total = self._load_vins(run_id, csv_paths)
-            self.log.info("Hot Deal: loaded %d VINs into run %s", total, run_id)
+            # Phase 2: Reconcile — dedup, find new, delete sold
+            today_vins, today_rows = self._parse_csv(csv_path)
+            stored_vins = get_active_vins(self.db)
 
-            # Phase 3: Process each VIN through 3-step pipeline
+            # VINs on list but not in DB → new
+            new_vins = today_vins - stored_vins
+            # VINs in DB but not on list → sold
+            sold_vins = stored_vins - today_vins
+            # VINs on both → still active (update last_seen)
+            still_active = stored_vins & today_vins
+
+            if sold_vins:
+                sold_count = delete_sold_vins(self.db, sold_vins)
+                self.log.info("Hot Deal: deleted %d sold VINs", sold_count)
+
+            if still_active:
+                touch_last_seen(self.db, still_active)
+
+            new_rows = [r for r in today_rows if r["vin"] in new_vins]
+            new_count = insert_new_vins(self.db, new_rows)
+            self.log.info(
+                "Hot Deal: %d on list, %d already in DB, %d new, %d sold",
+                len(today_vins), len(still_active), new_count, sold_count,
+            )
+
+            # Phase 3: Screen each NEW VIN through 3-step pipeline
             processed = 0
             while True:
-                vin_row = claim_next_pending(self.db, run_id)
+                vin_row = claim_next_pending(self.db)
                 if vin_row is None:
                     break
                 vin = vin_row["vin"]
                 processed += 1
-                self.log.info("Hot Deal [%d]: processing VIN %s", processed, vin)
+                self.log.info("Hot Deal [%d/%d]: processing VIN %s", processed, new_count, vin)
                 try:
-                    self._process_vin(vin, run_id)
+                    self._process_vin(vin)
                 except Exception as exc:
                     err_msg = f"VIN {vin}: {type(exc).__name__}: {exc}"
                     self.log.error("Hot Deal pipeline error: %s", err_msg)
                     errors.append(err_msg)
                     advance_status(
-                        self.db, vin, run_id, "step1_fail",
+                        self.db, vin, "step1_fail",
                         rejection_step="error", rejection_reason=str(exc),
                     )
 
-            finish_run(self.db, run_id, "completed", errors or None)
+            finish_run(self.db, run_id, "completed", new_vins=new_count, sold_vins=sold_count, error_details=errors or None)
 
         except Exception as exc:
             self.log.error("Hot Deal pipeline failed: %s", exc)
             errors.append(str(exc))
-            finish_run(self.db, run_id, "failed", errors)
+            finish_run(self.db, run_id, "failed", new_vins=new_count, sold_vins=sold_count, error_details=errors)
 
         # Phase 4: Report
         summary = get_run_summary(self.db, run_id)
-        hot_deals = get_hot_deals(self.db, run_id)
+        hot_deals = get_hot_deals(self.db)
         report_text = format_hot_deal_summary(summary, hot_deals)
         self.log.info("Hot Deal pipeline complete:\n%s", report_text)
 
@@ -116,66 +145,60 @@ class HotDealPipelineRunner:
 
         return summary
 
-    def _export_searches(self, search_names: list[str]) -> list[Path]:
-        """Export each saved search CSV using the browser, with locking."""
-        csv_paths: list[Path] = []
+    def _export_search(self, search_name: str) -> Path | None:
+        """Export a single saved search CSV using the browser."""
         export_dir = self.settings.export_dir / "hot-deal"
         export_dir.mkdir(parents=True, exist_ok=True)
+        self.log.info("Hot Deal: exporting saved search '%s'", search_name)
+        try:
+            with OveAutomationLock(timeout_seconds=600):
+                path = self.browser.export_saved_search(
+                    search_name=search_name,
+                    export_dir=export_dir,
+                )
+            if path and path.exists():
+                self.log.info("Hot Deal: exported '%s' -> %s", search_name, path)
+                return path
+            self.log.warning("Hot Deal: export returned no file for '%s'", search_name)
+        except Exception as exc:
+            self.log.error("Hot Deal: export failed for '%s': %s", search_name, exc)
+        return None
 
-        for name in search_names:
-            self.log.info("Hot Deal: exporting saved search '%s'", name)
-            try:
-                with OveAutomationLock(timeout_seconds=600):
-                    path = self.browser.export_saved_search(
-                        search_name=name,
-                        export_dir=export_dir,
-                    )
-                if path and path.exists():
-                    csv_paths.append(path)
-                    self.log.info("Hot Deal: exported '%s' -> %s", name, path)
-                else:
-                    self.log.warning("Hot Deal: export returned no file for '%s'", name)
-            except Exception as exc:
-                self.log.error("Hot Deal: export failed for '%s': %s", name, exc)
-        return csv_paths
+    def _parse_csv(self, csv_path: Path) -> tuple[set[str], list[dict]]:
+        """Parse exported CSV into a set of VINs and a list of row dicts."""
+        rows_raw = load_csv_rows(csv_path)
+        today_vins: set[str] = set()
+        today_rows: list[dict] = []
 
-    def _load_vins(self, run_id: str, csv_paths: list[Path]) -> int:
-        """Load and dedup VINs from exported CSVs into the database."""
-        all_rows: list[dict] = []
-        seen_vins: set[str] = set()
+        for row in rows_raw:
+            vin = (row.get("Vin") or row.get("VIN") or row.get("vin") or "").strip().upper()
+            if not vin or len(vin) != 17 or vin in today_vins:
+                continue
+            today_vins.add(vin)
+            today_rows.append({
+                "vin": vin,
+                "year": _safe_int(row.get("Year") or row.get("year")),
+                "make": row.get("Make") or row.get("make"),
+                "model": row.get("Model") or row.get("model"),
+                "trim": row.get("Trim") or row.get("trim"),
+                "odometer": _safe_int(
+                    row.get("Odometer Value") or row.get("Mileage")
+                    or row.get("Odometer") or row.get("odometer")
+                ),
+                "price_asking": _safe_float(
+                    row.get("Buy Now Price") or row.get("Asking Price")
+                    or row.get("Buy Now") or row.get("Floor Price")
+                ),
+                "condition_grade": (
+                    row.get("Condition Report Grade") or row.get("Condition")
+                    or row.get("Grade")
+                ),
+                "location_state": row.get("Pickup Location") or row.get("State"),
+            })
 
-        for path in csv_paths:
-            rows = load_csv_rows(path)
-            for row in rows:
-                # OVE CSV column is "Vin" (title case). Also accept "VIN" /
-                # "vin" for robustness if OVE changes its casing.
-                vin = (row.get("Vin") or row.get("VIN") or row.get("vin") or "").strip().upper()
-                if vin and len(vin) == 17 and vin not in seen_vins:
-                    seen_vins.add(vin)
-                    all_rows.append({
-                        "vin": vin,
-                        "year": _safe_int(row.get("Year") or row.get("year")),
-                        "make": row.get("Make") or row.get("make"),
-                        "model": row.get("Model") or row.get("model"),
-                        "trim": row.get("Trim") or row.get("trim"),
-                        "odometer": _safe_int(
-                            row.get("Odometer Value") or row.get("Mileage")
-                            or row.get("Odometer") or row.get("odometer")
-                        ),
-                        "price_asking": _safe_float(
-                            row.get("Buy Now Price") or row.get("Asking Price")
-                            or row.get("Buy Now") or row.get("Floor Price")
-                        ),
-                        "condition_grade": (
-                            row.get("Condition Report Grade") or row.get("Condition")
-                            or row.get("Grade")
-                        ),
-                        "location_state": row.get("Pickup Location") or row.get("State"),
-                    })
+        return today_vins, today_rows
 
-        return insert_vins(self.db, run_id, all_rows)
-
-    def _process_vin(self, vin: str, run_id: str) -> None:
+    def _process_vin(self, vin: str) -> None:
         """Run a single VIN through all 3 screening steps."""
         artifact_dir = self.settings.artifact_dir / "hot-deal" / vin
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -192,7 +215,7 @@ class HotDealPipelineRunner:
 
         if cr is None:
             advance_status(
-                self.db, vin, run_id, "step1_fail",
+                self.db, vin, "step1_fail",
                 rejection_step="step1", rejection_reason="No condition report available",
             )
             return
@@ -201,43 +224,52 @@ class HotDealPipelineRunner:
         cr_json = json.dumps({"passed": step1.passed, "reason": step1.reason})
         if not step1.passed:
             advance_status(
-                self.db, vin, run_id, "step1_fail",
+                self.db, vin, "step1_fail",
                 rejection_step="step1", rejection_reason=step1.reason,
                 data_column="cr_data", data_value=cr_json,
             )
             self.log.info("VIN %s FAILED step1: %s", vin, step1.reason)
             return
 
-        advance_status(self.db, vin, run_id, "step1_pass", data_column="cr_data", data_value=cr_json)
+        advance_status(self.db, vin, "step1_pass", data_column="cr_data", data_value=cr_json)
         self.log.info("VIN %s PASSED step1", vin)
 
-        # Step 2: AutoCheck modal
+        # Step 2: AutoCheck — read from deep scrape result (already captured)
         self.log.info("Step 2 (AutoCheck) for VIN %s", vin)
-        advance_status(self.db, vin, run_id, "step2_running")
-        with OveAutomationLock(timeout_seconds=600):
-            autocheck_data = self.browser.scrape_autocheck_modal(vin, artifact_dir)
+        advance_status(self.db, vin, "step2_running")
+
+        autocheck_data = {}
+        if cr.autocheck:
+            autocheck_data = cr.autocheck.model_dump()
+        elif listing_json.get("autocheck"):
+            # Fallback to listing JSON autocheck flags
+            ac = listing_json["autocheck"]
+            autocheck_data = {
+                "title_brand_check": "OK" if ac.get("titleAndProblemCheckOK") else "Problem Reported",
+                "odometer_check": "OK" if ac.get("odometerCheckOK") else "Problem Reported",
+            }
 
         step2 = screen_autocheck(autocheck_data)
         ac_json = json.dumps({"passed": step2.passed, "reason": step2.reason})
         if not step2.passed:
             advance_status(
-                self.db, vin, run_id, "step2_fail",
+                self.db, vin, "step2_fail",
                 rejection_step="step2", rejection_reason=step2.reason,
                 data_column="autocheck_data", data_value=ac_json,
             )
             self.log.info("VIN %s FAILED step2: %s", vin, step2.reason)
             return
 
-        advance_status(self.db, vin, run_id, "step2_pass", data_column="autocheck_data", data_value=ac_json)
+        advance_status(self.db, vin, "step2_pass", data_column="autocheck_data", data_value=ac_json)
         self.log.info("VIN %s PASSED step2", vin)
 
         # Step 3: Google VIN search (no browser lock needed)
         self.log.info("Step 3 (web search) for VIN %s", vin)
-        advance_status(self.db, vin, run_id, "step3_running")
+        advance_status(self.db, vin, "step3_running")
 
         if not self.settings.openai_api_key:
             self.log.warning("OPENAI_API_KEY not set; skipping step3 for VIN %s", vin)
-            advance_status(self.db, vin, run_id, "hot_deal")
+            advance_status(self.db, vin, "hot_deal")
             return
 
         search_result = search_vin_salvage_history(
@@ -247,17 +279,20 @@ class HotDealPipelineRunner:
         )
 
         step3 = screen_vin_web_search(search_result)
-        ws_json = json.dumps({"passed": step3.passed, "reason": step3.reason, "sites": search_result.get("found_on_salvage_sites", [])})
+        ws_json = json.dumps({
+            "passed": step3.passed, "reason": step3.reason,
+            "sites": search_result.get("found_on_salvage_sites", []),
+        })
         if not step3.passed:
             advance_status(
-                self.db, vin, run_id, "step3_fail",
+                self.db, vin, "step3_fail",
                 rejection_step="step3", rejection_reason=step3.reason,
                 data_column="websearch_data", data_value=ws_json,
             )
             self.log.info("VIN %s FAILED step3: %s", vin, step3.reason)
             return
 
-        advance_status(self.db, vin, run_id, "hot_deal", data_column="websearch_data", data_value=ws_json)
+        advance_status(self.db, vin, "hot_deal", data_column="websearch_data", data_value=ws_json)
         self.log.info("VIN %s is a HOT DEAL", vin)
 
 
