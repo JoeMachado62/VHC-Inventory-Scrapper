@@ -90,6 +90,27 @@ class IngestPayload(BaseModel):
     sync_metadata: SyncMetadata
 
 
+class AutoCheckReport(BaseModel):
+    """AutoCheck Vehicle History Report data scraped from OVE listing."""
+    model_config = ConfigDict(extra="ignore")
+
+    scrape_status: str = "not_attempted"  # success | partial | failed | not_attempted
+    autocheck_score: int | None = None
+    owner_count: int | None = None
+    accident_count: int | None = None
+    title_brand_check: str | None = None  # "OK" | "Problem Reported"
+    odometer_check: str | None = None     # "OK" | "Problem Reported"
+    accident_check: str | None = None
+    damage_check: str | None = None
+    vehicle_use: str | None = None
+    buyback_protection: str | None = None
+    view_report_href: str | None = None
+    full_report_text: str | None = None
+    raw_text: str | None = None
+    failure_category: str | None = None
+    failure_message: str | None = None
+
+
 class ConditionReport(BaseModel):
     overall_grade: str | None = None
     structural_damage: bool | None = None
@@ -159,6 +180,7 @@ class ConditionReport(BaseModel):
     # coexist when both source formats are available; the VPS template
     # renders whichever is populated.
     equipment_features: list[str] = Field(default_factory=list)
+    autocheck: AutoCheckReport | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

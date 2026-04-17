@@ -34,6 +34,22 @@ EASTERN_TZ = ZoneInfo("America/New_York")
 # killed mid-scrape and leaving claims dangling on the VPS.
 SHUTDOWN_EVENT = threading.Event()
 
+# Auth-failure circuit breaker.  When recover_browser_session raises
+# BrowserSessionError repeatedly (auth genuinely gone, not a transient
+# CDP glitch), the main loop backs off exponentially instead of
+# hammering OVE every few seconds and risking an account ban.
+#
+#   _AUTH_FAIL_COUNT   backoff (seconds)
+#   1                  30
+#   2                  60
+#   3                  120
+#   4                  240
+#   5+                 300  (cap — parked until manual intervention)
+#
+_AUTH_FAIL_COUNT = 0
+_AUTH_FAIL_MAX_BACKOFF = 300          # 5 minutes cap
+_AUTH_FAIL_PARK_THRESHOLD = 5         # after 5 consecutive failures, park
+
 # Shared mutable heartbeat state. The main loop updates these fields as
 # it observes new events (sync_ok, poll_ok, claim taken, etc); the
 # background heartbeat ticker reads them every 30s and POSTs them to
@@ -94,6 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    global _AUTH_FAIL_COUNT  # must appear before any assignment in this scope
     # Suppress Node.js deprecation warnings from Playwright
     os.environ["NODE_OPTIONS"] = "--no-deprecation"
 
@@ -187,6 +204,7 @@ def main() -> None:
                                 sync_runner=sync_runner,
                                 notifier=notifier,
                             )
+                            _AUTH_FAIL_COUNT = 0  # reset circuit breaker on success
                             if sync_result is not None and getattr(sync_result, "execution_status", None) == "Success":
                                 _HEARTBEAT_STATE["last_sync_at"] = _utc_now_iso()
                                 _HEARTBEAT_STATE["status_note"] = "snapshot_ok"
@@ -216,6 +234,7 @@ def main() -> None:
                             deep_scrape_worker=deep_scrape_worker,
                             notifier=notifier,
                         )
+                        _AUTH_FAIL_COUNT = 0  # reset circuit breaker on success
                         _HEARTBEAT_STATE["last_poll_at"] = _utc_now_iso()
                         if isinstance(poll_result, list) and poll_result:
                             _HEARTBEAT_STATE["last_claim_at"] = _HEARTBEAT_STATE["last_poll_at"]
@@ -242,8 +261,46 @@ def main() -> None:
                     # Wait on the shutdown event instead of a plain sleep so
                     # SIGINT/SIGTERM/SIGBREAK wake the loop within 1s.
                     SHUTDOWN_EVENT.wait(timeout=1.0)
+                except BrowserSessionError as exc:
+                    _AUTH_FAIL_COUNT += 1
+                    backoff = min(30 * (2 ** (_AUTH_FAIL_COUNT - 1)), _AUTH_FAIL_MAX_BACKOFF)
+                    _HEARTBEAT_STATE["status_note"] = f"auth_fail_{_AUTH_FAIL_COUNT}"
+
+                    if _AUTH_FAIL_COUNT >= _AUTH_FAIL_PARK_THRESHOLD:
+                        logger.error(
+                            "Auth failed %d consecutive times (parked). "
+                            "Manual login required — scraper will exit. Backoff was %ds.",
+                            _AUTH_FAIL_COUNT, backoff,
+                        )
+                        if notifier is not None:
+                            notifier.notify_browser_auth_lost(
+                                reason=f"PARKED after {_AUTH_FAIL_COUNT} consecutive auth failures: {exc}",
+                                context={
+                                    "chrome_debug_host": settings.chrome_debug_host,
+                                    "chrome_debug_port": settings.chrome_debug_port,
+                                    "node_id": settings.scraper_node_id,
+                                    "consecutive_failures": _AUTH_FAIL_COUNT,
+                                },
+                                logger=logger,
+                            )
+                        SHUTDOWN_EVENT.set()
+                        break
+
+                    logger.warning(
+                        "Auth failure #%d; backing off %ds before retry: %s",
+                        _AUTH_FAIL_COUNT, backoff, exc,
+                    )
+                    try:
+                        api_client.close()
+                    finally:
+                        if hasattr(browser, "close"):
+                            browser.close()
+                    if SHUTDOWN_EVENT.wait(timeout=backoff):
+                        break
+                    browser, api_client, sync_runner, deep_scrape_worker, notifier = build_runtime(settings, logger)
+
                 except Exception as exc:
-                    logger.exception("OVE main loop crashed; rebuilding runtime: %s", exc)
+                    logger.exception("OVE main loop crashed (non-auth); rebuilding runtime: %s", exc)
                     try:
                         api_client.close()
                     finally:

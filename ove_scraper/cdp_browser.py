@@ -25,6 +25,7 @@ from ove_scraper.browser import (
     DeepScrapeResult,
     ListingNotFoundError,
     ManheimAuthRedirectError,
+    SavedSearchPageEmpty,
 )
 from ove_scraper.condition_report_normalizer import normalize_condition_report
 from ove_scraper.config import Settings
@@ -367,9 +368,19 @@ class PlaywrightCdpBrowserSession:
         try:
             page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
             try:
-                page.wait_for_selector("[data-test-id^='search name:']", timeout=15000)
-            except PlaywrightTimeoutError:
-                LOGGER.warning("Search-card elements did not render within 15s in list_saved_searches")
+                self._wait_for_saved_search_cards(page, timeout_ms=15_000)
+            except SavedSearchPageEmpty:
+                LOGGER.warning("Initial load returned empty saved searches; attempting recovery")
+                try:
+                    self._recover_empty_saved_searches(page)
+                except SavedSearchPageEmpty:
+                    # Last resort: close this page, open fresh one
+                    LOGGER.warning("In-page recovery failed; trying fresh browser page")
+                    self._close_page(page)
+                    page = self._open_dedicated_ove_page(browser)
+                    page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
+                    self._wait_for_saved_search_cards(page, timeout_ms=15_000)
+                    # If still SavedSearchPageEmpty, let it propagate
             names = page.evaluate(
                 """
                 () => {
@@ -461,12 +472,36 @@ class PlaywrightCdpBrowserSession:
                     download = self._trigger_export(page)
                     self._persist_download(download, target_path, search_name)
                     return target_path
+                except SavedSearchPageEmpty as exc:
+                    # OVE returned "No Saved Searches" — don't waste time on
+                    # the normal reset-and-retry, attempt escalating recovery.
+                    last_error = exc
+                    LOGGER.warning(
+                        "OVE returned 'No Saved Searches' during export attempt %s/%s "
+                        "for '%s'; attempting recovery before next retry",
+                        attempt + 1, max_attempts, search_name,
+                    )
+                    try:
+                        self._recover_empty_saved_searches(page)
+                        continue  # recovery succeeded; skip normal reset nav
+                    except SavedSearchPageEmpty:
+                        LOGGER.warning(
+                            "In-page recovery exhausted; opening fresh browser page"
+                        )
+                        self._close_page(page)
+                        page = self._open_dedicated_ove_page(browser)
+                        continue
                 except (BrowserSessionError, PlaywrightTimeoutError) as exc:
                     last_error = exc
 
+                # Normal reset between retries (for non-empty-page failures).
                 try:
                     page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
-                    page.wait_for_selector("[data-test-id^='search name:']", timeout=15000)
+                    self._wait_for_saved_search_cards(page, timeout_ms=15_000)
+                except SavedSearchPageEmpty:
+                    LOGGER.warning(
+                        "Reset to saved-searches returned empty page between retries"
+                    )
                 except Exception as nav_exc:
                     LOGGER.warning(
                         "Failed to reset page to saved-searches between export retries: %s",
@@ -632,6 +667,24 @@ class PlaywrightCdpBrowserSession:
             listing_json = self._extract_ove_listing_json(detail_page)
             if listing_json is None:
                 LOGGER.warning("Could not extract OVE listing JSON for VIN %s", vin)
+
+            # Capture AutoCheck BEFORE navigating to the CR page — the inline
+            # AutoCheck data lives on the listing page and will be lost after
+            # the CR click navigates away.
+            autocheck_data: dict[str, Any] | None = None
+            try:
+                LOGGER.info("Stage capture_autocheck: starting for VIN %s", vin)
+                autocheck_data = self._capture_autocheck_on_page(detail_page, vin, artifact_dir)
+                LOGGER.info(
+                    "Stage capture_autocheck: complete for VIN %s (score=%s, status=%s)",
+                    vin,
+                    autocheck_data.get("autocheck_score") if autocheck_data else None,
+                    autocheck_data.get("scrape_status", "unknown") if autocheck_data else "skipped",
+                )
+            except Exception as ac_exc:
+                LOGGER.warning("AutoCheck capture failed (non-fatal) for VIN %s: %s", vin, ac_exc)
+                autocheck_data = {"scrape_status": "failed", "failure_category": type(ac_exc).__name__, "failure_message": str(ac_exc)}
+
             LOGGER.info(
                 "Stage capture_condition_report: starting for VIN %s (link present=%s, listing_json=%s)",
                 vin,
@@ -664,6 +717,10 @@ class PlaywrightCdpBrowserSession:
                 report_link=condition_report_link,
                 listing_json=listing_json,
             )
+            # Attach AutoCheck report to the condition report
+            if condition_report and autocheck_data and autocheck_data.get("scrape_status") != "not_attempted":
+                from ove_scraper.schemas import AutoCheckReport
+                condition_report.autocheck = AutoCheckReport.model_validate(autocheck_data)
             if condition_report and report_page_payload:
                 condition_report.metadata = {
                     **condition_report.metadata,
@@ -760,21 +817,117 @@ class PlaywrightCdpBrowserSession:
             raise
         return page
 
+    # ------------------------------------------------------------------
+    # Saved-search page: detection, wait, and recovery helpers
+    # ------------------------------------------------------------------
+
+    def _detect_empty_saved_searches_page(self, page: Page) -> bool:
+        """Return True if the OVE saved-searches page rendered successfully
+        but shows 'No Saved Searches' (i.e., OVE's API returned empty data).
+        This is distinct from cards not rendering yet (slow React hydration)."""
+        try:
+            return page.evaluate(
+                '() => (document.body?.innerText || "").toLowerCase().includes("no saved search")'
+            )
+        except Exception:
+            return False
+
+    def _wait_for_saved_search_cards(self, page: Page, *, timeout_ms: int = 15_000) -> None:
+        """Wait for saved-search card elements to appear in the DOM.
+
+        Raises:
+            SavedSearchPageEmpty: page shows 'No Saved Searches' text.
+            BrowserSessionError: login page detected or cards never rendered.
+        """
+        if self._is_login_page(page):
+            raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
+
+        if self._detect_empty_saved_searches_page(page):
+            raise SavedSearchPageEmpty(
+                "OVE saved-searches page shows 'No Saved Searches' — "
+                "known intermittent OVE issue"
+            )
+
+        try:
+            page.wait_for_selector("[data-test-id^='search name:']", timeout=timeout_ms)
+        except PlaywrightTimeoutError:
+            if self._is_login_page(page):
+                raise BrowserSessionError(
+                    "OVE session expired during wait; browser redirected to login page"
+                )
+            if self._detect_empty_saved_searches_page(page):
+                raise SavedSearchPageEmpty(
+                    "OVE saved-searches page shows 'No Saved Searches' after "
+                    f"{timeout_ms}ms wait — known intermittent OVE issue"
+                )
+            raise BrowserSessionError(
+                f"Saved search cards did not render within {timeout_ms}ms — "
+                "possible cold session or OVE outage"
+            )
+
+    def _recovery_hard_reload(self, page: Page) -> None:
+        """Cache-busting reload of the saved-searches page."""
+        page.evaluate("() => location.reload(true)")
+        page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        page.wait_for_timeout(2000)
+
+    def _recovery_navigate_roundtrip(self, page: Page) -> None:
+        """Navigate to OVE homepage, wait, then back to saved searches.
+        Forces a fresh API call from the React app."""
+        page.goto(self.settings.ove_base_url, wait_until="domcontentloaded", timeout=15_000)
+        page.wait_for_timeout(3000)
+        page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=15_000)
+        page.wait_for_timeout(2000)
+
+    def _recover_empty_saved_searches(self, page: Page) -> None:
+        """Attempt escalating recovery when OVE returns 'No Saved Searches'.
+
+        Strategies tried in order:
+          1. Hard reload — clears cached response.
+          2. Navigate away to OVE homepage, then back — forces fresh API call.
+          3. Raise so the caller can try a fresh browser page.
+
+        Raises SavedSearchPageEmpty if all in-page strategies fail.
+        """
+        strategies: list[tuple[str, Any]] = [
+            ("hard_reload", self._recovery_hard_reload),
+            ("navigate_away_and_back", self._recovery_navigate_roundtrip),
+        ]
+        for i, (name, fn) in enumerate(strategies):
+            LOGGER.warning(
+                "Empty saved-searches recovery attempt %d/%d: strategy=%s",
+                i + 1, len(strategies) + 1, name,
+            )
+            try:
+                fn(page)
+            except Exception as exc:
+                LOGGER.warning("Recovery strategy '%s' raised: %s", name, exc)
+                continue
+
+            try:
+                self._wait_for_saved_search_cards(page, timeout_ms=10_000)
+                LOGGER.info("Recovery strategy '%s' succeeded", name)
+                return
+            except SavedSearchPageEmpty:
+                LOGGER.warning("Recovery strategy '%s' did not resolve empty page", name)
+                continue
+            except BrowserSessionError:
+                raise  # login page or other hard failure
+
+        raise SavedSearchPageEmpty(
+            "OVE 'No Saved Searches' persists after all in-page recovery strategies"
+        )
+
     def _open_saved_search(self, page: Page, search_name: str) -> None:
         # Use domcontentloaded rather than networkidle: the OVE saved-searches
         # page runs continuous analytics/polling XHRs that prevent networkidle
         # from ever firing (verified 2026-04-15 — the page renders fully but
         # the 500ms-idle condition never clears, so goto times out at 30s even
-        # though the saved-search cards are visible). The wait_for_selector
-        # below is the real readiness signal.
+        # though the saved-search cards are visible). The _wait_for_saved_search_cards
+        # call below is the real readiness signal, and also distinguishes
+        # "No Saved Searches" (SavedSearchPageEmpty) from slow hydration.
         page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
-        try:
-            page.wait_for_selector("[data-test-id^='search name:']", timeout=15000)
-        except PlaywrightTimeoutError as exc:
-            raise BrowserSessionError(
-                "Saved search cards did not render within 15s — "
-                "possible cold session or OVE outage"
-            ) from exc
+        self._wait_for_saved_search_cards(page, timeout_ms=15_000)
         matched_name = self._resolve_saved_search_name(page, search_name)
         # The saved-search card in the OVE UI is a nested div structure:
         #   <div data-test-id="search name: East Hub 2022-2024">      ← outer wrapper (NOT clickable)
@@ -904,8 +1057,8 @@ class PlaywrightCdpBrowserSession:
         # is also reachable from list_saved_searches which has its own
         # navigation path.
         try:
-            page.wait_for_selector("[data-test-id^='search name:']", timeout=10000)
-        except PlaywrightTimeoutError:
+            self._wait_for_saved_search_cards(page, timeout_ms=10_000)
+        except (SavedSearchPageEmpty, BrowserSessionError):
             LOGGER.warning("Search-card elements not found in DOM; _collect_saved_search_names may return empty")
         names = page.evaluate(
             """
@@ -1140,17 +1293,100 @@ class PlaywrightCdpBrowserSession:
     }
     """
 
-    def scrape_autocheck_modal(self, vin: str, artifact_dir: Path) -> dict[str, Any]:
-        """Extract AutoCheck data for a VIN from the OVE listing page.
+    def _capture_autocheck_on_page(
+        self, detail_page: Page, vin: str, artifact_dir: Path,
+    ) -> dict[str, Any]:
+        """Extract AutoCheck data from an already-open OVE detail page.
 
-        Primary strategy: extract inline AutoCheck data from the listing
-        page's data-test-id elements (score, owners, accidents, title/probs).
-        Fallback: click VIEW REPORT to open the full Experian popup.
+        Called from deep_scrape_vin (before CR navigation) and from
+        scrape_autocheck_modal (standalone Hot Deal wrapper).
         """
-        self.ensure_session()
         ac_artifact_dir = artifact_dir / "autocheck"
         ac_artifact_dir.mkdir(parents=True, exist_ok=True)
 
+        # Strategy 1: Extract inline AutoCheck data (most reliable)
+        LOGGER.info("AutoCheck: trying inline extraction for VIN %s", vin)
+        inline_data = detail_page.evaluate(self._AUTOCHECK_INLINE_EXTRACT_JS)
+        if inline_data and inline_data.get("score") is not None:
+            detail_page.screenshot(path=str(ac_artifact_dir / "autocheck-inline.png"), full_page=True)
+            (ac_artifact_dir / "autocheck-inline.html").write_text(detail_page.content(), encoding="utf-8")
+            LOGGER.info(
+                "AutoCheck inline: score=%s owners=%s accidents=%s for VIN %s",
+                inline_data.get("score"), inline_data.get("owners"),
+                inline_data.get("accidents"), vin,
+            )
+            result = self._parse_autocheck_inline(inline_data)
+
+            # Also try to get full Experian popup for complete report
+            try:
+                report_link = detail_page.locator("[data-test-id='auto-report-data'] a").first
+                if report_link.is_visible(timeout=2000):
+                    with detail_page.expect_popup(timeout=10000) as popup_info:
+                        report_link.click(timeout=5000)
+                    popup = popup_info.value
+                    popup.wait_for_load_state("domcontentloaded", timeout=15000)
+                    popup.wait_for_timeout(3000)
+                    popup.screenshot(path=str(ac_artifact_dir / "autocheck-popup.png"), full_page=True)
+                    (ac_artifact_dir / "autocheck-popup.html").write_text(popup.content(), encoding="utf-8")
+                    full_text = popup.inner_text("body")
+                    popup.close()
+                    result["full_report_text"] = full_text
+                    # Merge full popup details into result
+                    full_parsed = self._parse_autocheck_content(full_text)
+                    for key in ("title_brand_check", "odometer_check", "accident_check",
+                                "damage_check", "vehicle_use", "buyback_protection"):
+                        if full_parsed.get(key) and not result.get(key):
+                            result[key] = full_parsed[key]
+                    LOGGER.info("AutoCheck full report also captured for VIN %s (%d chars)", vin, len(full_text))
+            except Exception as popup_exc:
+                LOGGER.debug("AutoCheck full popup skipped for VIN %s: %s", vin, popup_exc)
+
+            result["scrape_status"] = "success"
+            return result
+
+        # Strategy 2: Click VIEW REPORT to open full Experian popup directly
+        LOGGER.info("AutoCheck: inline extraction empty, trying VIEW REPORT popup for VIN %s", vin)
+        report_link = detail_page.locator("[data-test-id='auto-report-data'] a").first
+        try:
+            if report_link.is_visible(timeout=3000):
+                with detail_page.expect_popup(timeout=10000) as popup_info:
+                    report_link.click(timeout=5000)
+                popup = popup_info.value
+                popup.wait_for_load_state("domcontentloaded", timeout=15000)
+                popup.wait_for_timeout(3000)
+                popup.screenshot(path=str(ac_artifact_dir / "autocheck-popup.png"), full_page=True)
+                (ac_artifact_dir / "autocheck-popup.html").write_text(popup.content(), encoding="utf-8")
+                content = popup.inner_text("body")
+                popup.close()
+                LOGGER.info("AutoCheck captured via VIEW REPORT popup for VIN %s (%d chars)", vin, len(content))
+                result = self._parse_autocheck_content(content)
+                result["full_report_text"] = content
+                result["scrape_status"] = "success"
+                return result
+        except Exception as popup_exc:
+            LOGGER.warning("AutoCheck VIEW REPORT popup failed for VIN %s: %s", vin, popup_exc)
+
+        # Strategy 3: Fall back to clicking AutoCheck button
+        ac_button = self._find_autocheck_button(detail_page)
+        if ac_button is not None:
+            LOGGER.info("AutoCheck: trying button click fallback for VIN %s", vin)
+            modal_content = self._open_autocheck_modal(detail_page, ac_button, ac_artifact_dir, vin)
+            result = self._parse_autocheck_content(modal_content)
+            result["scrape_status"] = "partial"
+            return result
+
+        LOGGER.warning("AutoCheck: no data found for VIN %s", vin)
+        detail_page.screenshot(path=str(ac_artifact_dir / "autocheck-none.png"), full_page=True)
+        return {"scrape_status": "failed", "failure_category": "not_found", "failure_message": "No AutoCheck data on listing page", "raw_text": ""}
+
+    def scrape_autocheck_modal(self, vin: str, artifact_dir: Path) -> dict[str, Any]:
+        """Standalone AutoCheck scrape — opens its own page for the VIN.
+
+        Used by the Hot Deal pipeline when a deep scrape isn't needed.
+        For deep scrape integration, _capture_autocheck_on_page is called
+        directly on the already-open detail page.
+        """
+        self.ensure_session()
         browser = self._connect_browser()
         seed_page = self._get_ove_page(browser.contexts)
         page = self._create_worker_page(seed_page.context, start_url=self._vin_results_url())
@@ -1159,54 +1395,13 @@ class PlaywrightCdpBrowserSession:
             LOGGER.info("AutoCheck scrape: opening listing for VIN %s", vin)
             detail_page, _ = self._open_listing_for_vin(page, vin, artifact_dir)
             self._wait_for_cr_link_to_render(detail_page, timeout_ms=8000)
-
-            # Strategy 1: Extract inline AutoCheck data (most reliable)
-            LOGGER.info("AutoCheck: trying inline extraction for VIN %s", vin)
-            inline_data = detail_page.evaluate(self._AUTOCHECK_INLINE_EXTRACT_JS)
-            if inline_data and inline_data.get("score") is not None:
-                detail_page.screenshot(path=str(ac_artifact_dir / "autocheck-inline.png"), full_page=True)
-                (ac_artifact_dir / "autocheck-inline.html").write_text(detail_page.content(), encoding="utf-8")
-                LOGGER.info(
-                    "AutoCheck inline: score=%s owners=%s accidents=%s for VIN %s",
-                    inline_data.get("score"), inline_data.get("owners"),
-                    inline_data.get("accidents"), vin,
-                )
-                return self._parse_autocheck_inline(inline_data)
-
-            # Strategy 2: Click VIEW REPORT to open full Experian popup
-            LOGGER.info("AutoCheck: inline extraction empty, trying VIEW REPORT popup for VIN %s", vin)
-            report_link = detail_page.locator("[data-test-id='auto-report-data'] a").first
-            if report_link.is_visible(timeout=3000):
-                try:
-                    with detail_page.expect_popup(timeout=10000) as popup_info:
-                        report_link.click(timeout=5000)
-                    popup = popup_info.value
-                    popup.wait_for_load_state("domcontentloaded", timeout=15000)
-                    popup.wait_for_timeout(3000)
-                    popup.screenshot(path=str(ac_artifact_dir / "autocheck-popup.png"), full_page=True)
-                    (ac_artifact_dir / "autocheck-popup.html").write_text(popup.content(), encoding="utf-8")
-                    content = popup.inner_text("body")
-                    popup.close()
-                    LOGGER.info("AutoCheck captured via VIEW REPORT popup for VIN %s (%d chars)", vin, len(content))
-                    return self._parse_autocheck_content(content)
-                except Exception as popup_exc:
-                    LOGGER.warning("AutoCheck VIEW REPORT popup failed for VIN %s: %s", vin, popup_exc)
-
-            # Strategy 3: Fall back to clicking AutoCheck button
-            ac_button = self._find_autocheck_button(detail_page)
-            if ac_button is not None:
-                LOGGER.info("AutoCheck: trying button click fallback for VIN %s", vin)
-                modal_content = self._open_autocheck_modal(detail_page, ac_button, ac_artifact_dir, vin)
-                return self._parse_autocheck_content(modal_content)
-
-            LOGGER.warning("AutoCheck: no data found for VIN %s", vin)
-            detail_page.screenshot(path=str(ac_artifact_dir / "autocheck-none.png"), full_page=True)
-            return {"error": "No AutoCheck data found", "raw_text": ""}
-
+            return self._capture_autocheck_on_page(detail_page, vin, artifact_dir)
         except Exception as exc:
             LOGGER.error("AutoCheck scrape failed for VIN %s: %s", vin, exc)
+            ac_dir = artifact_dir / "autocheck"
+            ac_dir.mkdir(parents=True, exist_ok=True)
             try:
-                self._capture_debug_state(page, ac_artifact_dir, "autocheck-error", vin, exc)
+                self._capture_debug_state(page, ac_dir, "autocheck-error", vin, exc)
             except Exception:
                 pass
             raise

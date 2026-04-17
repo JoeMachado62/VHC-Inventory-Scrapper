@@ -1019,8 +1019,9 @@ def _parse_inspectionreport_findings(lines: list[str]) -> tuple[list[dict[str, A
     for section_name, section_lines in (("exterior", exterior_lines), ("interior", interior_lines)):
         pairs = _pairwise_damage_findings(section_lines, section_name)
         for label, value in pairs:
-            if _is_non_issue_value(value):
-                continue
+            # Faithfully replicate ALL inspection items — do NOT filter
+            # "No Damage" / "No Issues". Consumers need the complete report
+            # to see what was inspected, not just what had problems.
             severity_color = infer_severity_color(section_name, label, value)
             severity_label, severity_rank = normalize_severity_color(severity_color)
             damage_items.append(
@@ -1037,8 +1038,6 @@ def _parse_inspectionreport_findings(lines: list[str]) -> tuple[list[dict[str, A
             )
 
     for label, value in _pairwise_mechanical_findings(mechanical_lines):
-        if _is_non_issue_value(value):
-            continue
         finding = {
             "section": "mechanical",
             "section_label": "Mechanical",
