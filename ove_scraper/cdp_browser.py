@@ -1142,6 +1142,20 @@ class PlaywrightCdpBrowserSession:
             pass
         page.wait_for_timeout(2000)
 
+        # Wait for actual vehicle results to render before exporting.
+        # Without this, OVE can export a 0-byte CSV when the React app
+        # has navigated to the results URL but hasn't populated the
+        # results grid yet (seen at peak OVE load).
+        try:
+            page.wait_for_selector(
+                "[data-test-id*='vehicle'], [class*='VehicleCard'], tr[data-test-id*='vehicle']",
+                state="visible",
+                timeout=20000,
+            )
+            page.wait_for_timeout(1500)  # let the rest of the grid catch up
+        except PlaywrightTimeoutError:
+            LOGGER.warning("Vehicle results selector not found before export; proceeding anyway")
+
         direct_download_locators = [
             page.get_by_role("button", name=re.compile(r"export\s*csv", re.I)).first,
             page.get_by_role("link", name=re.compile(r"export\s*csv", re.I)).first,
@@ -1223,15 +1237,53 @@ class PlaywrightCdpBrowserSession:
                 f"OVE export download failed for '{search_name}'"
                 f" (suggested filename: {download.suggested_filename}): {failure}"
             )
+        # Try Playwright's save_as first. When Playwright connects over CDP
+        # to a user-launched Chrome, the download object often has no real
+        # content (Chrome has already auto-saved to the user's Downloads
+        # folder before Playwright's interceptor attaches). The save_as
+        # call may succeed but produce a 0-byte file.
+        save_as_worked = False
         try:
             download.save_as(str(target_path))
-        except Exception as exc:
-            raise BrowserSessionError(
-                f"Could not save exported CSV for '{search_name}'"
-                f" (suggested filename: {download.suggested_filename})"
-            ) from exc
-        if target_path.exists() and target_path.stat().st_size > 0:
+            if target_path.exists() and target_path.stat().st_size > 0:
+                save_as_worked = True
+        except Exception:
+            pass
+
+        if save_as_worked:
             return
+
+        # Fallback: find the actual CSV in Chrome's default Downloads folder.
+        # OVE names exports "Export.csv", "Export (1).csv", "Export (2).csv",
+        # etc. — we pick the newest Export*.csv modified in the last 2 min.
+        import time as _time
+        chrome_downloads = Path.home() / "Downloads"
+        cutoff = _time.time() - 120  # 2 minutes
+        candidates = sorted(
+            (p for p in chrome_downloads.glob("Export*.csv")
+             if p.stat().st_mtime >= cutoff and p.stat().st_size > 0),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            source = candidates[0]
+            import shutil
+            try:
+                shutil.copy2(source, target_path)
+                LOGGER.info(
+                    "Copied OVE export for '%s' from Chrome Downloads (%s, %d bytes)",
+                    search_name, source.name, source.stat().st_size,
+                )
+                # Clean up Chrome's copy so we don't re-pick it on next retry
+                try:
+                    source.unlink()
+                except Exception:
+                    pass
+                if target_path.exists() and target_path.stat().st_size > 0:
+                    return
+            except Exception as exc:
+                LOGGER.warning("Fallback copy from Chrome Downloads failed: %s", exc)
+
         raise BrowserSessionError(
             f"Exported CSV for '{search_name}' was empty"
             f" (suggested filename: {download.suggested_filename})"
