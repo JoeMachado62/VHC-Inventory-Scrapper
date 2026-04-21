@@ -84,6 +84,9 @@ class Settings:
     sync_schedule_eastern: tuple[tuple[int, int], ...] = (
         (9, 0), (11, 0), (13, 0), (15, 0), (17, 30), (19, 0), (21, 0), (23, 0),
     )
+    # DEPRECATED: no longer used by run_once(). The sync now validates that
+    # all configured east/west searches exist within the discovered set,
+    # rather than comparing total counts. Kept for env-var compat.
     ove_required_search_count: int = 6
     scraper_node_id: str = "unknown-node"
     scraper_profile_slug: str = "default"
@@ -103,6 +106,8 @@ class Settings:
     ove_base_url: str = "https://www.ove.com"
     ove_listings_url: str = "https://www.ove.com"
     ove_source_platform: str = "manheim"
+    ove_username: str = ""
+    ove_password: str = ""
     ove_east_searches: tuple[str, ...] = (
         "East Hub 2022-2024",
         "East Hub 2024 or Newer",
@@ -110,7 +115,7 @@ class Settings:
     ove_west_searches: tuple[str, ...] = (
         "West Hub 2015 - 2021",
         "West Hub 2015-2023",
-        "West Hub 2022-2024",
+        "West Hub 2022 - 2024",
         "West Hub 2024 or Newer",
     )
     ove_search_input_selector: str = "input[type='search'], input[placeholder*='VIN'], input[name*='search']"
@@ -179,6 +184,8 @@ class Settings:
             ove_base_url=os.getenv("OVE_BASE_URL", "https://www.ove.com").rstrip("/"),
             ove_listings_url=os.getenv("OVE_LISTINGS_URL", "https://www.ove.com"),
             ove_source_platform=os.getenv("OVE_SOURCE_PLATFORM", "manheim"),
+            ove_username=os.getenv("OVE_USERNAME", ""),
+            ove_password=os.getenv("OVE_PASSWORD", ""),
             ove_east_searches=_get_list(
                 "OVE_EAST_SEARCHES",
                 (
@@ -191,7 +198,7 @@ class Settings:
                 (
                     "West Hub 2015 - 2021",
                     "West Hub 2015-2023",
-                    "West Hub 2022-2024",
+                    "West Hub 2022 - 2024",
                     "West Hub 2024 or Newer",
                 ),
             ),
@@ -224,6 +231,10 @@ class Settings:
     @property
     def detail_worker_id(self) -> str:
         return f"scraper-{self.scraper_node_id}-{self.scraper_profile_slug}"
+
+    @property
+    def ove_auto_login_configured(self) -> bool:
+        return bool(self.ove_username and self.ove_password)
 
 
 def _get_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
