@@ -429,24 +429,29 @@ class PlaywrightCdpBrowserSession:
         max_attempts = max(1, getattr(self.settings, "ove_export_max_attempts", 5))
 
         # Open the dedicated page with retry — the initial goto to
-        # /saved_searches#/ can time out on transient OVE slowness; letting
-        # a single goto failure bypass the retry loop (previous behavior)
-        # meant one bad attempt killed the whole export.
+        # /saved_searches#/ can time out on transient OVE slowness.
+        # OVE is notoriously slow at 9 AM ET (peak auction load); a single
+        # 30s timeout is not enough during that window. 5 attempts with
+        # increasing backoff gives OVE up to ~4 minutes to respond before
+        # we give up. The hourly sync has plenty of wall-clock budget for
+        # this.
         page: Page | None = None
-        for open_attempt in range(3):
+        open_attempts = 5
+        for open_attempt in range(open_attempts):
             try:
                 page = self._open_dedicated_ove_page(browser)
                 break
             except Exception as exc:
                 LOGGER.warning(
-                    "Failed to open dedicated OVE page (attempt %s/3) for '%s': %s",
-                    open_attempt + 1, search_name, exc,
+                    "Failed to open dedicated OVE page (attempt %s/%s) for '%s': %s",
+                    open_attempt + 1, open_attempts, search_name, exc,
                 )
                 last_error = exc
-                time.sleep(3 * (open_attempt + 1))
+                # Backoff: 5s, 10s, 20s, 30s between attempts
+                time.sleep(min(30, 5 * (2 ** open_attempt)))
         if page is None:
             raise BrowserSessionError(
-                f"Could not open dedicated OVE page for '{search_name}' after 3 attempts: {last_error}"
+                f"Could not open dedicated OVE page for '{search_name}' after {open_attempts} attempts: {last_error}"
             )
 
         try:
@@ -805,7 +810,11 @@ class PlaywrightCdpBrowserSession:
     def _create_worker_page(self, context: BrowserContext, *, start_url: str | None = None) -> Page:
         page = context.new_page()
         try:
-            page.goto(start_url or self._saved_searches_url(), wait_until="domcontentloaded")
+            # Explicit 60s timeout (Playwright default is 30s) — OVE can be
+            # slow to respond at peak auction times (9 AM ET, for example).
+            # Combined with the retry wrapper in export_saved_search, this
+            # lets us absorb multi-minute OVE hiccups.
+            page.goto(start_url or self._saved_searches_url(), wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(1500)
             if self._is_login_page(page) or self._is_error_page(page):
                 self._close_page(page)
