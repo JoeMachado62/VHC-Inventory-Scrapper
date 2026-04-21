@@ -46,7 +46,6 @@ LOGIN_COPY_HINTS = (
     "dealer id",
 )
 LOGIN_FIELD_HINTS = ("user", "login", "email", "dealer", "account", "sign")
-AUTO_LOGIN_MAX_ATTEMPTS = 2  # cap per 5-min window to prevent account lockout
 VIN_SEARCH_FIELD_HINTS = ("vin", "make", "search", "keyword")
 
 
@@ -326,8 +325,6 @@ class PlaywrightCdpBrowserSession:
         self.settings = settings
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
-        self._auto_login_attempts: int = 0
-        self._auto_login_last_reset: float = 0.0
 
     def close(self) -> None:
         if self._playwright is not None:
@@ -343,7 +340,8 @@ class PlaywrightCdpBrowserSession:
             browser = self._connect_browser()
             page = self._get_ove_page(browser.contexts)
             page.wait_for_load_state("domcontentloaded", timeout=5000)
-            self._ensure_authenticated(page)
+            if self._is_login_page(page):
+                raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
             if self.settings.ove_base_url not in page.url or self._is_error_page(page):
                 page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
         except Exception as exc:
@@ -356,7 +354,8 @@ class PlaywrightCdpBrowserSession:
             page = self._open_dedicated_ove_page(browser)
             try:
                 page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
-                self._ensure_authenticated(page)
+                if self._is_login_page(page):
+                    raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
             finally:
                 self._close_page(page)
         except Exception as exc:
@@ -368,11 +367,20 @@ class PlaywrightCdpBrowserSession:
         page = self._open_dedicated_ove_page(browser)
         try:
             page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
-            # SavedSearchPageEmpty propagates immediately — it signals an
-            # auth problem that requires full browser session recovery
-            # (kill Chrome, relaunch).  Do NOT retry in-page; that just
-            # hammers OVE on a broken session and triggers rate-limiting.
-            self._wait_for_saved_search_cards(page, timeout_ms=15_000)
+            try:
+                self._wait_for_saved_search_cards(page, timeout_ms=15_000)
+            except SavedSearchPageEmpty:
+                LOGGER.warning("Initial load returned empty saved searches; attempting recovery")
+                try:
+                    self._recover_empty_saved_searches(page)
+                except SavedSearchPageEmpty:
+                    # Last resort: close this page, open fresh one
+                    LOGGER.warning("In-page recovery failed; trying fresh browser page")
+                    self._close_page(page)
+                    page = self._open_dedicated_ove_page(browser)
+                    page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
+                    self._wait_for_saved_search_cards(page, timeout_ms=15_000)
+                    # If still SavedSearchPageEmpty, let it propagate
             names = page.evaluate(
                 """
                 () => {
@@ -464,13 +472,25 @@ class PlaywrightCdpBrowserSession:
                     download = self._trigger_export(page)
                     self._persist_download(download, target_path, search_name)
                     return target_path
-                except SavedSearchPageEmpty:
-                    # "No Saved Searches" means the OVE session is broken.
-                    # Do NOT retry in-page — that hammers OVE on a dead
-                    # session and triggers rate-limiting / 500 errors.
-                    # Propagate immediately so run_browser_operation() can
-                    # do a full browser recovery (kill Chrome, relaunch).
-                    raise
+                except SavedSearchPageEmpty as exc:
+                    # OVE returned "No Saved Searches" — don't waste time on
+                    # the normal reset-and-retry, attempt escalating recovery.
+                    last_error = exc
+                    LOGGER.warning(
+                        "OVE returned 'No Saved Searches' during export attempt %s/%s "
+                        "for '%s'; attempting recovery before next retry",
+                        attempt + 1, max_attempts, search_name,
+                    )
+                    try:
+                        self._recover_empty_saved_searches(page)
+                        continue  # recovery succeeded; skip normal reset nav
+                    except SavedSearchPageEmpty:
+                        LOGGER.warning(
+                            "In-page recovery exhausted; opening fresh browser page"
+                        )
+                        self._close_page(page)
+                        page = self._open_dedicated_ove_page(browser)
+                        continue
                 except (BrowserSessionError, PlaywrightTimeoutError) as exc:
                     last_error = exc
 
@@ -479,8 +499,9 @@ class PlaywrightCdpBrowserSession:
                     page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
                     self._wait_for_saved_search_cards(page, timeout_ms=15_000)
                 except SavedSearchPageEmpty:
-                    # Session went bad between retries — stop retrying.
-                    raise
+                    LOGGER.warning(
+                        "Reset to saved-searches returned empty page between retries"
+                    )
                 except Exception as nav_exc:
                     LOGGER.warning(
                         "Failed to reset page to saved-searches between export retries: %s",
@@ -763,9 +784,8 @@ class PlaywrightCdpBrowserSession:
             if context.pages:
                 page = context.pages[0]
                 page.goto(self._saved_searches_url(), wait_until="domcontentloaded")
-                self._ensure_authenticated(page)
-                if self._is_error_page(page):
-                    raise BrowserSessionError("OVE session shows error page after navigation")
+                if self._is_login_page(page) or self._is_error_page(page):
+                    raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
                 return page
         raise BrowserSessionError("No browser pages available in the CDP session")
 
@@ -787,15 +807,9 @@ class PlaywrightCdpBrowserSession:
         try:
             page.goto(start_url or self._saved_searches_url(), wait_until="domcontentloaded")
             page.wait_for_timeout(1500)
-            if self._is_login_page(page):
-                try:
-                    self._ensure_authenticated(page)
-                except BrowserSessionError:
-                    self._close_page(page)
-                    raise
-            if self._is_error_page(page):
+            if self._is_login_page(page) or self._is_error_page(page):
                 self._close_page(page)
-                raise BrowserSessionError("OVE session shows error page")
+                raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
         except BrowserSessionError:
             raise
         except Exception:
@@ -831,7 +845,7 @@ class PlaywrightCdpBrowserSession:
         if self._detect_empty_saved_searches_page(page):
             raise SavedSearchPageEmpty(
                 "OVE saved-searches page shows 'No Saved Searches' — "
-                "stale session — clearing cookies and re-authenticating"
+                "known intermittent OVE issue"
             )
 
         try:
@@ -844,12 +858,65 @@ class PlaywrightCdpBrowserSession:
             if self._detect_empty_saved_searches_page(page):
                 raise SavedSearchPageEmpty(
                     "OVE saved-searches page shows 'No Saved Searches' after "
-                    f"{timeout_ms}ms wait — stale session — clearing cookies and re-authenticating"
+                    f"{timeout_ms}ms wait — known intermittent OVE issue"
                 )
             raise BrowserSessionError(
                 f"Saved search cards did not render within {timeout_ms}ms — "
                 "possible cold session or OVE outage"
             )
+
+    def _recovery_hard_reload(self, page: Page) -> None:
+        """Cache-busting reload of the saved-searches page."""
+        page.evaluate("() => location.reload(true)")
+        page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        page.wait_for_timeout(2000)
+
+    def _recovery_navigate_roundtrip(self, page: Page) -> None:
+        """Navigate to OVE homepage, wait, then back to saved searches.
+        Forces a fresh API call from the React app."""
+        page.goto(self.settings.ove_base_url, wait_until="domcontentloaded", timeout=15_000)
+        page.wait_for_timeout(3000)
+        page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=15_000)
+        page.wait_for_timeout(2000)
+
+    def _recover_empty_saved_searches(self, page: Page) -> None:
+        """Attempt escalating recovery when OVE returns 'No Saved Searches'.
+
+        Strategies tried in order:
+          1. Hard reload — clears cached response.
+          2. Navigate away to OVE homepage, then back — forces fresh API call.
+          3. Raise so the caller can try a fresh browser page.
+
+        Raises SavedSearchPageEmpty if all in-page strategies fail.
+        """
+        strategies: list[tuple[str, Any]] = [
+            ("hard_reload", self._recovery_hard_reload),
+            ("navigate_away_and_back", self._recovery_navigate_roundtrip),
+        ]
+        for i, (name, fn) in enumerate(strategies):
+            LOGGER.warning(
+                "Empty saved-searches recovery attempt %d/%d: strategy=%s",
+                i + 1, len(strategies) + 1, name,
+            )
+            try:
+                fn(page)
+            except Exception as exc:
+                LOGGER.warning("Recovery strategy '%s' raised: %s", name, exc)
+                continue
+
+            try:
+                self._wait_for_saved_search_cards(page, timeout_ms=10_000)
+                LOGGER.info("Recovery strategy '%s' succeeded", name)
+                return
+            except SavedSearchPageEmpty:
+                LOGGER.warning("Recovery strategy '%s' did not resolve empty page", name)
+                continue
+            except BrowserSessionError:
+                raise  # login page or other hard failure
+
+        raise SavedSearchPageEmpty(
+            "OVE 'No Saved Searches' persists after all in-page recovery strategies"
+        )
 
     def _open_saved_search(self, page: Page, search_name: str) -> None:
         # Use domcontentloaded rather than networkidle: the OVE saved-searches
@@ -2201,209 +2268,6 @@ class PlaywrightCdpBrowserSession:
         if any(hint in attrs for hint in VIN_SEARCH_FIELD_HINTS):
             return False
         return any(hint in attrs for hint in LOGIN_FIELD_HINTS)
-
-    # ------------------------------------------------------------------
-    # Autonomous OVE login
-    # ------------------------------------------------------------------
-
-    def _ensure_authenticated(self, page: Page) -> None:
-        """Check if page is on a login screen; if so, attempt auto-login.
-
-        Raises BrowserSessionError only if auto-login fails or credentials
-        aren't configured. If auto-login succeeds, returns normally and
-        the caller can proceed as if the session was always valid.
-        """
-        if not self._is_login_page(page):
-            return
-
-        LOGGER.warning("Login page detected at %s; attempting auto-login", page.url)
-
-        if self._attempt_auto_login(page):
-            LOGGER.info("Auto-login succeeded; resuming normal operation")
-            return
-
-        raise BrowserSessionError(
-            "OVE session is not authenticated; browser is on the login page"
-        )
-
-    def _attempt_auto_login(self, page: Page) -> bool:
-        """Fill and submit the Manheim auth form via Playwright.
-
-        Returns True if login succeeded (page navigated away from auth
-        domain to OVE). Returns False on any failure — never raises.
-        Capped at AUTO_LOGIN_MAX_ATTEMPTS per 5-minute window to prevent
-        account lockout from wrong credentials.
-        """
-        # Guard: credentials configured?
-        if not self.settings.ove_auto_login_configured:
-            LOGGER.debug("Auto-login skipped: OVE_USERNAME/OVE_PASSWORD not configured in .env")
-            return False
-
-        # Guard: attempt limit (reset after 5 minutes)
-        now = time.time()
-        if now - self._auto_login_last_reset > 300:
-            self._auto_login_attempts = 0
-            self._auto_login_last_reset = now
-        if self._auto_login_attempts >= AUTO_LOGIN_MAX_ATTEMPTS:
-            LOGGER.warning(
-                "Auto-login skipped: %d attempts in last 5 minutes (limit %d); "
-                "waiting for cooldown to avoid account lockout",
-                self._auto_login_attempts, AUTO_LOGIN_MAX_ATTEMPTS,
-            )
-            return False
-
-        self._auto_login_attempts += 1
-        login_artifact_dir = self.settings.artifact_dir / "auto-login"
-        login_artifact_dir.mkdir(parents=True, exist_ok=True)
-
-        try:
-            # Pre-login screenshot
-            try:
-                page.screenshot(path=str(login_artifact_dir / "pre-login.png"), full_page=True)
-            except Exception:
-                pass
-
-            # Find username field
-            username_field = None
-            for selector in (
-                "input#username",
-                "input[name='username']",
-                "input[name='pf.username']",
-                "input[type='email']",
-            ):
-                try:
-                    loc = page.locator(selector).first
-                    if loc.count() > 0 and loc.is_visible(timeout=2000):
-                        username_field = loc
-                        LOGGER.debug("Found username field via: %s", selector)
-                        break
-                except Exception:
-                    continue
-
-            # Fallback: single text input
-            if username_field is None:
-                try:
-                    text_inputs = page.locator("input[type='text']")
-                    if text_inputs.count() == 1 and text_inputs.first.is_visible(timeout=2000):
-                        username_field = text_inputs.first
-                        LOGGER.debug("Found username field via single text input fallback")
-                except Exception:
-                    pass
-
-            if username_field is None:
-                LOGGER.error("Auto-login failed: no username field found on %s", page.url)
-                return False
-
-            # Find password field
-            try:
-                password_field = page.locator("input[type='password']").first
-                if not password_field.is_visible(timeout=2000):
-                    LOGGER.error("Auto-login failed: password field not visible on %s", page.url)
-                    return False
-            except Exception:
-                LOGGER.error("Auto-login failed: no password field found on %s", page.url)
-                return False
-
-            # Find submit button
-            submit_button = None
-            for selector in (
-                "button[type='submit']",
-                "button:has-text('Sign In')",
-                "button:has-text('Log In')",
-                "button:has-text('Login')",
-                "input[type='submit']",
-                "a:has-text('Sign In')",
-            ):
-                try:
-                    loc = page.locator(selector).first
-                    if loc.count() > 0 and loc.is_visible(timeout=1000):
-                        submit_button = loc
-                        LOGGER.debug("Found submit button via: %s", selector)
-                        break
-                except Exception:
-                    continue
-
-            if submit_button is None:
-                LOGGER.error("Auto-login failed: no submit button found on %s", page.url)
-                return False
-
-            # Fill and submit
-            LOGGER.info("Auto-login: filling credentials and submitting form")
-            username_field.fill(self.settings.ove_username)
-            password_field.fill(self.settings.ove_password)
-            submit_button.click()
-
-            # Wait for navigation away from auth domain
-            try:
-                page.wait_for_timeout(3000)  # initial redirect time
-                # Poll for up to 30s for URL to leave auth domain
-                deadline = time.time() + 30
-                while time.time() < deadline:
-                    current_url = (page.url or "").lower()
-                    if not any(hint in current_url for hint in AUTH_PATH_HINTS) and "auth.manheim.com" not in current_url:
-                        break
-                    page.wait_for_timeout(1000)
-                else:
-                    LOGGER.error("Auto-login: timed out waiting for redirect away from auth page")
-                    page.screenshot(path=str(login_artifact_dir / "post-login-timeout.png"), full_page=True)
-                    return False
-            except PlaywrightTimeoutError:
-                LOGGER.error("Auto-login: navigation timeout after form submit")
-                return False
-
-            # Wait for destination page to settle
-            try:
-                page.wait_for_load_state("domcontentloaded", timeout=15000)
-            except PlaywrightTimeoutError:
-                pass  # best-effort; check the page state below
-
-            # Post-login checks
-            page_text = ""
-            try:
-                page_text = page.locator("body").inner_text(timeout=3000).lower()[:1000]
-            except Exception:
-                pass
-
-            # MFA/2FA detection
-            mfa_hints = ("verification code", "one-time", "authenticator", "two-factor", "2fa", "mfa")
-            if any(hint in page_text for hint in mfa_hints):
-                LOGGER.error("Auto-login: MFA/2FA prompt detected — cannot proceed automatically")
-                page.screenshot(path=str(login_artifact_dir / "post-login-mfa.png"), full_page=True)
-                return False
-
-            # Captcha detection
-            captcha_hints = ("captcha", "verify you are human", "robot")
-            if any(hint in page_text for hint in captcha_hints):
-                LOGGER.error("Auto-login: CAPTCHA detected — cannot proceed automatically")
-                page.screenshot(path=str(login_artifact_dir / "post-login-captcha.png"), full_page=True)
-                return False
-
-            # Bad credentials detection
-            bad_cred_hints = ("invalid", "incorrect", "wrong password", "authentication failed", "account locked")
-            if self._is_login_page(page) and any(hint in page_text for hint in bad_cred_hints):
-                LOGGER.error("Auto-login: credentials rejected (check OVE_USERNAME/OVE_PASSWORD in .env)")
-                page.screenshot(path=str(login_artifact_dir / "post-login-rejected.png"), full_page=True)
-                return False
-
-            # Still on login page?
-            if self._is_login_page(page):
-                LOGGER.error("Auto-login: still on login page after form submit (%s)", page.url)
-                page.screenshot(path=str(login_artifact_dir / "post-login-still-auth.png"), full_page=True)
-                return False
-
-            # Success
-            LOGGER.info("Auto-login: authenticated successfully, now at %s", page.url)
-            page.screenshot(path=str(login_artifact_dir / "post-login-success.png"), full_page=True)
-            self._auto_login_attempts = 0  # reset on success
-            return True
-
-        except Exception as exc:
-            LOGGER.error("Auto-login: unexpected error: %s", exc)
-            try:
-                page.screenshot(path=str(login_artifact_dir / "post-login-error.png"), full_page=True)
-            except Exception:
-                pass
-            return False
 
     def _is_error_page(self, page: Page) -> bool:
         try:
