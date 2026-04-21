@@ -49,9 +49,34 @@ if ($existing) {
 }
 
 if (-not $existing) {
+    # Before launching, clean up the "Chrome didn't shut down correctly"
+    # state from the Preferences file. Without this, every unclean kill
+    # produces a session-crashed bubble + restore-pages prompt, which
+    # blocks the scraper from finding the OVE page and triggers another
+    # recovery cycle (infinite kill/relaunch loop).
+    $prefsPath = Join-Path $profilePath "Default\Preferences"
+    if (Test-Path $prefsPath) {
+        try {
+            $prefsJson = Get-Content $prefsPath -Raw | ConvertFrom-Json
+            if ($prefsJson.profile) {
+                $prefsJson.profile.exit_type = "Normal"
+                $prefsJson.profile.exited_cleanly = $true
+                $prefsJson | ConvertTo-Json -Depth 100 -Compress | Set-Content $prefsPath -Encoding UTF8
+            }
+        } catch {
+            Write-Host "Could not patch Chrome Preferences: $_"
+        }
+    }
+
     Start-Process -FilePath $chromePath -ArgumentList @(
         "--remote-debugging-port=$debugPort",
         "--user-data-dir=$profilePath",
+        "--disable-session-crashed-bubble",
+        "--hide-crash-restore-bubble",
+        "--disable-features=InfiniteSessionRestore",
+        "--restore-last-session=false",
+        "--no-first-run",
+        "--no-default-browser-check",
         $oveUrl
     )
 }
