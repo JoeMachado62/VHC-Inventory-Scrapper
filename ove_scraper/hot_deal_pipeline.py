@@ -122,9 +122,16 @@ class HotDealPipelineRunner:
             )
 
             # Phase 3: Screen each pending VIN through 3-step pipeline.
-            # Count both NEW rows AND the retry pool as the work budget
-            # so progress logs read correctly.
-            to_process = new_count + retry_yesterday
+            # Count *all* pending rows for the progress denominator, not
+            # just new_count + retry_yesterday: an operator may have
+            # pushed additional VINs into pending via hot-deal-reprocess
+            # --rescreen (promoting previously-false-positive step1_fail
+            # rows back for re-screening). Those are real work in this
+            # run but fall outside the new/retry budget.
+            total_pending_at_start = self.db.execute(
+                "SELECT COUNT(*) FROM hot_deal_vins WHERE status='pending'"
+            ).fetchone()[0]
+            to_process = total_pending_at_start
             processed = 0
             while True:
                 vin_row = claim_next_pending(self.db)
