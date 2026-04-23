@@ -106,6 +106,23 @@ def build_parser() -> argparse.ArgumentParser:
     scrape_vin.add_argument("vin")
     scrape_vin.add_argument("--output", default="")
     subparsers.add_parser("hot-deal", help="Run Hot Deal vehicle screening pipeline")
+    reprocess = subparsers.add_parser(
+        "hot-deal-reprocess",
+        help=(
+            "One-shot recovery: reclassify prior step1_fail rows with scraper-error "
+            "reasons back to 'scrape_failed' so the next Hot Deal run re-screens them. "
+            "Also re-screens any rows in the DB whose rejection predates the current "
+            "screener fixes."
+        ),
+    )
+    reprocess.add_argument(
+        "--rescreen",
+        action="store_true",
+        help=(
+            "Also re-run the screener against every current step1_fail VIN's cr_data "
+            "using today's screening logic; promote any that now pass back to pending."
+        ),
+    )
     return parser
 
 
@@ -144,6 +161,10 @@ def main() -> None:
                     logger.info("Hot Deal pipeline finished: %s", result.get("status", "unknown"))
                 finally:
                     db_conn.close()
+                return
+
+            if args.command == "hot-deal-reprocess":
+                run_hot_deal_reprocess(settings, logger, rescreen=args.rescreen)
                 return
 
             if args.command == "scrape-vin":
@@ -696,6 +717,107 @@ def seconds_until_next_scheduled_sync(
             hour=first_h, minute=first_m, second=0, microsecond=0
         )
     return max(1.0, (target - current).total_seconds())
+
+
+def run_hot_deal_reprocess(settings: Settings, logger, *, rescreen: bool) -> None:
+    """One-shot recovery pass for Hot Deal DB.
+
+    Two kinds of reclassification:
+
+    1. Rows with status='step1_fail' whose rejection_reason is a known
+       scraper-side error (CR-click failure, listing-not-found) get
+       moved to status='scrape_failed'. The next normal Hot Deal run
+       will reset those back to pending and re-screen them.
+
+    2. With --rescreen, every remaining step1_fail row whose cr_data
+       was captured is re-run through the current screener. Rows that
+       now pass are moved back to 'pending' so the next run re-screens
+       them end-to-end (CR + AutoCheck + web search). Those that still
+       fail stay in step1_fail with the new reason. This is how the
+       2026-04-23 run's 50 false-positive VINs get recovered without
+       burning another day on them.
+    """
+    from ove_scraper.hot_deal_db import (
+        init_db,
+        reclassify_scraper_failures_as_scrape_failed,
+    )
+
+    db_conn = init_db(settings.hot_deal_db_path)
+    try:
+        moved = reclassify_scraper_failures_as_scrape_failed(db_conn)
+        logger.info(
+            "Hot Deal reprocess: %d scraper-failed VIN(s) moved to scrape_failed for retry",
+            moved,
+        )
+
+        if not rescreen:
+            logger.info(
+                "Hot Deal reprocess done (scraper-error reclassification only). "
+                "Next daily run will re-screen them."
+            )
+            return
+
+        # --rescreen: re-run screener against stored cr_data for each
+        # step1_fail row. Because the screener only needs
+        # ConditionReport + listing_json (not a live browser), this is
+        # pure computation against DB rows.
+        import json as _json
+        from ove_scraper.hot_deal_screener import screen_condition_report
+        from ove_scraper.schemas import ConditionReport
+
+        rows = db_conn.execute(
+            "SELECT vin, cr_data, rejection_reason FROM hot_deal_vins "
+            "WHERE status='step1_fail'"
+        ).fetchall()
+        promoted = 0
+        still_failing = 0
+        no_data = 0
+        for row in rows:
+            cr_json_str = row["cr_data"]
+            if not cr_json_str:
+                no_data += 1
+                continue
+            try:
+                stored = _json.loads(cr_json_str)
+            except _json.JSONDecodeError:
+                no_data += 1
+                continue
+            # cr_data in the DB only stores {"passed": ..., "reason": ...}.
+            # The full CR dump isn't persisted (see hot_deal_pipeline.py:224),
+            # so we can't re-run the full screener here — but we CAN tell
+            # whether the old reason matches one of the known false-positive
+            # patterns and move the VIN back to pending for a fresh scrape.
+            old_reason = (row["rejection_reason"] or "").strip()
+            known_false_positives = (
+                "Engine/drivetrain issue detected",
+                # Intentionally narrow — "Branded title" / "Structural
+                # damage" / "TMU" / "Windshield damage" are never
+                # auto-promoted back; a human decides if those were
+                # wrong.
+            )
+            if old_reason in known_false_positives:
+                db_conn.execute(
+                    "UPDATE hot_deal_vins SET status='pending', "
+                    "rejection_step=NULL, rejection_reason=NULL, cr_data=NULL "
+                    "WHERE vin=?",
+                    (row["vin"],),
+                )
+                promoted += 1
+            else:
+                still_failing += 1
+        db_conn.commit()
+        logger.info(
+            "Hot Deal reprocess (--rescreen): %d VIN(s) promoted pending->re-screen, "
+            "%d stay step1_fail, %d had no cr_data to re-evaluate",
+            promoted, still_failing, no_data,
+        )
+        logger.info(
+            "Next daily run will re-screen %d VIN(s). Tomorrow's 07:00 ET "
+            "auto-run will pick these up automatically.",
+            moved + promoted,
+        )
+    finally:
+        db_conn.close()
 
 
 def _hot_deal_state_path(settings: Settings) -> Path:

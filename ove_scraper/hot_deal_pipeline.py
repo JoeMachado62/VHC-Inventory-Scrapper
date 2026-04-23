@@ -17,6 +17,11 @@ from pathlib import Path
 from typing import Any
 
 from ove_scraper.automation_lock import OveAutomationLock
+from ove_scraper.browser import (
+    BrowserSessionError,
+    ConditionReportClickFailedError,
+    ListingNotFoundError,
+)
 from ove_scraper.cdp_browser import PlaywrightCdpBrowserSession
 from ove_scraper.config import Settings
 from ove_scraper.csv_transform import load_csv_rows
@@ -30,6 +35,7 @@ from ove_scraper.hot_deal_db import (
     get_hot_deals,
     get_run_summary,
     insert_new_vins,
+    reset_scrape_failed_to_pending,
     touch_last_seen,
 )
 from ove_scraper.hot_deal_report import format_hot_deal_summary
@@ -97,12 +103,28 @@ class HotDealPipelineRunner:
 
             new_rows = [r for r in today_rows if r["vin"] in new_vins]
             new_count = insert_new_vins(self.db, new_rows)
+
+            # Reset any VINs that were left in scrape_failed state from a
+            # previous run back to pending so the scraper gets another
+            # shot today. These are VINs where the browser couldn't open
+            # the CR — a transient capture bug, not a real rejection —
+            # and they deserve a retry with today's warmer session.
+            retry_yesterday = reset_scrape_failed_to_pending(self.db)
+            if retry_yesterday:
+                self.log.info(
+                    "Hot Deal: reset %d previously-scrape-failed VIN(s) to pending for retry",
+                    retry_yesterday,
+                )
+
             self.log.info(
-                "Hot Deal: %d on list, %d already in DB, %d new, %d sold",
-                len(today_vins), len(still_active), new_count, sold_count,
+                "Hot Deal: %d on list, %d already in DB, %d new, %d sold, %d retries",
+                len(today_vins), len(still_active), new_count, sold_count, retry_yesterday,
             )
 
-            # Phase 3: Screen each NEW VIN through 3-step pipeline
+            # Phase 3: Screen each pending VIN through 3-step pipeline.
+            # Count both NEW rows AND the retry pool as the work budget
+            # so progress logs read correctly.
+            to_process = new_count + retry_yesterday
             processed = 0
             while True:
                 vin_row = claim_next_pending(self.db)
@@ -110,17 +132,36 @@ class HotDealPipelineRunner:
                     break
                 vin = vin_row["vin"]
                 processed += 1
-                self.log.info("Hot Deal [%d/%d]: processing VIN %s", processed, new_count, vin)
-                try:
-                    self._process_vin(vin)
-                except Exception as exc:
-                    err_msg = f"VIN {vin}: {type(exc).__name__}: {exc}"
-                    self.log.error("Hot Deal pipeline error: %s", err_msg)
-                    errors.append(err_msg)
-                    advance_status(
-                        self.db, vin, "step1_fail",
-                        rejection_step="error", rejection_reason=str(exc),
+                self.log.info("Hot Deal [%d/%d]: processing VIN %s", processed, to_process, vin)
+                self._screen_vin_with_classification(vin, errors, in_retry_pass=False)
+
+            # Phase 3b: one-shot in-run retry for VINs that scrape_failed
+            # on their first attempt during this run. Rationale: the
+            # 2026-04-23 Ferrari-loop fix dropped CR-click retries from
+            # 4 to 2, which made transient popup flakiness terminal for
+            # any VIN that hit it. A single re-attempt after the rest
+            # of the list has run usually works — the browser session
+            # has drifted back to a good state, and re-claiming a VIN
+            # costs ~2-3 minutes vs losing it for the day. Only VINs
+            # that still fail on the retry are truly marked scrape_failed.
+            retried = reset_scrape_failed_to_pending(self.db)
+            if retried:
+                self.log.info(
+                    "Hot Deal: one-shot retry pass for %d VIN(s) that scrape-failed this run",
+                    retried,
+                )
+                retry_processed = 0
+                while True:
+                    vin_row = claim_next_pending(self.db)
+                    if vin_row is None:
+                        break
+                    vin = vin_row["vin"]
+                    retry_processed += 1
+                    self.log.info(
+                        "Hot Deal retry [%d/%d]: processing VIN %s",
+                        retry_processed, retried, vin,
                     )
+                    self._screen_vin_with_classification(vin, errors, in_retry_pass=True)
 
             finish_run(self.db, run_id, "completed", new_vins=new_count, sold_vins=sold_count, error_details=errors or None)
 
@@ -197,6 +238,56 @@ class HotDealPipelineRunner:
             })
 
         return today_vins, today_rows
+
+    def _screen_vin_with_classification(
+        self,
+        vin: str,
+        errors: list[str],
+        *,
+        in_retry_pass: bool,
+    ) -> None:
+        """Invoke _process_vin for one VIN and classify any exception.
+
+        Scraper-side exceptions (BrowserSessionError and its subclasses:
+        ConditionReportClickFailedError, ListingNotFoundError) mean we
+        never got enough data to reach the screener. Those become
+        status='scrape_failed' — retry-eligible — on the first attempt,
+        and permanently step1_fail with a scraper-error category on the
+        retry pass. Everything else is a true pipeline error and
+        terminals immediately.
+        """
+        try:
+            self._process_vin(vin)
+        except (ConditionReportClickFailedError, ListingNotFoundError, BrowserSessionError) as exc:
+            err_msg = f"VIN {vin}: {type(exc).__name__}: {exc}"
+            self.log.error("Hot Deal scraper error: %s", err_msg)
+            errors.append(err_msg)
+            if in_retry_pass:
+                # Second strike — give up on this VIN for today. Mark
+                # it step1_fail with a scraper-error reason so it's
+                # visible in the daily summary as a capture problem
+                # rather than a screener verdict. Tomorrow's reset
+                # won't pick this one back up.
+                advance_status(
+                    self.db, vin, "step1_fail",
+                    rejection_step="scraper_error",
+                    rejection_reason=f"{type(exc).__name__} on retry: {exc}",
+                )
+            else:
+                # First strike — retry eligible in the second pass.
+                advance_status(
+                    self.db, vin, "scrape_failed",
+                    rejection_step="scraper_error",
+                    rejection_reason=str(exc),
+                )
+        except Exception as exc:
+            err_msg = f"VIN {vin}: {type(exc).__name__}: {exc}"
+            self.log.error("Hot Deal pipeline error: %s", err_msg)
+            errors.append(err_msg)
+            advance_status(
+                self.db, vin, "step1_fail",
+                rejection_step="error", rejection_reason=str(exc),
+            )
 
     def _process_vin(self, vin: str) -> None:
         """Run a single VIN through all 3 screening steps."""

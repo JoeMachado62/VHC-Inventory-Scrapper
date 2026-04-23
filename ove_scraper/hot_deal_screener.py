@@ -36,11 +36,30 @@ _TMU_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Engine/drivetrain concern patterns.
+#
+# History (2026-04-23): an earlier pairing of this regex with cr.raw_text
+# scanning caused the Manheim InsightCR template label "ENGINE NOISE"
+# (field value "No Issues") to match on 50/51 rejected VINs — field
+# headings, not inspector findings. The architectural fix is in
+# _collect_text_fields below: scanning no longer touches cr.raw_text,
+# only the parsed findings fields (announcements, remarks,
+# seller_comments_items, problem_highlights) and the itemized
+# mechanical_findings list. Those are the fields that carry actual
+# inspector observations, not template labels.
+#
+# Patterns kept permissive because the normalizer already filters out
+# non-finding boilerplate before populating these fields. Defense in
+# depth: "Active Codes" alone is too broad (field label "No Active
+# Codes"), so it requires an explicit powertrain/engine/transmission
+# qualifier. "Check engine" requires an "on/illuminated/reported/active"
+# follow-up.
 _ENGINE_DRIVETRAIN_PATTERNS = re.compile(
-    r"engine\s*(?:noise|knock|misfire|issue|problem|failure|replace)|"
+    r"engine\s*(?:noise|knock|misfire|issue|problem|failure|replace|seized|blown)|"
     r"drivetrain\s*(?:noise|issue|problem|failure)|"
     r"transmission\s*(?:noise|slip|issue|problem|failure|replace)|"
-    r"active\s*(?:code|dtc)|check\s*engine|"
+    r"\bactive\s+(?:powertrain|engine|transmission)\s+(?:code|codes|dtc)\b|"
+    r"check\s+engine\s+light\s+(?:on|illuminated|reported|active)\b|"
     r"(?:needs|requires)\s*(?:engine|motor|transmission)|"
     r"mechanical\s*(?:issue|problem|failure|damage)",
     re.IGNORECASE,
@@ -108,6 +127,20 @@ def screen_condition_report(
             passed=False, step="step1",
             reason=f"Title status: {cr.title_status}",
         )
+
+    # Branded-title language appearing in announcements — covers the case
+    # where Manheim's announcement lists a disclosure ("MANUFACTURER'S
+    # BUYBACK/LEMON LAW", "BRANDED TITLE SALVAGE", etc.) but the CR's
+    # title_branding field isn't populated. Observed 2026-04-23 on VIN
+    # KM8JEDD13SU329976 (Hyundai Tucson): the lemon-law announcement
+    # was a real red flag that was only caught by a broad
+    # engine/drivetrain match because title_branding was empty.
+    for announcement in cr.announcements:
+        if _BRANDED_TITLE_PATTERNS.search(announcement):
+            return ScreenResult(
+                passed=False, step="step1",
+                reason=f"Branded title announcement: {announcement[:120]}",
+            )
 
     # Structural damage
     if cr.structural_damage is True:
@@ -222,14 +255,22 @@ def screen_vin_web_search(search_result: dict[str, Any]) -> ScreenResult:
 # ---------------------------------------------------------------------------
 
 def _collect_text_fields(cr: ConditionReport) -> str:
-    """Concatenate all free-text fields from a CR for keyword scanning."""
+    """Concatenate the *parsed finding* text fields from a CR for keyword
+    scanning.
+
+    Intentionally excludes cr.raw_text because raw_text is the whole CR
+    body dumped as one string — it contains every inspection field HEADING
+    (e.g. "ENGINE NOISE No Issues", "DIAGNOSTIC TROUBLE CODES No Active
+    Codes") which trivially match any engine/drivetrain keyword regex.
+    The normalizer is responsible for promoting real inspector findings
+    into the structured fields below; if a finding exists it will be in
+    announcements, remarks, seller comments, or problem_highlights.
+    """
     parts = []
     parts.extend(cr.announcements)
     parts.extend(cr.remarks)
     parts.extend(cr.seller_comments_items)
     parts.extend(cr.problem_highlights)
-    if cr.raw_text:
-        parts.append(cr.raw_text)
     return " ".join(parts)
 
 

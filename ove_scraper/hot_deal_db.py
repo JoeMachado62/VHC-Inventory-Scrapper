@@ -225,7 +225,7 @@ def advance_status(
         fields.append(f"{data_column}=?")
         params.append(data_value)
 
-    if new_status in ("hot_deal", "step1_fail", "step2_fail", "step3_fail"):
+    if new_status in ("hot_deal", "step1_fail", "step2_fail", "step3_fail", "scrape_failed"):
         fields.append("screened_at=?")
         params.append(_utc_now_iso())
 
@@ -256,6 +256,7 @@ def get_run_summary(conn: sqlite3.Connection, run_id: str) -> dict:
         "step1_fail": counts.get("step1_fail", 0),
         "step2_fail": counts.get("step2_fail", 0),
         "step3_fail": counts.get("step3_fail", 0),
+        "scrape_failed": counts.get("scrape_failed", 0),
         "pending": counts.get("pending", 0),
         "in_progress": sum(v for k, v in counts.items() if k.endswith("_running")),
         "counts_by_status": counts,
@@ -269,3 +270,45 @@ def get_hot_deals(conn: sqlite3.Connection) -> list[dict]:
         "FROM hot_deal_vins WHERE status='hot_deal' ORDER BY price",
     )
     return [dict(row) for row in cur.fetchall()]
+
+
+def reset_scrape_failed_to_pending(conn: sqlite3.Connection) -> int:
+    """Reset any scrape_failed VINs to pending so they're re-claimed for
+    screening.
+
+    Called at the start of a run (and from the one-shot in-run retry
+    pass) so a scraper-side failure — browser-level "couldn't open CR"
+    or "VIN not found in OVE search" — gets another shot on the next
+    daily run rather than being stuck forever. Distinct from step1_fail
+    / step2_fail / step3_fail, which are real screener verdicts and
+    stay terminal.
+
+    Returns the number of VINs reset.
+    """
+    cur = conn.execute(
+        "UPDATE hot_deal_vins SET status='pending', rejection_step=NULL, "
+        "rejection_reason=NULL WHERE status='scrape_failed'"
+    )
+    conn.commit()
+    return cur.rowcount or 0
+
+
+def reclassify_scraper_failures_as_scrape_failed(conn: sqlite3.Connection) -> int:
+    """One-time reclassifier: existing step1_fail rows whose
+    rejection_reason looks like a scraper error (CR-click / VIN-not-
+    found) are moved to status='scrape_failed' so they become eligible
+    for re-screening on the next run.
+
+    Used by the hot-deal-reprocess CLI to recover from the 2026-04-23
+    incident where ~69 VINs were terminally rejected because the CR
+    popup couldn't be opened after the max-attempts cap was lowered
+    to 2. Returns the number of rows reclassified.
+    """
+    cur = conn.execute(
+        "UPDATE hot_deal_vins SET status='scrape_failed' "
+        "WHERE status='step1_fail' "
+        "AND (rejection_reason LIKE 'Could not open OVE condition report%' "
+        "     OR rejection_reason LIKE '%is not available in OVE search results')"
+    )
+    conn.commit()
+    return cur.rowcount or 0

@@ -104,6 +104,61 @@ class TestScreenConditionReport:
         result = screen_condition_report(_make_cr(), _make_listing(yellowLight=True))
         assert result.passed is True  # yellow is caution, not disqualifying
 
+    def test_manheim_inspection_labels_do_not_false_fail(self):
+        # Regression: 2026-04-23 run rejected 50/51 VINs because the
+        # Manheim InsightCR template ships with field headings like
+        # "ENGINE NOISE No Issues" and "DIAGNOSTIC TROUBLE CODES No
+        # Active Codes" in its body. raw_text used to be scanned and
+        # the regex matched the label. raw_text is no longer scanned,
+        # and even if it were, "No Active Codes" must not match.
+        cr = _make_cr(
+            raw_text=(
+                "ACTIVE VISIBLE LEAKS FROM ENGINE OR UNDERCARRIAGE AREA No Active Leaks "
+                "ENGINE NOISE No Issues "
+                "ENGINE OIL SLUDGE No Oil Sludge "
+                "DIAGNOSTIC TROUBLE CODES No Active Codes "
+                "CHECK ENGINE LIGHT No Issues"
+            ),
+        )
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is True, f"label text should not fail; got {result.reason!r}"
+
+    def test_raw_text_not_scanned_for_findings(self):
+        # Even a truly scary raw_text string must not reject a vehicle
+        # if none of the parsed finding fields flagged it — the
+        # normalizer is the single source of truth for promoting
+        # findings, raw_text is a fallback for the VPS template only.
+        cr = _make_cr(raw_text="Engine noise reported Transmission slip")
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is True
+
+    def test_lemon_law_announcement_still_fails(self):
+        # Real announcement text observed on VIN KM8JEDD13SU329976
+        # (2025 Hyundai Tucson) 2026-04-23 run. Must be caught via the
+        # branded-title-in-announcements scan (buyback / lemon law
+        # keywords), NOT via an accidental engine/drivetrain match.
+        cr = _make_cr(announcements=[
+            "BUYBACK/OPEN SALE, BRANDED TITLE MANUFACTURER'S BUYBACK/LEMON LAW "
+            "CHECK ENGINE LIGHT DEALER MUST SIGN & DATE DISCLOSURE"
+        ])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is False
+        assert "Branded title" in result.reason or "buyback" in result.reason.lower() or "lemon" in result.reason.lower()
+
+    def test_active_powertrain_code_in_announcement_fails(self):
+        # Real announcement: "Active powertrain codes present" should fail
+        cr = _make_cr(announcements=["Active powertrain codes present"])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is False
+        assert "Engine/drivetrain" in result.reason
+
+    def test_no_active_codes_in_announcement_passes(self):
+        # If the normalizer were to promote a "No Active Codes" string
+        # into announcements (unusual but defensive), it must not fail.
+        cr = _make_cr(announcements=["No Active Codes"])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is True
+
 
 # ---------------------------------------------------------------------------
 # Step 2: AutoCheck screening
