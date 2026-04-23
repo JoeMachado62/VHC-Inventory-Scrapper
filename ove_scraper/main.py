@@ -15,7 +15,7 @@ from urllib.request import urlopen
 from zoneinfo import ZoneInfo
 
 from ove_scraper.automation_lock import AutomationLockBusyError, OveAutomationLock
-from ove_scraper.browser import BrowserSessionError
+from ove_scraper.browser import BrowserSessionError, SavedSearchPageEmpty
 from ove_scraper.api_client import VCHApiClient
 from ove_scraper.cdp_browser import PlaywrightCdpBrowserSession
 from ove_scraper.config import Settings, load_env_file
@@ -173,6 +173,15 @@ def main() -> None:
             next_sync_at = 0.0
             next_poll_at = 0.0
             next_keepalive_at = 0.0
+            # Hot Deal daily pipeline tick. We check once a minute whether
+            # today's scheduled slot has been reached AND today hasn't
+            # already run (or has failed and is within the retry budget).
+            # The actual decision lives in should_run_hot_deal_now() which
+            # reads artifacts/_state/hot_deal_daily_state.json — the state
+            # file is the single source of truth for "did today run yet",
+            # so a reboot in the middle of the day still produces one
+            # run per Eastern calendar day.
+            next_hot_deal_check_at = 0.0
             # Heartbeat ticker is INDEPENDENT of poll/sync. The hourly
             # sync can hold the OveAutomationLock for up to 30 minutes,
             # during which the polling tick is skipped by the busy-lock
@@ -257,6 +266,28 @@ def main() -> None:
                             notifier=notifier,
                         )
                         next_keepalive_at = now + settings.browser_keepalive_interval_seconds
+
+                    if SHUTDOWN_EVENT.is_set():
+                        break
+
+                    if now >= next_hot_deal_check_at:
+                        if settings.hot_deal_enabled:
+                            decision = should_run_hot_deal_now(settings, logger)
+                            if decision["should_run"]:
+                                logger.info(
+                                    "Hot Deal auto-run: firing (%s)", decision["reason"],
+                                )
+                                run_hot_deal_with_recovery(
+                                    settings, browser, logger, notifier=notifier,
+                                )
+                            else:
+                                logger.debug(
+                                    "Hot Deal auto-run: skipping (%s)", decision["reason"],
+                                )
+                        # Re-check every 60s whether the slot has arrived,
+                        # or whether a retry-delay has elapsed. Cheap: just
+                        # reads a JSON file and a clock.
+                        next_hot_deal_check_at = now + 60.0
 
                     # Wait on the shutdown event instead of a plain sleep so
                     # SIGINT/SIGTERM/SIGBREAK wake the loop within 1s.
@@ -354,7 +385,7 @@ def build_runtime(settings: Settings, logger):
         cooldown_seconds=settings.admin_alert_cooldown_seconds,
     )
     sync_runner = HourlySyncRunner(settings, browser, api_client, logger, notifier=notifier)
-    deep_scrape_worker = DeepScrapeWorker(api_client, browser, logger, settings)
+    deep_scrape_worker = DeepScrapeWorker(api_client, browser, logger, settings, notifier=notifier)
     logger.info("Configured deep-scrape worker pool size: %s", settings.deep_scrape_max_workers)
     return browser, api_client, sync_runner, deep_scrape_worker, notifier
 
@@ -463,6 +494,20 @@ def run_browser_operation(settings: Settings, browser, logger, operation, operat
             ensure_browser_session(settings, browser, logger, notifier=notifier)
             try:
                 return operation()
+            except SavedSearchPageEmpty as exc:
+                # "No Saved Searches" means OVE accepted the session cookie
+                # but the token is stale — the backend returns zero searches
+                # instead of redirecting to login.  Reloading the same
+                # profile just reloads the same bad cookies.  The fix is to
+                # clear cookies so Chrome starts a fresh login on relaunch.
+                logger.warning(
+                    "%s detected stale OVE session (empty saved searches): "
+                    "clearing cookies and relaunching browser",
+                    operation_name,
+                )
+                _clear_chrome_cookies(settings, browser, logger)
+                recover_browser_session(settings, browser, logger, notifier=notifier)
+                return operation()
             except BrowserSessionError as exc:
                 logger.warning("%s lost browser session: %s", operation_name, exc)
                 recover_browser_session(settings, browser, logger, notifier=notifier)
@@ -529,6 +574,34 @@ def _kill_stale_chrome(settings: Settings, logger) -> None:
         time.sleep(2)
     except Exception as exc:
         logger.warning("Failed to kill stale Chrome processes: %s", exc)
+
+
+_CHROME_CDP_PROFILE = Path("C:/chrome-cdp-profile")
+
+
+def _clear_chrome_cookies(settings: Settings, browser, logger) -> None:
+    """Kill Chrome and delete its cookie files so the next launch starts
+    a fresh OVE login.  This is the programmatic equivalent of the manual
+    fix: clearing browser cookies then re-logging in.
+
+    Called when OVE shows 'No Saved Searches' — the session cookie looks
+    valid to OVE's page shell (no login redirect) but the backend token
+    is stale, so it silently returns zero searches.
+    """
+    browser.close()
+    _kill_stale_chrome(settings, logger)
+
+    cookie_files = [
+        _CHROME_CDP_PROFILE / "Default" / "Network" / "Cookies",
+        _CHROME_CDP_PROFILE / "Default" / "Network" / "Cookies-journal",
+    ]
+    for path in cookie_files:
+        try:
+            if path.exists():
+                path.unlink()
+                logger.info("Deleted stale cookie file: %s", path)
+        except Exception as exc:
+            logger.warning("Failed to delete cookie file %s: %s", path, exc)
 
 
 def launch_browser_script(logger) -> None:
@@ -623,6 +696,246 @@ def seconds_until_next_scheduled_sync(
             hour=first_h, minute=first_m, second=0, microsecond=0
         )
     return max(1.0, (target - current).total_seconds())
+
+
+def _hot_deal_state_path(settings: Settings) -> Path:
+    return settings.artifact_dir / "_state" / "hot_deal_daily_state.json"
+
+
+def _load_hot_deal_state(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_hot_deal_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _is_within_ims_refresh_window(settings: Settings, now: datetime) -> bool:
+    return settings.ims_refresh_start_hour_eastern <= now.hour < settings.ims_refresh_end_hour_eastern
+
+
+def should_run_hot_deal_now(
+    settings: Settings,
+    logger,
+    now: datetime | None = None,
+) -> dict:
+    """Decide whether the main loop should kick off today's Hot Deal run.
+
+    Reads the persisted state file and answers "yes + why" or "no + why".
+    Exposes the reason so the log trail on skipped checks is legible and
+    so ops can diagnose why a day's run didn't fire. Single source of
+    truth for the "one run per Eastern calendar day" invariant.
+    """
+    current = now or datetime.now(EASTERN_TZ)
+    today_str = current.date().isoformat()
+
+    slots = settings.hot_deal_daily_schedule_eastern
+    if not slots:
+        return {"should_run": False, "reason": "no_schedule_configured"}
+
+    # "First slot today that has already passed" — all slots are expressed
+    # in Eastern time and the pipeline runs only once per day, so the
+    # earliest-past slot is the trigger boundary. A slot of (7, 0) means
+    # "eligible to run any time at or after 7:00 AM Eastern today".
+    today_slots_as_dt = [
+        current.replace(hour=h, minute=m, second=0, microsecond=0)
+        for h, m in slots
+    ]
+    past_slots = [slot for slot in today_slots_as_dt if slot <= current]
+    if not past_slots:
+        return {"should_run": False, "reason": "before_first_slot_today"}
+
+    if _is_within_ims_refresh_window(settings, current):
+        # Saved-search exports are backed by Manheim IMS which goes into a
+        # refresh window 4-5 PM ET and returns transient "not found" results.
+        # Defer until the window closes (memory: manheim_ims_refresh_window).
+        return {"should_run": False, "reason": "ims_refresh_window"}
+
+    state = _load_hot_deal_state(_hot_deal_state_path(settings))
+    last_date = state.get("last_run_date_eastern")
+    last_status = state.get("last_run_status")
+    attempts_today = int(state.get("attempts_today", 0) or 0)
+
+    if last_date != today_str:
+        # Either never ran, or last ran on a previous day. New day = fresh
+        # attempt budget regardless of yesterday's outcome.
+        return {"should_run": True, "reason": "new_day"}
+
+    if last_status == "completed":
+        return {"should_run": False, "reason": "already_completed_today"}
+
+    if last_status == "started":
+        last_run_at = _parse_iso_datetime(state.get("last_run_at"))
+        if last_run_at is None:
+            logger.warning("Hot Deal state has status=started but no parseable last_run_at; treating as stale")
+            return {"should_run": True, "reason": "stale_started_unparseable"}
+        age_seconds = (current - last_run_at).total_seconds()
+        if age_seconds >= settings.hot_deal_stale_start_seconds:
+            return {
+                "should_run": True,
+                "reason": f"stale_started_{int(age_seconds)}s_old",
+            }
+        return {
+            "should_run": False,
+            "reason": f"run_in_progress_{int(age_seconds)}s_elapsed",
+        }
+
+    # last_status == "failed" (or anything else we didn't expect)
+    if attempts_today >= settings.hot_deal_max_daily_attempts:
+        return {
+            "should_run": False,
+            "reason": f"daily_attempt_cap_reached_{attempts_today}",
+        }
+    last_run_at = _parse_iso_datetime(state.get("last_run_at"))
+    if last_run_at is not None:
+        elapsed = (current - last_run_at).total_seconds()
+        if elapsed < settings.hot_deal_retry_delay_seconds:
+            return {
+                "should_run": False,
+                "reason": f"retry_cooldown_{int(settings.hot_deal_retry_delay_seconds - elapsed)}s_remaining",
+            }
+    return {
+        "should_run": True,
+        "reason": f"retry_attempt_{attempts_today + 1}_of_{settings.hot_deal_max_daily_attempts}",
+    }
+
+
+def _parse_iso_datetime(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=EASTERN_TZ)
+    return parsed.astimezone(EASTERN_TZ)
+
+
+def run_hot_deal_with_recovery(
+    settings: Settings,
+    browser,
+    logger,
+    notifier: AdminNotifier | None = None,
+) -> None:
+    """Execute one Hot Deal pipeline run, persist state, and surface
+    failures. Mirrors run_sync_once_with_recovery / run_poll_once_with_recovery
+    in that BrowserSessionError is intentionally NOT caught — it propagates
+    to the main-loop auth handler so the session can be rebuilt with the
+    normal circuit-breaker backoff."""
+    from ove_scraper.hot_deal_db import init_db
+    from ove_scraper.hot_deal_pipeline import HotDealPipelineRunner
+
+    state_path = _hot_deal_state_path(settings)
+    state = _load_hot_deal_state(state_path)
+    now_eastern = datetime.now(EASTERN_TZ)
+    today_str = now_eastern.date().isoformat()
+
+    # Reset attempts counter on a new day. The should-run check has
+    # already gated us, but writing the started marker here is the
+    # authoritative "we attempted" record.
+    attempts_today = int(state.get("attempts_today", 0) or 0)
+    if state.get("last_run_date_eastern") != today_str:
+        attempts_today = 0
+    attempts_today += 1
+
+    _save_hot_deal_state(state_path, {
+        "last_run_date_eastern": today_str,
+        "last_run_status": "started",
+        "last_run_at": now_eastern.isoformat(),
+        "attempts_today": attempts_today,
+        "last_failure_reason": state.get("last_failure_reason") if attempts_today > 1 else None,
+    })
+
+    logger.info(
+        "Hot Deal pipeline: starting attempt %s/%s for %s",
+        attempts_today, settings.hot_deal_max_daily_attempts, today_str,
+    )
+
+    try:
+        db_conn = init_db(settings.hot_deal_db_path)
+        try:
+            runner = HotDealPipelineRunner(
+                settings=settings, browser=browser, db_conn=db_conn,
+                log=logger, notifier=notifier,
+            )
+            result = runner.run_once()
+        finally:
+            db_conn.close()
+    except BrowserSessionError:
+        # Re-raise to the main loop's auth handler. Leave state as
+        # "started" — the stale-start detection will reclassify it as
+        # retryable once the runtime rebuilds and we're back in the loop.
+        logger.warning("Hot Deal pipeline hit BrowserSessionError; deferring to main-loop auth recovery")
+        raise
+    except Exception as exc:
+        finish = datetime.now(EASTERN_TZ)
+        reason = f"{type(exc).__name__}: {exc}"
+        _save_hot_deal_state(state_path, {
+            "last_run_date_eastern": today_str,
+            "last_run_status": "failed",
+            "last_run_at": finish.isoformat(),
+            "attempts_today": attempts_today,
+            "last_failure_reason": reason,
+        })
+        logger.error("Hot Deal pipeline crashed on attempt %s: %s", attempts_today, exc, exc_info=True)
+        if attempts_today >= settings.hot_deal_max_daily_attempts and notifier is not None:
+            try:
+                notifier.notify_hot_deal_pipeline_failed(
+                    attempts=attempts_today,
+                    last_error=reason,
+                    logger=logger,
+                )
+            except Exception as notify_exc:
+                logger.warning("Failed to send Hot Deal failure notification: %s", notify_exc)
+        return
+
+    finish = datetime.now(EASTERN_TZ)
+    status = (result or {}).get("status") if isinstance(result, dict) else None
+    if status == "completed":
+        _save_hot_deal_state(state_path, {
+            "last_run_date_eastern": today_str,
+            "last_run_status": "completed",
+            "last_run_at": finish.isoformat(),
+            "attempts_today": attempts_today,
+            "last_failure_reason": None,
+        })
+        logger.info(
+            "Hot Deal pipeline: completed for %s (attempt %s, total_vins=%s, hot_deals=%s)",
+            today_str, attempts_today,
+            (result or {}).get("total_vins", 0),
+            (result or {}).get("hot_deals", 0),
+        )
+    else:
+        # Pipeline reached finish_run() but status != "completed" (e.g.
+        # "failed" — export failure inside run_once caught and logged).
+        reason = f"pipeline returned status={status!r}"
+        _save_hot_deal_state(state_path, {
+            "last_run_date_eastern": today_str,
+            "last_run_status": "failed",
+            "last_run_at": finish.isoformat(),
+            "attempts_today": attempts_today,
+            "last_failure_reason": reason,
+        })
+        logger.error(
+            "Hot Deal pipeline did not complete cleanly on attempt %s: %s",
+            attempts_today, reason,
+        )
+        if attempts_today >= settings.hot_deal_max_daily_attempts and notifier is not None:
+            try:
+                notifier.notify_hot_deal_pipeline_failed(
+                    attempts=attempts_today,
+                    last_error=reason,
+                    logger=logger,
+                )
+            except Exception as notify_exc:
+                logger.warning("Failed to send Hot Deal failure notification: %s", notify_exc)
 
 
 if __name__ == "__main__":

@@ -41,14 +41,27 @@ try {
     & $browserLauncher
     Start-Sleep -Seconds 3
 
+    $consecutiveFailures = 0
+    $maxBackoff = 300  # 5 minutes cap
+
     while ($true) {
         & $pythonPath -m ove_scraper.main run
         $exitCode = $LASTEXITCODE
 
+        if ($exitCode -eq 0) {
+            # Clean exit (e.g. signal shutdown) — reset backoff, restart quickly
+            $consecutiveFailures = 0
+            $waitSeconds = 10
+        } else {
+            $consecutiveFailures++
+            # Exponential backoff: 10, 20, 40, 80, 160, 300 (cap)
+            $waitSeconds = [Math]::Min(10 * [Math]::Pow(2, $consecutiveFailures - 1), $maxBackoff)
+        }
+
         Add-Content -Path $launcherLog -Value (
-            "{0} scraper process exited with code {1}; restarting in 10 seconds" -f ([DateTime]::UtcNow.ToString("o")), $exitCode
+            "{0} scraper exited code={1} failures={2}; restarting in {3}s" -f ([DateTime]::UtcNow.ToString("o")), $exitCode, $consecutiveFailures, $waitSeconds
         )
-        Start-Sleep -Seconds 10
+        Start-Sleep -Seconds $waitSeconds
     }
 }
 finally {

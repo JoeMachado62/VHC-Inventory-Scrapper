@@ -3,7 +3,11 @@ from __future__ import annotations
 import logging
 
 from ove_scraper.api_client import ApiClientError
-from ove_scraper.browser import BrowserSessionError, ListingNotFoundError
+from ove_scraper.browser import (
+    BrowserSessionError,
+    ConditionReportClickFailedError,
+    ListingNotFoundError,
+)
 from ove_scraper.cdp_browser import unique_urls
 from ove_scraper.deep_scrape import DeepScrapeWorker
 from ove_scraper.config import Settings
@@ -248,6 +252,89 @@ def test_successful_detail_push_completes_claim(tmp_path) -> None:
 
     assert result == "VIN1"
     assert api_client.completions == [("complete-request", settings.detail_worker_id, "success")]
+
+
+class ClickFailedBrowser:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def deep_scrape_vin(self, vin: str):
+        self.calls += 1
+        raise ConditionReportClickFailedError(
+            f"Could not open OVE condition report after 2 click attempts; "
+            f"intended_href=https://insightcr.manheim.com/x; last_error=None"
+        )
+
+
+class RecordingNotifier:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def notify_browser_auth_lost(self, *, reason: str, context=None, logger=None) -> bool:
+        self.calls.append({"reason": reason, "context": dict(context or {})})
+        return True
+
+
+def test_conditionreport_click_failed_error_terminals_immediately_as_auth_expired(tmp_path) -> None:
+    """Regression: Ferrari ZFF96NMA4N0272307 (2026-04-22) hit a stale OVE
+    session that caused _open_via_ove_internal_viewer to exhaust its
+    click retries and raise ConditionReportClickFailedError. That
+    previously classified as generic browser_error (cap=5), which kept
+    the VPS re-queueing the request and spawning orphan tabs on every
+    attempt. After the fix: one attempt, straight to /terminal with
+    reason=max_attempts_exceeded, and the operator is notified so they
+    can re-login Chrome."""
+    request = make_request("ZFF96NMA4N0272307", request_id="ferrari-req")
+    settings = Settings(
+        vch_api_base_url="https://example.com/v1",
+        vch_service_token="token",
+        scraper_node_id="node1",
+        artifact_dir=tmp_path / "artifacts",
+        export_dir=tmp_path / "exports",
+        log_file_path=tmp_path / "sync.log",
+    )
+    browser = ClickFailedBrowser()
+    api_client = FakeApiClient([request])
+    notifier = RecordingNotifier()
+    worker = DeepScrapeWorker(
+        api_client,
+        browser,
+        logging.getLogger("test"),
+        settings,
+        notifier=notifier,
+    )
+
+    processed = worker.process_pending_once()
+
+    assert processed == ["ZFF96NMA4N0272307"]
+    assert browser.calls == 1
+    assert api_client.terminals == [("ferrari-req", settings.detail_worker_id, "max_attempts_exceeded")]
+    assert api_client.failures == []  # no /fail call — we skipped straight to /terminal
+    assert len(notifier.calls) == 1
+    assert notifier.calls[0]["context"]["vin"] == "ZFF96NMA4N0272307"
+    assert notifier.calls[0]["context"]["error_category"] == "auth_expired"
+
+
+def test_classify_failure_routes_conditionreport_click_failed_to_auth_expired(tmp_path) -> None:
+    settings = Settings(
+        vch_api_base_url="https://example.com/v1",
+        vch_service_token="token",
+        artifact_dir=tmp_path / "artifacts",
+        export_dir=tmp_path / "exports",
+        log_file_path=tmp_path / "sync.log",
+    )
+    worker = DeepScrapeWorker(
+        FakeApiClient([]),
+        PassiveBrowser(),
+        logging.getLogger("test"),
+        settings,
+    )
+
+    exc = ConditionReportClickFailedError(
+        "Could not open OVE condition report after 2 click attempts"
+    )
+
+    assert worker._classify_failure(exc) == "auth_expired"
 
 
 def test_unique_urls_filters_out_non_vehicle_assets() -> None:

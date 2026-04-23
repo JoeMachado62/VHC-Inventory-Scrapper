@@ -47,6 +47,8 @@ class FakeApiClient:
         self.detail_pushes = 0
         self.last_ingest_vehicles = None
         self.last_sync_metadata = None
+        self.failed_requests: list[dict] = []
+        self.terminal_requests: list[dict] = []
 
     def check_health(self) -> bool:
         return True
@@ -67,6 +69,33 @@ class FakeApiClient:
     def push_ove_detail(self, vin, payload):
         self.detail_pushes += 1
         return {"status": "ok", "data": {"vin": vin, "detail_saved": True}}
+
+    def complete_detail_request(self, request_id, *, worker_id, result="success"):
+        self.terminal_requests.append({
+            "request_id": request_id,
+            "worker_id": worker_id,
+            "result": result,
+        })
+        return {"status": "ok"}
+
+    def fail_detail_request(self, request_id, *, worker_id, error_category, error_message, retry_after_seconds):
+        self.failed_requests.append({
+            "request_id": request_id,
+            "worker_id": worker_id,
+            "error_category": error_category,
+            "error_message": error_message,
+            "retry_after_seconds": retry_after_seconds,
+        })
+        return {"status": "ok"}
+
+    def terminal_detail_request(self, request_id, *, worker_id, error_category, error_message):
+        self.terminal_requests.append({
+            "request_id": request_id,
+            "worker_id": worker_id,
+            "error_category": error_category,
+            "error_message": error_message,
+        })
+        return {"status": "ok"}
 
 
 class DummyVehicle:
@@ -100,6 +129,8 @@ class DummyPendingRequest:
         self.attempts = 0
         self.requested_at = __import__("datetime").datetime.fromisoformat("2026-03-23T12:00:00+00:00")
         self.last_polled_at = None
+        self.claimed_at = None
+        self.lease_expires_at = None
         self.request_source = "test"
         self.requested_by = "test"
         self.reason = "test"
@@ -264,18 +295,21 @@ def test_run_once_fails_when_any_saved_search_is_missing(tmp_path) -> None:
     assert api_client.calls == 0
 
 
-def test_run_once_fails_when_discovered_search_count_is_incomplete(tmp_path) -> None:
+def test_run_once_fails_when_only_non_inventory_searches_are_discovered(tmp_path) -> None:
+    # If OVE discovery returns only searches that feed other pipelines
+    # (Hot Deal), exclusion leaves zero inventory searches. The sync must
+    # refuse to push rather than silently pushing an empty snapshot.
     settings = Settings(
         vch_api_base_url="https://example.com/v1",
         vch_service_token="token",
         export_dir=tmp_path,
         log_file_path=tmp_path / "sync.log",
-        ove_required_search_count=6,
+        hot_deal_searches=("Factory Warranty Active", "VCH Marketing List"),
     )
     api_client = FakeApiClient()
     runner = HourlySyncRunner(
         settings,
-        FakeBrowser(saved_searches=("East Hub 2022-2024", "West Hub 2024 or Newer")),
+        FakeBrowser(saved_searches=("Factory Warranty Active", "VCH Marketing List")),
         api_client,
         logging.getLogger("test"),
     )
@@ -284,7 +318,7 @@ def test_run_once_fails_when_discovered_search_count_is_incomplete(tmp_path) -> 
 
     assert result.execution_status == "Failure"
     assert api_client.calls == 0
-    assert any("Expected 6 saved searches" in detail for detail in result.error_details)
+    assert any("No inventory searches found" in detail for detail in result.error_details)
 
 
 def test_run_once_uploads_complete_deduped_snapshot_in_single_batch(tmp_path) -> None:

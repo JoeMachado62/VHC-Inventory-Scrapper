@@ -666,7 +666,7 @@ def test_create_worker_page_uses_new_tab_and_validates_session() -> None:
             self.wait_calls: list[int] = []
             self.closed = False
 
-        def goto(self, url: str, wait_until: str = "domcontentloaded") -> None:
+        def goto(self, url: str, wait_until: str = "domcontentloaded", timeout: int | None = None) -> None:
             self.url = url
             self.goto_calls.append(url)
 

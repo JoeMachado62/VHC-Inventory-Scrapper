@@ -104,13 +104,12 @@ class Settings:
     ove_listings_url: str = "https://www.ove.com"
     ove_source_platform: str = "manheim"
     ove_east_searches: tuple[str, ...] = (
-        "East Hub 2022-2024",
-        "East Hub 2024 or Newer",
+        "East Hub 2022-2023",
+        "East Hub 2024",
+        "East Hub 2025 or Newer",
     )
     ove_west_searches: tuple[str, ...] = (
-        "West Hub 2015 - 2021",
         "West Hub 2015-2023",
-        "West Hub 2022-2024",
         "West Hub 2024 or Newer",
     )
     ove_search_input_selector: str = "input[type='search'], input[placeholder*='VIN'], input[name*='search']"
@@ -124,6 +123,23 @@ class Settings:
         "VCH Marketing List",
     )
     hot_deal_db_path: Path = Path("./data/hot_deal.db")
+    # Daily Hot Deal auto-run integration. When enabled, the main run loop
+    # fires HotDealPipelineRunner once per Eastern calendar day at the
+    # first unmet slot in hot_deal_daily_schedule_eastern. State is
+    # persisted at artifacts/_state/hot_deal_daily_state.json so a
+    # machine reboot doesn't lose the fact that today already ran (or
+    # that today still needs to catch up). Default slot is 07:00 ET —
+    # before the 09:00 inventory sync and well clear of the 16:00-17:00
+    # Manheim IMS refresh window.
+    hot_deal_enabled: bool = True
+    hot_deal_daily_schedule_eastern: tuple[tuple[int, int], ...] = ((7, 0),)
+    hot_deal_retry_delay_seconds: int = 1800
+    hot_deal_max_daily_attempts: int = 3
+    # If a state file shows status="started" but last_run_at is older
+    # than this many seconds, the previous run is assumed crashed and
+    # eligible for retry. Conservative default: 2 hours (pipeline runs
+    # observed at ~50 min for 100 VINs; doubled for headroom).
+    hot_deal_stale_start_seconds: int = 7200
     openai_api_key: str = ""
     openai_model: str = "gpt-5.4"
 
@@ -182,16 +198,15 @@ class Settings:
             ove_east_searches=_get_list(
                 "OVE_EAST_SEARCHES",
                 (
-                    "East Hub 2022-2024",
-                    "East Hub 2024 or Newer",
+                    "East Hub 2022-2023",
+                    "East Hub 2024",
+                    "East Hub 2025 or Newer",
                 ),
             ),
             ove_west_searches=_get_list(
                 "OVE_WEST_SEARCHES",
                 (
-                    "West Hub 2015 - 2021",
                     "West Hub 2015-2023",
-                    "West Hub 2022-2024",
                     "West Hub 2024 or Newer",
                 ),
             ),
@@ -217,6 +232,14 @@ class Settings:
                 ("Factory Warranty Active", "VCH Marketing List"),
             ),
             hot_deal_db_path=Path(os.getenv("HOT_DEAL_DB_PATH", "./data/hot_deal.db")),
+            hot_deal_enabled=_get_bool("HOT_DEAL_ENABLED", True),
+            hot_deal_daily_schedule_eastern=_get_schedule_slots(
+                "HOT_DEAL_DAILY_SCHEDULE_EASTERN",
+                ((7, 0),),
+            ),
+            hot_deal_retry_delay_seconds=_get_int("HOT_DEAL_RETRY_DELAY_SECONDS", 1800),
+            hot_deal_max_daily_attempts=_get_int("HOT_DEAL_MAX_DAILY_ATTEMPTS", 3),
+            hot_deal_stale_start_seconds=_get_int("HOT_DEAL_STALE_START_SECONDS", 7200),
             openai_api_key=os.getenv("OPENAI_API_KEY", ""),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-5.4"),
         )

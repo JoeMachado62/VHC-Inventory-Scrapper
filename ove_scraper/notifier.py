@@ -115,6 +115,32 @@ class AdminNotifier:
             logger=logger,
         )
 
+    def notify_sync_success(
+        self,
+        *,
+        east_count: int,
+        west_count: int,
+        total_vehicles: int,
+        duplicates_removed: int,
+        searches_exported: list[str],
+        logger=None,
+    ) -> bool:
+        subject = f"OVE inventory sync OK — {total_vehicles} vehicles pushed"
+        body_lines = [
+            "The OVE inventory sync completed successfully.",
+            "",
+            f"East Hub records:    {east_count}",
+            f"West Hub records:    {west_count}",
+            f"Duplicates removed:  {duplicates_removed}",
+            f"Vehicles pushed:     {total_vehicles}",
+            f"Searches exported:   {', '.join(searches_exported)}",
+        ]
+        return self._send_email_unchecked(
+            subject=subject,
+            body="\n".join(body_lines),
+            logger=logger,
+        )
+
     def notify_hot_deal_complete(
         self,
         *,
@@ -128,6 +154,50 @@ class AdminNotifier:
         subject = f"Hot Deal Screening Complete: {found} candidates found ({total} screened)"
         body = format_hot_deal_summary(run_summary, hot_deals)
         return self._send_with_cooldown(key="hot-deal-complete", subject=subject, body=body, logger=logger)
+
+    def notify_hot_deal_pipeline_failed(
+        self,
+        *,
+        attempts: int,
+        last_error: str,
+        logger=None,
+    ) -> bool:
+        subject = f"Hot Deal Pipeline FAILED after {attempts} attempts today"
+        body_lines = [
+            "The daily Hot Deal screening pipeline exhausted its retry budget for today.",
+            "Qualified-VIN marketing list was NOT refreshed today.",
+            "",
+            f"Attempts exhausted: {attempts}",
+            f"Last error:         {last_error}",
+            "",
+            "Action required: inspect logs/ove_scraper.log for the Hot Deal pipeline entries,",
+            "confirm the OVE browser session is authenticated, verify the 'VCH Marketing List'",
+            "saved search still exists in OVE, and run `python -m ove_scraper.main hot-deal`",
+            "manually to reproduce. The daily auto-run will try again at tomorrow's scheduled slot.",
+        ]
+        return self._send_with_cooldown(
+            key="hot-deal-pipeline-failed",
+            subject=subject,
+            body="\n".join(body_lines),
+            logger=logger,
+        )
+
+    def _send_email_unchecked(self, *, subject: str, body: str, logger=None) -> bool:
+        """Send an email without cooldown gating. Use for notifications
+        that should always be delivered (e.g. sync success)."""
+        if not self.is_configured():
+            if logger:
+                logger.warning("Admin notifier is not configured; skipping notification")
+            return False
+        try:
+            self._send_email(subject=subject, body=body)
+            if logger:
+                logger.warning("Sent notification '%s' to %s", subject, self.admin_alert_email)
+            return True
+        except Exception as exc:
+            if logger:
+                logger.warning("Failed to send notification: %s", exc)
+            return False
 
     def _send_with_cooldown(self, *, key: str, subject: str, body: str, logger=None) -> bool:
         if not self.is_configured():

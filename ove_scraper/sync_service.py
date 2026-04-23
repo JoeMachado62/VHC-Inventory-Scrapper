@@ -7,13 +7,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import re
+
 from ove_scraper.api_client import ApiClientError, VCHApiClient
-from ove_scraper.browser import BrowserSession, BrowserSessionError
+from ove_scraper.browser import BrowserSession, BrowserSessionError, SavedSearchPageEmpty
 from ove_scraper.config import Settings
 from ove_scraper.csv_transform import TransformResult, load_csv_rows, transform_rows
 from ove_scraper.logging_utils import append_sync_log
 from ove_scraper.notifier import AdminNotifier
 from ove_scraper.schemas import SyncExecutionLog
+
+
+def _normalize_search_name(value: str) -> str:
+    """Strip non-alphanumeric chars and lowercase so minor name variations
+    (spacing around dashes, extra whitespace, punctuation changes) won't
+    break the configured-vs-discovered matching.
+
+    Examples:
+        "West Hub 2022-2024"   -> "westhub20222024"
+        "West Hub 2022 - 2024" -> "westhub20222024"
+    """
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
 @dataclass(slots=True)
@@ -68,24 +82,66 @@ class HourlySyncRunner:
             if not self.api_client.check_health():
                 raise ApiClientError("VCH API unreachable")
 
-            resolved_searches = self.resolve_saved_searches()
-            expected_search_count = self.settings.ove_required_search_count
-            if len(resolved_searches) != expected_search_count:
-                raise BrowserSessionError(
-                    f"Expected {expected_search_count} saved searches for a complete snapshot, found {len(resolved_searches)}"
+            # Discover ALL saved searches on OVE, exclude only the ones
+            # that belong to other pipelines (e.g. Hot Deal), then export
+            # everything that remains.  This is name-agnostic: adding,
+            # removing, or renaming searches on OVE won't break the sync
+            # — the 75% safety gate is the real correctness firewall.
+            discovered = self.resolve_saved_searches()
+
+            # Exclude searches that feed other pipelines (Hot Deal, etc.)
+            exclude_keys = {
+                _normalize_search_name(n)
+                for n in getattr(self.settings, "hot_deal_searches", ())
+            }
+            inventory_searches = tuple(
+                name for name in discovered
+                if _normalize_search_name(name) not in exclude_keys
+            )
+            excluded = [n for n in discovered if _normalize_search_name(n) in exclude_keys]
+            if excluded:
+                self.logger.info(
+                    "Excluding %d non-inventory searches: %s",
+                    len(excluded), ", ".join(excluded),
                 )
 
-            east_searches = tuple(name for name in resolved_searches if "east" in name.lower())
-            west_searches = tuple(name for name in resolved_searches if "west" in name.lower())
+            if not inventory_searches:
+                raise BrowserSessionError(
+                    f"No inventory searches found after excluding {len(excluded)} "
+                    f"non-inventory searches from {len(discovered)} discovered"
+                )
+
+            # Classify into east/west by name for metadata logging.
+            east_searches = tuple(n for n in inventory_searches if "east" in n.lower())
+            west_searches = tuple(n for n in inventory_searches if "west" in n.lower())
+            unclassified = [
+                n for n in inventory_searches
+                if "east" not in n.lower() and "west" not in n.lower()
+            ]
+            if unclassified:
+                # Searches that don't match east/west still get exported
+                # — just lump them into west for metadata purposes.
+                self.logger.info(
+                    "Unclassified searches (adding to west group): %s",
+                    ", ".join(unclassified),
+                )
+                west_searches = west_searches + tuple(unclassified)
+
+            self.logger.info(
+                "Inventory sync: %d searches (%d east, %d west) from %d discovered",
+                len(inventory_searches), len(east_searches), len(west_searches),
+                len(discovered),
+            )
 
             east_export = self.export_search_group(east_searches)
             west_export = self.export_search_group(west_searches)
             completed_searches = east_export.completed_searches + west_export.completed_searches
-            missing_searches = [name for name in resolved_searches if name not in completed_searches]
+            all_required = east_searches + west_searches
+            missing_searches = [name for name in all_required if name not in completed_searches]
             if missing_searches:
                 raise BrowserSessionError(
                     "Saved-search export incomplete; missing "
-                    f"{len(missing_searches)} of {len(resolved_searches)} searches: {', '.join(missing_searches)}"
+                    f"{len(missing_searches)} of {len(all_required)} searches: {', '.join(missing_searches)}"
                 )
 
             east_rows, east_count = east_export.rows, east_export.total_count
@@ -121,9 +177,9 @@ class HourlySyncRunner:
                 "scraper_node_id": self.settings.scraper_node_id,
                 "scraper_version": self.settings.scraper_version,
                 "source_platform": self.settings.ove_source_platform,
-                "saved_search_names": list(resolved_searches),
+                "saved_search_names": list(all_required),
                 "completed_saved_search_names": list(completed_searches),
-                "expected_saved_search_count": len(resolved_searches),
+                "expected_saved_search_count": len(all_required),
                 "completed_saved_search_count": len(completed_searches),
                 "missing_saved_search_names": [],
                 "full_snapshot": True,
@@ -147,7 +203,26 @@ class HourlySyncRunner:
             self._save_successful_snapshot(transformed)
             execution_log.api_push_status = "Success"
             execution_log.execution_status = "Success"
+
+            if self.notifier is not None:
+                self.notifier.notify_sync_success(
+                    east_count=east_count,
+                    west_count=west_count,
+                    total_vehicles=len(transformed.vehicles),
+                    duplicates_removed=transformed.duplicates_removed,
+                    searches_exported=list(completed_searches),
+                    logger=self.logger,
+                )
+
             return execution_log
+        except SavedSearchPageEmpty as exc:
+            # Log the failure but RE-RAISE so run_browser_operation()
+            # can trigger cookie-clearing + full browser recovery.
+            # Swallowing this here would prevent the recovery from firing.
+            execution_log.api_push_status = "Failure"
+            execution_log.error_details.append(str(exc))
+            self.logger.error("Hourly sync failed: %s", exc)
+            raise
         except (ApiClientError, BrowserSessionError, ValueError) as exc:
             execution_log.api_push_status = "Failure"
             execution_log.error_details.append(str(exc))
@@ -206,6 +281,12 @@ class HourlySyncRunner:
             if discovered:
                 self.logger.info("Discovered %s saved searches from OVE", len(discovered))
                 return discovered
+        except SavedSearchPageEmpty:
+            # "No Saved Searches" is stale auth, not an OVE outage. Falling
+            # back to configured names would just retry every export on the
+            # same bad cookie. Propagate so run_browser_operation clears
+            # cookies and fires the 'OVE scraper login required' alert.
+            raise
         except BrowserSessionError as exc:
             self.logger.warning("Saved-search discovery failed; falling back to configured search names: %s", exc)
 

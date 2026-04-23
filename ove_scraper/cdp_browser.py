@@ -321,6 +321,21 @@ DETAIL_EXTRACTION_SCRIPT = """
 
 
 class PlaywrightCdpBrowserSession:
+    # Process-wide single-shot flag for the auto-click login recovery.
+    # Set to True after the FIRST auto-click attempt (success OR failure)
+    # and never reset for the lifetime of this Python process. Rebuilding
+    # the PlaywrightCdpBrowserSession instance (main.py's auth-fail
+    # rebuild path) does NOT reset it because it's a class attribute.
+    #
+    # Guardrail reason: the prior autonomous login feature (commit
+    # 1f1d8ee, reverted in eaf37cf 2026-04-21) retried the login in a
+    # tight loop on failure and Manheim locked the OVE account. A
+    # process-wide single-shot limits us to exactly one click per
+    # scraper process — a restart is required to try again, which
+    # bounds total click volume to the scheduled-task restart budget
+    # (Count=3). Memory: feedback_ove_auto_login_account_lock.md.
+    _auto_login_attempted_this_process: bool = False
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._playwright: Playwright | None = None
@@ -341,12 +356,114 @@ class PlaywrightCdpBrowserSession:
             page = self._get_ove_page(browser.contexts)
             page.wait_for_load_state("domcontentloaded", timeout=5000)
             if self._is_login_page(page):
-                raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
+                # Try the single-shot auto-click ONCE per process before
+                # giving up. Only clicks if Chrome has pre-filled the
+                # credentials; never types them ourselves.
+                if self._try_single_shot_login_click(page):
+                    # Recheck — a successful click lands us off the login
+                    # page. Fall through to the is_error_page check below.
+                    pass
+                else:
+                    raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
             if self.settings.ove_base_url not in page.url or self._is_error_page(page):
                 page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
         except Exception as exc:
             self._browser = None  # drop stale browser handle, keep Playwright alive
             raise BrowserSessionError(f"OVE browser session unavailable: {exc}") from exc
+
+    def _try_single_shot_login_click(self, page: Page) -> bool:
+        """Click the OVE login 'Sign In' button ONCE if Chrome has
+        pre-filled the credentials, then wait briefly to see if the
+        click navigated us off the login page.
+
+        Returns True if the page is no longer on the login screen after
+        the click; False in every other case (not attempted because
+        fields aren't pre-filled, process-wide flag already set, click
+        failed, or we're still on login after waiting).
+
+        Never clicks more than once per Python process. Never types
+        credentials. Never retries. The prior revert (eaf37cf) was
+        because the reverted implementation retried on failure and
+        Manheim locked the OVE account — this version is single-shot by
+        construction. See feedback_ove_auto_login_account_lock.md.
+        """
+        if type(self)._auto_login_attempted_this_process:
+            LOGGER.info(
+                "Skipping auto-login click: already attempted once in this process. "
+                "A process restart is required to try again."
+            )
+            return False
+        # Mark FIRST — before we even try — so that any exception during
+        # the click still counts as a consumed attempt. This matches the
+        # spirit of "single-shot" strictly: one chance to recover, not
+        # one successful click.
+        type(self)._auto_login_attempted_this_process = True
+
+        try:
+            filled = page.evaluate(
+                """
+                () => {
+                    const pw = document.querySelector("input[type='password']");
+                    if (!(pw instanceof HTMLInputElement)) return false;
+                    return pw.value.length > 0;
+                }
+                """
+            )
+        except Exception as exc:
+            LOGGER.warning("Auto-login pre-check (password-populated) failed: %s", exc)
+            return False
+        if not filled:
+            LOGGER.warning(
+                "Auto-login skipped: password field is empty — Chrome's saved "
+                "credentials are not available. Operator must log in manually."
+            )
+            return False
+
+        submit_locators = [
+            page.locator("button[type='submit']").first,
+            page.get_by_role("button", name=re.compile(r"^\s*(sign\s*in|log\s*in|login)\s*$", re.I)).first,
+            page.locator("input[type='submit']").first,
+        ]
+        submit: Locator | None = None
+        for candidate in submit_locators:
+            try:
+                if candidate.count() and candidate.is_visible(timeout=1000):
+                    submit = candidate
+                    break
+            except Exception:
+                continue
+        if submit is None:
+            LOGGER.warning("Auto-login skipped: could not locate a Sign In button on the login page")
+            return False
+
+        LOGGER.info("Auto-login: clicking Sign In (single-shot, credentials were pre-filled)")
+        try:
+            submit.click(timeout=5000)
+        except Exception as exc:
+            LOGGER.warning("Auto-login Sign In click raised: %s", exc)
+            return False
+
+        # Wait up to 10s for the URL to leave the login page. Using a
+        # simple polling loop instead of expect_navigation because SPA
+        # logins commonly flip the URL via history.replaceState without
+        # firing a navigation event.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                if not self._is_login_page(page):
+                    LOGGER.info(
+                        "Auto-login succeeded: page left the login screen (url=%s)",
+                        page.url,
+                    )
+                    return True
+            except Exception:
+                pass
+            page.wait_for_timeout(250)
+        LOGGER.warning(
+            "Auto-login click fired but page is still on the login screen after 10s. "
+            "Giving up — will NOT re-click. Operator must intervene."
+        )
+        return False
 
     def touch_session(self) -> None:
         try:
@@ -355,7 +472,10 @@ class PlaywrightCdpBrowserSession:
             try:
                 page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
                 if self._is_login_page(page):
-                    raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
+                    # Single-shot auto-click recovery; fall through to
+                    # raise if it didn't land us off login.
+                    if not self._try_single_shot_login_click(page):
+                        raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
             finally:
                 self._close_page(page)
         except Exception as exc:
@@ -523,7 +643,16 @@ class PlaywrightCdpBrowserSession:
 
         if last_error is None:
             raise BrowserSessionError(f"Could not export saved search '{search_name}'")
-        raise BrowserSessionError(
+        # Preserve SavedSearchPageEmpty subclass so run_browser_operation's
+        # cookie-clearing + re-login path fires. Wrapping it as a generic
+        # BrowserSessionError demotes the signal and the weaker recovery
+        # (kill Chrome, relaunch with same cookies) runs instead.
+        exc_type = (
+            SavedSearchPageEmpty
+            if isinstance(last_error, SavedSearchPageEmpty)
+            else BrowserSessionError
+        )
+        raise exc_type(
             f"Could not export saved search '{search_name}' after {max_attempts} attempts: {last_error}"
         )
 
@@ -1299,18 +1428,19 @@ class PlaywrightCdpBrowserSession:
     # AutoCheck modal scraping (Hot Deal pipeline)
     # ------------------------------------------------------------------
 
+    # Universal AutoCheck click target across all OVE CR types: the
+    # branded Experian image wrapped by Manheim's Tracker__container,
+    # which carries the click delegate that opens the full report.
+    # data-test-id="autocheck-link" is on the <img>; click it with
+    # expect_popup and the full Experian report opens in a new window.
     _AUTOCHECK_BUTTON_SELECTORS = [
-        "[data-test-id='autocheck']",
-        "[data-test-id='auto-check']",
+        "[data-test-id='autocheck-link']",
+        "a.Autocheck__fullreport-link",
+        "[data-test-id='report-data'] a",
+        "a[href*='autocheckreport']",
         "a[data-label-text='AutoCheck']",
         "a[data-label-text='AC']",
         ".VehicleReportLink__autocheck-link",
-        "button:has-text('Auto Check')",
-        "a:has-text('Auto Check')",
-        "button:has-text('AutoCheck')",
-        "a:has-text('AutoCheck')",
-        "button:has-text('View Report')",
-        "a:has-text('View Report')",
     ]
 
     # JavaScript to extract inline AutoCheck data from OVE listing page.
@@ -1345,8 +1475,12 @@ class PlaywrightCdpBrowserSession:
             const odoSection = text.match(/ODO(.{0,50})/i);
             result.odo = odoSection ? odoSection[1].trim() : '';
         }
-        // VIEW REPORT link
-        const reportLink = section.querySelector('[data-test-id="auto-report-data"] a')
+        // VIEW REPORT link — OVE's test-id is report-data (class
+        // Autocheck__fullreport-link). Keep the host/path fallbacks
+        // for defense against future DOM churn.
+        const reportLink = section.querySelector('[data-test-id="report-data"] a')
+                        || section.querySelector('a.Autocheck__fullreport-link')
+                        || section.querySelector('a[href*="autocheckreport"]')
                         || section.querySelector('a[href*="vehiclehistservice"]')
                         || section.querySelector('a[href*="autocheck"]');
         if (reportLink) result.view_report_href = reportLink.href || '';
@@ -1365,95 +1499,180 @@ class PlaywrightCdpBrowserSession:
         ac_artifact_dir = artifact_dir / "autocheck"
         ac_artifact_dir.mkdir(parents=True, exist_ok=True)
 
-        # Strategy 1: Extract inline AutoCheck data (most reliable)
-        LOGGER.info("AutoCheck: trying inline extraction for VIN %s", vin)
-        inline_data = detail_page.evaluate(self._AUTOCHECK_INLINE_EXTRACT_JS)
-        if inline_data and inline_data.get("score") is not None:
+        # Step 1: Extract inline AutoCheck indicators from the listing DOM.
+        # OVE does NOT display the numeric AutoCheck score inline — score,
+        # title brands, odometer branding and narrative only live in the
+        # full Experian report — so this step gathers owners/accidents/href
+        # and is purely a precursor to the mandatory Experian navigation.
+        LOGGER.info("AutoCheck: extracting inline indicators for VIN %s", vin)
+        inline_data = detail_page.evaluate(self._AUTOCHECK_INLINE_EXTRACT_JS) or {}
+        has_inline_section = bool(
+            inline_data.get("view_report_href")
+            or inline_data.get("owners") is not None
+            or inline_data.get("accidents") is not None
+            or (inline_data.get("raw_text") or "").strip()
+        )
+        if has_inline_section:
             detail_page.screenshot(path=str(ac_artifact_dir / "autocheck-inline.png"), full_page=True)
             (ac_artifact_dir / "autocheck-inline.html").write_text(detail_page.content(), encoding="utf-8")
             LOGGER.info(
-                "AutoCheck inline: score=%s owners=%s accidents=%s for VIN %s",
-                inline_data.get("score"), inline_data.get("owners"),
-                inline_data.get("accidents"), vin,
+                "AutoCheck inline indicators for VIN %s: owners=%s accidents=%s href=%s",
+                vin,
+                inline_data.get("owners"),
+                inline_data.get("accidents"),
+                bool(inline_data.get("view_report_href")),
             )
             result = self._parse_autocheck_inline(inline_data)
+        else:
+            LOGGER.warning("AutoCheck: no inline section detected for VIN %s", vin)
+            detail_page.screenshot(path=str(ac_artifact_dir / "autocheck-none.png"), full_page=True)
+            (ac_artifact_dir / "autocheck-none.html").write_text(detail_page.content(), encoding="utf-8")
+            return {
+                "scrape_status": "failed",
+                "failure_category": "not_found",
+                "failure_message": "No AutoCheck section on listing page",
+                "raw_text": "",
+            }
 
-            # Try to get full Experian report by navigating to the
-            # AutoCheck URL in a new tab (same context = same cookies).
-            # Using context.new_page().goto() instead of expect_popup
-            # because popup windows don't reliably inherit Manheim SSO.
-            view_href = result.get("view_report_href", "")
-            if not view_href:
-                # Try extracting href from the inline data's link element
+        # Step 2: MANDATORY — open the full Experian report. Title brands,
+        # odometer branding and other serious issues are frequently omitted
+        # from the inline listing view but always appear in the full report.
+        # Per user directive 2026-04-21: never short-circuit to inline-only
+        # success; a deep scrape that skipped Experian is flagged partial
+        # with a clear failure_category so downstream consumers can see the
+        # data gap.
+        experian_outcome = self._capture_experian_autocheck_report(
+            detail_page, result, ac_artifact_dir, vin,
+        )
+        result["scrape_status"] = experian_outcome["scrape_status"]
+        if experian_outcome.get("failure_category"):
+            result["failure_category"] = experian_outcome["failure_category"]
+        if experian_outcome.get("failure_message"):
+            result["failure_message"] = experian_outcome["failure_message"]
+        return result
+
+    def _capture_experian_autocheck_report(
+        self,
+        detail_page: Page,
+        result: dict[str, Any],
+        ac_artifact_dir: Path,
+        vin: str,
+    ) -> dict[str, Any]:
+        """Open the full Experian AutoCheck report and merge its data into
+        ``result``. Tries direct URL navigation first (same browser context
+        = same Manheim SSO cookies), then falls back to clicking the
+        branded autocheck-link image with expect_popup. Returns a dict with
+        scrape_status and optional failure_category/failure_message."""
+        view_href = (result.get("view_report_href") or "").strip()
+        if not view_href:
+            # Re-extract from the DOM at the moment of navigation, in case
+            # the inline JS snapshot missed a late-rendered link.
+            for selector in (
+                "a.Autocheck__fullreport-link",
+                "[data-test-id='report-data'] a",
+                "a[href*='autocheckreport']",
+                "a[href*='vehiclehistservice']",
+            ):
                 try:
-                    report_link = detail_page.locator("[data-test-id='auto-report-data'] a").first
+                    report_link = detail_page.locator(selector).first
                     if report_link.is_visible(timeout=2000):
-                        view_href = report_link.get_attribute("href", timeout=2000) or ""
+                        view_href = (report_link.get_attribute("href", timeout=2000) or "").strip()
+                        if view_href:
+                            result["view_report_href"] = view_href
+                            break
                 except Exception:
-                    pass
-            if view_href:
-                try:
-                    report_page = detail_page.context.new_page()
-                    report_page.goto(view_href, wait_until="domcontentloaded", timeout=20000)
-                    report_page.wait_for_timeout(3000)
-                    report_page.screenshot(path=str(ac_artifact_dir / "autocheck-report.png"), full_page=True)
-                    (ac_artifact_dir / "autocheck-report.html").write_text(report_page.content(), encoding="utf-8")
-                    full_text = report_page.inner_text("body")
-                    report_page.close()
-                    # Check if we got a login page or actual content
-                    if "sign in" in full_text.lower()[:200] or "username" in full_text.lower()[:200]:
-                        LOGGER.debug("AutoCheck full report returned login page for VIN %s; skipping", vin)
-                    else:
-                        result["full_report_text"] = full_text
-                        full_parsed = self._parse_autocheck_content(full_text)
-                        for key in ("title_brand_check", "odometer_check", "accident_check",
-                                    "damage_check", "vehicle_use", "buyback_protection"):
-                            if full_parsed.get(key) and not result.get(key):
-                                result[key] = full_parsed[key]
-                        LOGGER.info("AutoCheck full report captured for VIN %s (%d chars)", vin, len(full_text))
-                except Exception as report_exc:
-                    LOGGER.debug("AutoCheck full report skipped for VIN %s: %s", vin, report_exc)
+                    continue
 
-            result["scrape_status"] = "success"
-            return result
-
-        # Strategy 2: Navigate to VIEW REPORT URL in a new tab (same context)
-        LOGGER.info("AutoCheck: inline extraction empty, trying VIEW REPORT for VIN %s", vin)
-        try:
-            report_link = detail_page.locator("[data-test-id='auto-report-data'] a").first
-            view_href = ""
-            if report_link.is_visible(timeout=3000):
-                view_href = report_link.get_attribute("href", timeout=2000) or ""
-            if view_href:
+        # Path A: direct navigation to the report URL in a new tab. This is
+        # the most reliable path — same context inherits Manheim SSO cookies
+        # and Playwright controls the page fully.
+        if view_href:
+            try:
                 report_page = detail_page.context.new_page()
                 report_page.goto(view_href, wait_until="domcontentloaded", timeout=20000)
                 report_page.wait_for_timeout(3000)
                 report_page.screenshot(path=str(ac_artifact_dir / "autocheck-report.png"), full_page=True)
                 (ac_artifact_dir / "autocheck-report.html").write_text(report_page.content(), encoding="utf-8")
-                content = report_page.inner_text("body")
+                full_text = report_page.inner_text("body")
                 report_page.close()
-                if "sign in" not in content.lower()[:200]:
-                    LOGGER.info("AutoCheck captured via VIEW REPORT for VIN %s (%d chars)", vin, len(content))
-                    result = self._parse_autocheck_content(content)
-                    result["full_report_text"] = content
-                    result["scrape_status"] = "success"
-                    return result
-                LOGGER.debug("AutoCheck VIEW REPORT returned login page for VIN %s", vin)
-        except Exception as report_exc:
-            LOGGER.warning("AutoCheck VIEW REPORT failed for VIN %s: %s", vin, report_exc)
+                if self._looks_like_login_page(full_text):
+                    LOGGER.warning("AutoCheck full report navigation landed on a login page for VIN %s", vin)
+                else:
+                    self._merge_full_experian_report(result, full_text)
+                    LOGGER.info("AutoCheck full report captured via direct nav for VIN %s (%d chars)", vin, len(full_text))
+                    return {"scrape_status": "success"}
+            except Exception as report_exc:
+                LOGGER.warning("AutoCheck direct navigation failed for VIN %s: %s", vin, report_exc)
 
-        # Strategy 3: Fall back to clicking AutoCheck button
-        ac_button = self._find_autocheck_button(detail_page)
-        if ac_button is not None:
-            LOGGER.info("AutoCheck: trying button click fallback for VIN %s", vin)
-            modal_content = self._open_autocheck_modal(detail_page, ac_button, ac_artifact_dir, vin)
-            result = self._parse_autocheck_content(modal_content)
-            result["scrape_status"] = "partial"
-            return result
+        # Path B: click the branded autocheck-link image with expect_popup.
+        # Per user 2026-04-21: this is the universal trigger across CR types
+        # — the Tracker__container wrapper fires a JS click delegate that
+        # opens the Experian report in a popup window.
+        for selector in ("[data-test-id='autocheck-link']", "a.Autocheck__fullreport-link"):
+            try:
+                trigger = detail_page.locator(selector).first
+                if not trigger.is_visible(timeout=1500):
+                    continue
+                LOGGER.info("AutoCheck: attempting popup click via %s for VIN %s", selector, vin)
+                with detail_page.expect_popup(timeout=8000) as popup_info:
+                    trigger.click(timeout=5000)
+                popup = popup_info.value
+                popup.wait_for_load_state("domcontentloaded", timeout=20000)
+                popup.wait_for_timeout(3000)
+                popup.screenshot(path=str(ac_artifact_dir / "autocheck-popup.png"), full_page=True)
+                (ac_artifact_dir / "autocheck-popup.html").write_text(popup.content(), encoding="utf-8")
+                popup_text = popup.inner_text("body")
+                popup.close()
+                if self._looks_like_login_page(popup_text):
+                    LOGGER.warning("AutoCheck popup landed on a login page for VIN %s", vin)
+                    continue
+                self._merge_full_experian_report(result, popup_text)
+                LOGGER.info("AutoCheck full report captured via popup click for VIN %s (%d chars)", vin, len(popup_text))
+                return {"scrape_status": "success"}
+            except Exception as popup_exc:
+                LOGGER.debug("AutoCheck popup click via %s failed for VIN %s: %s", selector, vin, popup_exc)
 
-        LOGGER.warning("AutoCheck: no data found for VIN %s", vin)
-        detail_page.screenshot(path=str(ac_artifact_dir / "autocheck-none.png"), full_page=True)
-        return {"scrape_status": "failed", "failure_category": "not_found", "failure_message": "No AutoCheck data on listing page", "raw_text": ""}
+        # Could not reach the Experian report. Keep the inline indicators
+        # but mark partial so consumers know title-brand / odometer-brand
+        # coverage is incomplete for this VIN.
+        detail_page.screenshot(path=str(ac_artifact_dir / "autocheck-experian-missing.png"), full_page=True)
+        return {
+            "scrape_status": "partial",
+            "failure_category": "experian_report_unreachable",
+            "failure_message": (
+                "Inline AutoCheck indicators captured but the full Experian "
+                "report could not be opened; title-brand and odometer-brand "
+                "checks may be incomplete."
+            ),
+        }
+
+    @staticmethod
+    def _looks_like_login_page(text: str) -> bool:
+        head = (text or "").lower()[:400]
+        return ("sign in" in head) or ("username" in head) or ("password" in head and "log in" in head)
+
+    def _merge_full_experian_report(self, result: dict[str, Any], full_text: str) -> None:
+        """Parse the Experian report body and merge its fields into result.
+        Overwrites inline-derived OK/Problem placeholders because the full
+        report is authoritative for title-brand and odometer branding."""
+        result["full_report_text"] = full_text
+        full_parsed = self._parse_autocheck_content(full_text)
+        # The full report's title_brand_check / odometer_check / accident_check
+        # override the inline heuristics. Inline only knows whether an icon
+        # was green/red — the full report knows *what* the brand is.
+        for key in (
+            "title_brand_check",
+            "odometer_check",
+            "accident_check",
+            "damage_check",
+            "vehicle_use",
+            "buyback_protection",
+        ):
+            full_value = full_parsed.get(key)
+            if full_value:
+                result[key] = full_value
+        if full_parsed.get("autocheck_score") is not None:
+            result["autocheck_score"] = full_parsed["autocheck_score"]
 
     def scrape_autocheck_modal(self, vin: str, artifact_dir: Path) -> dict[str, Any]:
         """Standalone AutoCheck scrape — opens its own page for the VIN.
@@ -1518,96 +1737,6 @@ class PlaywrightCdpBrowserSession:
         result["vehicle_use"] = ""
         result["buyback_protection"] = ""
         return result
-
-    def _find_autocheck_button(self, page: Page) -> Locator | None:
-        """Try each selector to find the AutoCheck button on the detail page."""
-        for selector in self._AUTOCHECK_BUTTON_SELECTORS:
-            try:
-                loc = page.locator(selector).first
-                if loc.is_visible(timeout=1000):
-                    LOGGER.info("Found AutoCheck button via selector: %s", selector)
-                    return loc
-            except Exception:
-                continue
-        return None
-
-    def _open_autocheck_modal(
-        self,
-        page: Page,
-        button: Locator,
-        artifact_dir: Path,
-        vin: str,
-    ) -> str:
-        """Click the AutoCheck button and extract the modal/popup content."""
-
-        # Strategy 1: Popup window
-        try:
-            with page.expect_popup(timeout=5000) as popup_info:
-                button.click(timeout=5000)
-            popup = popup_info.value
-            popup.wait_for_load_state("domcontentloaded", timeout=15000)
-            popup.wait_for_timeout(3000)  # Let dynamic content render
-            popup.screenshot(path=str(artifact_dir / "autocheck-popup.png"), full_page=True)
-            (artifact_dir / "autocheck-popup.html").write_text(popup.content(), encoding="utf-8")
-            content = popup.inner_text("body")
-            popup.close()
-            LOGGER.info("AutoCheck captured via popup window for VIN %s (%d chars)", vin, len(content))
-            return content
-        except Exception as popup_exc:
-            LOGGER.debug("AutoCheck popup strategy failed for VIN %s: %s", vin, popup_exc)
-
-        # Strategy 2: Inline modal/overlay
-        try:
-            button.click(timeout=5000)
-            page.wait_for_timeout(2000)
-
-            # Look for common modal selectors
-            modal_selectors = [
-                "[role='dialog']",
-                ".modal-content",
-                ".modal-body",
-                ".overlay-content",
-                "[class*='modal']",
-                "[class*='Modal']",
-                "[class*='autocheck']",
-                "[class*='AutoCheck']",
-            ]
-            for selector in modal_selectors:
-                try:
-                    modal = page.locator(selector).first
-                    if modal.is_visible(timeout=2000):
-                        page.screenshot(path=str(artifact_dir / "autocheck-modal.png"), full_page=True)
-                        (artifact_dir / "autocheck-modal.html").write_text(page.content(), encoding="utf-8")
-                        content = modal.inner_text()
-                        LOGGER.info(
-                            "AutoCheck captured via inline modal (%s) for VIN %s (%d chars)",
-                            selector, vin, len(content),
-                        )
-                        return content
-                except Exception:
-                    continue
-        except Exception as modal_exc:
-            LOGGER.debug("AutoCheck inline modal strategy failed for VIN %s: %s", vin, modal_exc)
-
-        # Strategy 3: iframe
-        try:
-            for frame in page.frames:
-                url = frame.url.lower()
-                if "autocheck" in url or "experian" in url:
-                    frame.wait_for_load_state("domcontentloaded", timeout=10000)
-                    page.screenshot(path=str(artifact_dir / "autocheck-iframe.png"), full_page=True)
-                    (artifact_dir / "autocheck-iframe.html").write_text(frame.content(), encoding="utf-8")
-                    content = frame.inner_text("body")
-                    LOGGER.info("AutoCheck captured via iframe for VIN %s (%d chars)", vin, len(content))
-                    return content
-        except Exception as iframe_exc:
-            LOGGER.debug("AutoCheck iframe strategy failed for VIN %s: %s", vin, iframe_exc)
-
-        # Fallback: capture full page content for debugging
-        page.screenshot(path=str(artifact_dir / "autocheck-fallback.png"), full_page=True)
-        (artifact_dir / "autocheck-fallback.html").write_text(page.content(), encoding="utf-8")
-        LOGGER.warning("All AutoCheck modal strategies exhausted for VIN %s; returning full page text", vin)
-        return page.inner_text("body")
 
     @staticmethod
     def _parse_autocheck_content(raw_text: str) -> dict[str, Any]:
@@ -2383,6 +2512,16 @@ class PlaywrightCdpBrowserSession:
             # via /fail with auth_expired (or pre-push validation can hard-stop
             # the entire CR push). DO NOT swallow.
             raise
+        except ConditionReportClickFailedError:
+            # Same reasoning: exhausted CR click retries are ~always a stale
+            # OVE SSO. Propagate so _classify_failure routes to auth_expired
+            # and the single-attempt fail-streak cap escalates to /terminal
+            # immediately. Previously this fell through to the generic
+            # Exception handler below, which returned None and let the scrape
+            # assemble a partial payload that then failed the tire-depths
+            # validation gate as page_structure_changed (cap=5) — the real
+            # mechanism behind the Ferrari ZFF96NMA4N0272307 loop.
+            raise
         except Exception as exc:
             LOGGER.warning(
                 "Condition report capture failed (non-auth) for %s: %s",
@@ -2551,72 +2690,140 @@ class PlaywrightCdpBrowserSession:
         # We do NOT pass `href` to a goto here. We use the href ONLY to
         # label debug artifacts on failure, and the click on the OVE
         # locator element is the sole navigation mechanism.
-        max_attempts = 4
+        #
+        # Under a stale OVE SSO the React handler sometimes delegates to
+        # window.open(insightcr...) instead of a hash-route change. The
+        # resulting popup lands on auth.manheim.com or Manheim's
+        # "Sorry, condition reports are not available right now" error
+        # page. Without a popup listener those tabs leaked — 4 retries ×
+        # 1 orphan each = the 5-tab pile-up behind the Ferrari
+        # ZFF96NMA4N0272307 incident. We now attach a context-level
+        # popup listener for the whole retry window, inspect each new
+        # page for auth/unavailable signals, raise
+        # ManheimAuthRedirectError on first sight, and close every
+        # orphan in the finally block.
+        max_attempts = 2
         last_error: Exception | None = None
-        for attempt in range(max_attempts):
-            # Re-resolve the locator on every attempt — a previous click
-            # may have rebuilt the DOM and the prior handle could be stale.
-            locator = self._find_condition_report_locator(source_page)
-            if locator is None:
-                LOGGER.warning(
-                    "Condition report locator not found on OVE detail page (attempt %s/%s)",
-                    attempt + 1,
-                    max_attempts,
-                )
-                source_page.wait_for_timeout(1500)
-                continue
-            try:
-                cr_page = self._click_condition_report_locator(source_page, locator)
-            except ManheimAuthRedirectError:
-                # The click DID navigate, but to an auth page. Propagate
-                # immediately — retrying with the same source page will
-                # not fix an auth state problem.
-                raise
-            except Exception as click_exc:
-                last_error = click_exc
-                LOGGER.warning(
-                    "Condition report click attempt %s/%s raised %s; will retry",
-                    attempt + 1,
-                    max_attempts,
-                    click_exc,
-                )
-                source_page.wait_for_timeout(1500)
-                continue
-            if cr_page is not None:
-                LOGGER.info(
-                    "Opened OVE-internal condition report view (attempt %s/%s, url=%s)",
-                    attempt + 1,
-                    max_attempts,
-                    cr_page.url,
-                )
-                self._raise_if_auth_redirect(cr_page, artifact_dir, "post_click", href)
-                return cr_page
-            LOGGER.warning(
-                "Condition report click attempt %s/%s produced no navigation; will retry",
-                attempt + 1,
-                max_attempts,
-            )
-            source_page.wait_for_timeout(1500)
+        collected_popups: list[Page] = []
+        claimed_page: Page | None = None
+        context = source_page.context
 
-        # All click attempts exhausted. We deliberately do NOT fall back to
-        # a direct goto on the raw Manheim URL. Capture a debug snapshot of
-        # the source page so a follow-up investigation can see why the click
-        # never produced a navigation, then raise so the lease retries.
+        def _on_popup(new_page: Page) -> None:
+            collected_popups.append(new_page)
+
+        context.on("page", _on_popup)
         try:
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            (artifact_dir / "cr-click-failed-source.html").write_text(
-                source_page.content(), encoding="utf-8"
+            for attempt in range(max_attempts):
+                # Re-resolve the locator on every attempt — a previous click
+                # may have rebuilt the DOM and the prior handle could be stale.
+                locator = self._find_condition_report_locator(source_page)
+                if locator is None:
+                    LOGGER.warning(
+                        "Condition report locator not found on OVE detail page (attempt %s/%s)",
+                        attempt + 1,
+                        max_attempts,
+                    )
+                    source_page.wait_for_timeout(1500)
+                    continue
+                try:
+                    cr_page = self._click_condition_report_locator(source_page, locator)
+                except ManheimAuthRedirectError:
+                    # The click DID navigate, but to an auth page. Propagate
+                    # immediately — retrying with the same source page will
+                    # not fix an auth state problem.
+                    raise
+                except Exception as click_exc:
+                    last_error = click_exc
+                    LOGGER.warning(
+                        "Condition report click attempt %s/%s raised %s; will retry",
+                        attempt + 1,
+                        max_attempts,
+                        click_exc,
+                    )
+                    source_page.wait_for_timeout(1500)
+                    self._inspect_cr_popups_for_auth(collected_popups, artifact_dir, href)
+                    continue
+
+                # Inspect any popups spawned by the click BEFORE deciding
+                # success. Raises ManheimAuthRedirectError if a popup
+                # landed on login or the Manheim "not available" page.
+                self._inspect_cr_popups_for_auth(collected_popups, artifact_dir, href)
+
+                if cr_page is not None:
+                    LOGGER.info(
+                        "Opened OVE-internal condition report view (attempt %s/%s, url=%s)",
+                        attempt + 1,
+                        max_attempts,
+                        cr_page.url,
+                    )
+                    self._raise_if_auth_redirect(cr_page, artifact_dir, "post_click", href)
+                    if self._is_cr_unavailable_page(cr_page):
+                        raise ManheimAuthRedirectError(
+                            "Manheim returned 'condition reports are not available' for "
+                            f"intended_href={href}; treating as stale-session auth failure."
+                        )
+                    claimed_page = cr_page
+                    return cr_page
+                LOGGER.warning(
+                    "Condition report click attempt %s/%s produced no navigation; will retry",
+                    attempt + 1,
+                    max_attempts,
+                )
+                source_page.wait_for_timeout(1500)
+
+            # All click attempts exhausted. We deliberately do NOT fall back
+            # to a direct goto on the raw Manheim URL. Capture a debug
+            # snapshot of the source page so a follow-up investigation can
+            # see why the click never produced a navigation, then raise so
+            # the lease retries.
+            try:
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                (artifact_dir / "cr-click-failed-source.html").write_text(
+                    source_page.content(), encoding="utf-8"
+                )
+                source_page.screenshot(
+                    path=str(artifact_dir / "cr-click-failed-source.png"),
+                    full_page=True,
+                )
+            except Exception as snap_exc:
+                LOGGER.warning("Could not capture cr-click-failed debug snapshot: %s", snap_exc)
+            raise ConditionReportClickFailedError(
+                f"Could not open OVE condition report after {max_attempts} click attempts; "
+                f"intended_href={href}; last_error={last_error}"
             )
-            source_page.screenshot(
-                path=str(artifact_dir / "cr-click-failed-source.png"),
-                full_page=True,
-            )
-        except Exception as snap_exc:
-            LOGGER.warning("Could not capture cr-click-failed debug snapshot: %s", snap_exc)
-        raise ConditionReportClickFailedError(
-            f"Could not open OVE condition report after {max_attempts} click attempts; "
-            f"intended_href={href}; last_error={last_error}"
-        )
+        finally:
+            try:
+                context.remove_listener("page", _on_popup)
+            except Exception:
+                pass
+            for popup in collected_popups:
+                if popup is claimed_page:
+                    continue
+                self._close_page(popup)
+
+    def _inspect_cr_popups_for_auth(
+        self,
+        popups: list[Page],
+        artifact_dir: Path,
+        href: str,
+    ) -> None:
+        """Raise ManheimAuthRedirectError if any popup opened by the CR
+        click landed on an auth page or the Manheim 'not available' error
+        page. These pages are the signature of a stale OVE SSO and
+        retrying cannot recover from them — the user must re-login Chrome."""
+        for popup in popups:
+            try:
+                if popup.is_closed():
+                    continue
+            except Exception:
+                continue
+            if self._is_manheim_auth_page(popup):
+                self._raise_if_auth_redirect(popup, artifact_dir, "cr_popup_auth", href)
+            if self._is_cr_unavailable_page(popup):
+                raise ManheimAuthRedirectError(
+                    "Manheim CR popup showed 'condition reports are not available' for "
+                    f"intended_href={href}; treating as stale-session auth failure."
+                )
 
     def _is_manheim_auth_page(self, page: Page) -> bool:
         try:
@@ -2630,6 +2837,35 @@ class PlaywrightCdpBrowserSession:
         except Exception:
             title = ""
         if title == "sign in" or title == "log in" or title == "login":
+            return True
+        return False
+
+    def _is_cr_unavailable_page(self, page: Page) -> bool:
+        """Detect Manheim's 'Sorry, condition reports are not available
+        right now' stale-session error page. This is the wording Manheim
+        shows when insightcr.manheim.com is reached with a bad / expired
+        SSO token. Retrying cannot recover it; the user must re-login."""
+        try:
+            text = page.evaluate(
+                "() => (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase()"
+            )
+        except Exception:
+            return False
+        if not isinstance(text, str):
+            return False
+        head = text[:2000]
+        if "condition reports are not available" in head:
+            return True
+        # Be conservative on fuzzier matches: require 'condition report'
+        # AND 'not available' AND one of the apology/retry cues, all in
+        # the top of the page, to avoid misfiring on listings that
+        # legitimately mention 'Data Not Available' in a vehicle-history
+        # section.
+        if (
+            "condition report" in head
+            and "not available" in head
+            and ("sorry" in head or "try again" in head or "right now" in head)
+        ):
             return True
         return False
 

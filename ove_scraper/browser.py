@@ -15,6 +15,17 @@ class ListingNotFoundError(BrowserSessionError):
     """Raised when a VIN cannot be found in the live OVE search results."""
 
 
+class SavedSearchPageEmpty(BrowserSessionError):
+    """Raised when the OVE saved-searches page loads successfully but shows
+    'No Saved Searches'.  Despite looking like a data issue, this is an
+    authentication problem: OVE renders the page shell but the session token
+    is stale, so the backend returns zero searches instead of a redirect.
+    Repeated requests on the same broken session trigger OVE rate-limiting
+    and 500 errors, so this exception must propagate immediately to trigger
+    a full browser session recovery (kill Chrome, relaunch) — never retry
+    in-page."""
+
+
 class ManheimAuthRedirectError(BrowserSessionError):
     """Raised when a Manheim navigation lands on auth.manheim.com instead of the
     expected condition-report page. Indicates the OAuth handshake failed and

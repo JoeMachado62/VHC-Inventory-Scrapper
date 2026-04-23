@@ -14,11 +14,13 @@ from ove_scraper.api_client import ApiClientError, VCHApiClient
 from ove_scraper.browser import (
     BrowserSession,
     BrowserSessionError,
+    ConditionReportClickFailedError,
     DeepScrapeResult,
     ListingNotFoundError,
     ManheimAuthRedirectError,
 )
 from ove_scraper.config import Settings
+from ove_scraper.notifier import AdminNotifier
 from ove_scraper.schemas import DetailImage, ListingSnapshot, PendingDetailRequest
 
 
@@ -34,11 +36,13 @@ class DeepScrapeWorker:
         browser: BrowserSession,
         logger: logging.Logger,
         settings: Settings,
+        notifier: AdminNotifier | None = None,
     ) -> None:
         self.api_client = api_client
         self.browser = browser
         self.logger = logger
         self.settings = settings
+        self.notifier = notifier
         self._not_found_tracker_path = self.settings.artifact_dir / "_state" / "not_found_tracker.json"
         self._parallel_warning_emitted = False
         # Process-local cooldown keyed by request_id. Whenever a request fails or
@@ -308,6 +312,19 @@ class DeepScrapeWorker:
                     request.vin,
                     error_category,
                 )
+                if error_category == "auth_expired" and self.notifier is not None:
+                    # Tell the operator to re-login Chrome. The notifier
+                    # has its own cooldown (default 1h) so we can fire
+                    # unconditionally here without flooding.
+                    self.notifier.notify_browser_auth_lost(
+                        reason=f"deep-scrape worker detected auth_expired: {exc}",
+                        context={
+                            "request_id": request.request_id,
+                            "vin": request.vin,
+                            "error_category": error_category,
+                        },
+                        logger=self.logger,
+                    )
                 return request.vin
             retry_after_seconds = self.settings.deep_scrape_retry_delay_seconds
             self._fail_claimed_request(
@@ -568,6 +585,8 @@ class DeepScrapeWorker:
                 )
         return released
 
+    MAX_CONSECUTIVE_AUTH_EXPIRED_FAILS = 1
+
     def _record_and_check_fail_streak(self, request: PendingDetailRequest, error_category: str) -> bool:
         """Record a fail of the given category for this request_id and return
         True if the consecutive-same-category streak has reached the cap.
@@ -575,12 +594,17 @@ class DeepScrapeWorker:
         The counter resets to 1 whenever the category changes — only
         consistent failures of the same kind count as a streak. The not-found
         category gets a tighter cap (3) because retrying a 404 cannot help.
+        auth_expired gets the tightest cap (1): Chrome needs a human to
+        re-login, and every additional attempt risks spawning orphan tabs
+        (per the Ferrari ZFF96NMA4N0272307 incident 2026-04-22). Escalating
+        to /terminal on the first signal halts the lease loop immediately.
         """
-        cap = (
-            self.MAX_CONSECUTIVE_VIN_NOT_FOUND_FAILS
-            if error_category == "vin_not_found" or error_category == "temporarily_unavailable"
-            else self.MAX_CONSECUTIVE_FAILS_PER_CATEGORY
-        )
+        if error_category == "auth_expired":
+            cap = self.MAX_CONSECUTIVE_AUTH_EXPIRED_FAILS
+        elif error_category == "vin_not_found" or error_category == "temporarily_unavailable":
+            cap = self.MAX_CONSECUTIVE_VIN_NOT_FOUND_FAILS
+        else:
+            cap = self.MAX_CONSECUTIVE_FAILS_PER_CATEGORY
         prior = self._fail_streak.get(request.request_id)
         if prior is not None and prior.get("category") == error_category:
             count = int(prior.get("count", 0)) + 1
@@ -613,6 +637,14 @@ class DeepScrapeWorker:
     def _classify_failure(self, exc: Exception) -> str:
         lowered = str(exc).lower()
         if isinstance(exc, ManheimAuthRedirectError):
+            return "auth_expired"
+        # ConditionReportClickFailedError in the field is ~always a stale
+        # OVE/Manheim SSO (per the Ferrari ZFF96NMA4N0272307 incident
+        # 2026-04-22 and memory note feedback_no_saved_searches_is_auth).
+        # Routing it as auth_expired — rather than generic browser_error
+        # — pairs with the fail-streak cap of 1 for auth_expired to
+        # short-circuit the tab-spawn loop.
+        if isinstance(exc, ConditionReportClickFailedError):
             return "auth_expired"
         if isinstance(exc, BrowserSessionError):
             if "login page" in lowered or "not authenticated" in lowered or "auth.manheim" in lowered:
