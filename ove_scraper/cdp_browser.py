@@ -1638,22 +1638,48 @@ class PlaywrightCdpBrowserSession:
             try:
                 report_page = detail_page.context.new_page()
                 report_page.goto(view_href, wait_until="domcontentloaded", timeout=20000)
-                report_page.wait_for_timeout(3000)
-                report_page.screenshot(path=str(ac_artifact_dir / "autocheck-report.png"), full_page=True)
-                (ac_artifact_dir / "autocheck-report.html").write_text(report_page.content(), encoding="utf-8")
-                full_text = report_page.inner_text("body")
-                if self._looks_like_login_page(full_text):
+
+                # Fast URL-based auth detection BEFORE waiting for content.
+                # If the URL redirected to auth.manheim.com the content
+                # will never arrive and waiting wastes 12s per VIN.
+                if self._url_is_auth_redirect(report_page.url):
                     self._record_experian_login_redirect()
                     LOGGER.warning(
-                        "AutoCheck full report navigation landed on a login page for VIN %s "
-                        "(consecutive=%s)",
-                        vin, self._experian_consecutive_login_redirects,
+                        "AutoCheck direct nav URL redirected to auth for VIN %s: %s (consecutive=%s)",
+                        vin, report_page.url, self._experian_consecutive_login_redirects,
                     )
                 else:
-                    self._reset_experian_login_redirect_counter()
-                    self._merge_full_experian_report(result, full_text)
-                    LOGGER.info("AutoCheck full report captured via direct nav for VIN %s (%d chars)", vin, len(full_text))
-                    return {"scrape_status": "success"}
+                    # Wait for real content to populate. Experian reports
+                    # take 5-8s to fully render per user 2026-04-24;
+                    # the 3s wait we had before was catching shells.
+                    try:
+                        report_page.wait_for_function(
+                            self._AUTOCHECK_CONTENT_READY_SIGNAL,
+                            timeout=self._AUTOCHECK_POST_LOAD_TIMEOUT_MS,
+                        )
+                    except Exception:
+                        # Content never crossed 500 chars in 12s — either
+                        # very slow or genuinely broken. Fall through and
+                        # capture whatever's there; content check below
+                        # will decide.
+                        pass
+                    report_page.screenshot(path=str(ac_artifact_dir / "autocheck-report.png"), full_page=True)
+                    (ac_artifact_dir / "autocheck-report.html").write_text(report_page.content(), encoding="utf-8")
+                    full_text = report_page.inner_text("body")
+
+                    # Final URL check + content check — URL could have
+                    # redirected during the 12s wait window.
+                    if self._url_is_auth_redirect(report_page.url) or self._looks_like_login_page(full_text):
+                        self._record_experian_login_redirect()
+                        LOGGER.warning(
+                            "AutoCheck direct nav landed on login for VIN %s: url=%s (consecutive=%s)",
+                            vin, report_page.url, self._experian_consecutive_login_redirects,
+                        )
+                    else:
+                        self._reset_experian_login_redirect_counter()
+                        self._merge_full_experian_report(result, full_text)
+                        LOGGER.info("AutoCheck full report captured via direct nav for VIN %s (%d chars)", vin, len(full_text))
+                        return {"scrape_status": "success"}
             except Exception as report_exc:
                 LOGGER.warning("AutoCheck direct navigation failed for VIN %s: %s", vin, report_exc)
             finally:
@@ -1687,22 +1713,43 @@ class PlaywrightCdpBrowserSession:
                 if not trigger.is_visible(timeout=1500):
                     continue
                 LOGGER.info("AutoCheck: attempting popup click via %s for VIN %s", selector, vin)
-                with detail_page.expect_popup(timeout=8000) as popup_info:
+                # Popup spawn can take 3-5s on a busy session; give it 12s.
+                with detail_page.expect_popup(timeout=12000) as popup_info:
                     trigger.click(timeout=5000)
                 popup = popup_info.value
                 popup.wait_for_load_state("domcontentloaded", timeout=20000)
-                popup.wait_for_timeout(3000)
+
+                # Same URL-first auth detection as Path A.
+                if self._url_is_auth_redirect(popup.url):
+                    self._record_experian_login_redirect()
+                    LOGGER.warning(
+                        "AutoCheck popup URL redirected to auth for VIN %s: %s (consecutive=%s)",
+                        vin, popup.url, self._experian_consecutive_login_redirects,
+                    )
+                    if self._experian_short_circuit_tripped():
+                        break
+                    continue
+
+                # Wait up to 12s for real content (Experian takes 5-8s to
+                # populate per user 2026-04-24). Fall through if it never
+                # crosses the threshold; content check below will decide.
+                try:
+                    popup.wait_for_function(
+                        self._AUTOCHECK_CONTENT_READY_SIGNAL,
+                        timeout=self._AUTOCHECK_POST_LOAD_TIMEOUT_MS,
+                    )
+                except Exception:
+                    pass
                 popup.screenshot(path=str(ac_artifact_dir / "autocheck-popup.png"), full_page=True)
                 (ac_artifact_dir / "autocheck-popup.html").write_text(popup.content(), encoding="utf-8")
                 popup_text = popup.inner_text("body")
-                if self._looks_like_login_page(popup_text):
+                if self._url_is_auth_redirect(popup.url) or self._looks_like_login_page(popup_text):
                     self._record_experian_login_redirect()
                     LOGGER.warning(
-                        "AutoCheck popup landed on a login page for VIN %s (consecutive=%s)",
-                        vin, self._experian_consecutive_login_redirects,
+                        "AutoCheck popup landed on login for VIN %s: url=%s (consecutive=%s)",
+                        vin, popup.url, self._experian_consecutive_login_redirects,
                     )
                     if self._experian_short_circuit_tripped():
-                        # Bail — further popups will also redirect.
                         break
                     continue
                 self._reset_experian_login_redirect_counter()
@@ -1749,6 +1796,40 @@ class PlaywrightCdpBrowserSession:
     def _looks_like_login_page(text: str) -> bool:
         head = (text or "").lower()[:400]
         return ("sign in" in head) or ("username" in head) or ("password" in head and "log in" in head)
+
+    @staticmethod
+    def _url_is_auth_redirect(url: str) -> bool:
+        """Definitive: the URL itself says this is a login page.
+
+        Unlike text scanning, URL doesn't partially render — a page is
+        either on auth.manheim.com or it isn't. Used to fast-fail
+        auth-redirect detection without waiting the full content timeout,
+        AND to avoid the 2026-04-24 false-positive class where a real
+        Experian report mid-render contained 'Sign In' in its header nav.
+        """
+        if not url:
+            return False
+        lowered = url.lower()
+        auth_hosts = ("auth.manheim.com", "signin.manheim", "login.manheim", "oauth.manheim")
+        auth_paths = ("/as/authorization", "/signin", "/oauth2/authorize", "/pingfederate")
+        return (
+            any(host in lowered for host in auth_hosts)
+            or any(path in lowered for path in auth_paths)
+        )
+
+    # Observed 2026-04-24: user reported Experian AutoCheck popups take
+    # 5-8 seconds to actually populate, CR views 8-10 seconds. The prior
+    # 3-second post-load wait was capturing partially-rendered shells
+    # and the text-based login detector would false-positive on header
+    # nav content containing "Sign In" during those partial renders —
+    # triggering the short-circuit and losing AutoCheck for the rest of
+    # the run. New timing budget: wait up to 12s for real content to
+    # appear (body innerText > 500 chars is a cheap content-ready
+    # signal), then fall back to a content-length check. URL-based
+    # auth detection runs first and short-circuits in ~100ms on a real
+    # auth redirect.
+    _AUTOCHECK_POST_LOAD_TIMEOUT_MS = 12000
+    _AUTOCHECK_CONTENT_READY_SIGNAL = "() => document.body && document.body.innerText && document.body.innerText.length > 500"
 
     def _merge_full_experian_report(self, result: dict[str, Any], full_text: str) -> None:
         """Parse the Experian report body and merge its fields into result.
