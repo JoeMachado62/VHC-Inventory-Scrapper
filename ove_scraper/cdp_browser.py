@@ -1551,6 +1551,29 @@ class PlaywrightCdpBrowserSession:
             result["failure_message"] = experian_outcome["failure_message"]
         return result
 
+    # Process-wide short-circuit: once we've seen this many consecutive
+    # Experian login redirects in a single scraper process, stop opening
+    # new tabs for AutoCheck entirely. The vehiclehistservice.manheim.com
+    # session cookie has clearly expired and every popup will redirect
+    # to Manheim login. Observed 2026-04-23: one stale-Experian run
+    # leaked 25 tabs before the user had to intervene. A restart of the
+    # scraper (which refreshes the Experian cookie on next hit) clears
+    # this counter.
+    _EXPERIAN_MAX_CONSECUTIVE_LOGIN_REDIRECTS = 3
+    _experian_consecutive_login_redirects: int = 0
+
+    @classmethod
+    def _experian_short_circuit_tripped(cls) -> bool:
+        return cls._experian_consecutive_login_redirects >= cls._EXPERIAN_MAX_CONSECUTIVE_LOGIN_REDIRECTS
+
+    @classmethod
+    def _record_experian_login_redirect(cls) -> None:
+        cls._experian_consecutive_login_redirects += 1
+
+    @classmethod
+    def _reset_experian_login_redirect_counter(cls) -> None:
+        cls._experian_consecutive_login_redirects = 0
+
     def _capture_experian_autocheck_report(
         self,
         detail_page: Page,
@@ -1562,7 +1585,31 @@ class PlaywrightCdpBrowserSession:
         ``result``. Tries direct URL navigation first (same browser context
         = same Manheim SSO cookies), then falls back to clicking the
         branded autocheck-link image with expect_popup. Returns a dict with
-        scrape_status and optional failure_category/failure_message."""
+        scrape_status and optional failure_category/failure_message.
+
+        Every tab/popup created here is wrapped in try/finally so a mid-
+        flight exception (goto timeout, navigation error, etc.) still
+        closes the tab. Without this the 2026-04-23 run leaked 25 tabs
+        when the Experian session expired mid-run.
+
+        Additionally: after N consecutive login redirects, the class-level
+        short-circuit skips further attempts for the rest of the process
+        lifetime. Restart the scraper (or fix the Experian cookie) to
+        reset."""
+        # Short-circuit: Experian session is known stale for this process.
+        # Return partial immediately without opening any tabs.
+        if self._experian_short_circuit_tripped():
+            return {
+                "scrape_status": "partial",
+                "failure_category": "experian_session_expired",
+                "failure_message": (
+                    f"Experian/VehicleHistService session expired for this "
+                    f"scraper process (>= {self._EXPERIAN_MAX_CONSECUTIVE_LOGIN_REDIRECTS} "
+                    "consecutive login redirects). Skipping Experian navigation "
+                    "for remaining VINs; restart the scraper to recover."
+                ),
+            }
+
         view_href = (result.get("view_report_href") or "").strip()
         if not view_href:
             # Re-extract from the DOM at the moment of navigation, in case
@@ -1587,6 +1634,7 @@ class PlaywrightCdpBrowserSession:
         # the most reliable path — same context inherits Manheim SSO cookies
         # and Playwright controls the page fully.
         if view_href:
+            report_page = None
             try:
                 report_page = detail_page.context.new_page()
                 report_page.goto(view_href, wait_until="domcontentloaded", timeout=20000)
@@ -1594,21 +1642,46 @@ class PlaywrightCdpBrowserSession:
                 report_page.screenshot(path=str(ac_artifact_dir / "autocheck-report.png"), full_page=True)
                 (ac_artifact_dir / "autocheck-report.html").write_text(report_page.content(), encoding="utf-8")
                 full_text = report_page.inner_text("body")
-                report_page.close()
                 if self._looks_like_login_page(full_text):
-                    LOGGER.warning("AutoCheck full report navigation landed on a login page for VIN %s", vin)
+                    self._record_experian_login_redirect()
+                    LOGGER.warning(
+                        "AutoCheck full report navigation landed on a login page for VIN %s "
+                        "(consecutive=%s)",
+                        vin, self._experian_consecutive_login_redirects,
+                    )
                 else:
+                    self._reset_experian_login_redirect_counter()
                     self._merge_full_experian_report(result, full_text)
                     LOGGER.info("AutoCheck full report captured via direct nav for VIN %s (%d chars)", vin, len(full_text))
                     return {"scrape_status": "success"}
             except Exception as report_exc:
                 LOGGER.warning("AutoCheck direct navigation failed for VIN %s: %s", vin, report_exc)
+            finally:
+                # Tab cleanup — runs even if goto/screenshot/inner_text
+                # raised. This is the 2026-04-23 leak fix.
+                if report_page is not None:
+                    try:
+                        report_page.close()
+                    except Exception:
+                        pass
+
+        # If the short-circuit tripped on Path A, don't try Path B.
+        if self._experian_short_circuit_tripped():
+            return {
+                "scrape_status": "partial",
+                "failure_category": "experian_session_expired",
+                "failure_message": (
+                    f"Experian session expired during this VIN (hit "
+                    f"{self._EXPERIAN_MAX_CONSECUTIVE_LOGIN_REDIRECTS}-redirect cap)."
+                ),
+            }
 
         # Path B: click the branded autocheck-link image with expect_popup.
         # Per user 2026-04-21: this is the universal trigger across CR types
         # — the Tracker__container wrapper fires a JS click delegate that
         # opens the Experian report in a popup window.
         for selector in ("[data-test-id='autocheck-link']", "a.Autocheck__fullreport-link"):
+            popup = None
             try:
                 trigger = detail_page.locator(selector).first
                 if not trigger.is_visible(timeout=1500):
@@ -1622,20 +1695,46 @@ class PlaywrightCdpBrowserSession:
                 popup.screenshot(path=str(ac_artifact_dir / "autocheck-popup.png"), full_page=True)
                 (ac_artifact_dir / "autocheck-popup.html").write_text(popup.content(), encoding="utf-8")
                 popup_text = popup.inner_text("body")
-                popup.close()
                 if self._looks_like_login_page(popup_text):
-                    LOGGER.warning("AutoCheck popup landed on a login page for VIN %s", vin)
+                    self._record_experian_login_redirect()
+                    LOGGER.warning(
+                        "AutoCheck popup landed on a login page for VIN %s (consecutive=%s)",
+                        vin, self._experian_consecutive_login_redirects,
+                    )
+                    if self._experian_short_circuit_tripped():
+                        # Bail — further popups will also redirect.
+                        break
                     continue
+                self._reset_experian_login_redirect_counter()
                 self._merge_full_experian_report(result, popup_text)
                 LOGGER.info("AutoCheck full report captured via popup click for VIN %s (%d chars)", vin, len(popup_text))
                 return {"scrape_status": "success"}
             except Exception as popup_exc:
                 LOGGER.debug("AutoCheck popup click via %s failed for VIN %s: %s", selector, vin, popup_exc)
+            finally:
+                # Popup cleanup — runs even if wait_for_load_state /
+                # screenshot / inner_text raised. Critical for the
+                # 2026-04-23 leak fix.
+                if popup is not None:
+                    try:
+                        popup.close()
+                    except Exception:
+                        pass
 
         # Could not reach the Experian report. Keep the inline indicators
         # but mark partial so consumers know title-brand / odometer-brand
         # coverage is incomplete for this VIN.
         detail_page.screenshot(path=str(ac_artifact_dir / "autocheck-experian-missing.png"), full_page=True)
+        if self._experian_short_circuit_tripped():
+            return {
+                "scrape_status": "partial",
+                "failure_category": "experian_session_expired",
+                "failure_message": (
+                    f"Experian session expired (hit "
+                    f"{self._EXPERIAN_MAX_CONSECUTIVE_LOGIN_REDIRECTS}-redirect cap); "
+                    "restart scraper to recover."
+                ),
+            }
         return {
             "scrape_status": "partial",
             "failure_category": "experian_report_unreachable",
