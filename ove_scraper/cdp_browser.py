@@ -1551,6 +1551,82 @@ class PlaywrightCdpBrowserSession:
             result["failure_message"] = experian_outcome["failure_message"]
         return result
 
+    def _attempt_inline_login_recovery(self, page: Page, context_label: str) -> bool:
+        """Shared entry-point for inline single-shot login recovery from any
+        mid-scrape auth redirect (AutoCheck popup, CR popup, CR direct
+        navigation landing on auth).
+
+        This delegates to _try_single_shot_login_click, which already
+        enforces the single-shot-per-process constraint via the
+        _auto_login_attempted_this_process class flag. Per
+        feedback_ove_auto_login_account_lock.md, auto-login must never
+        retry in a tight loop — calling this from multiple sites is
+        SAFE because they all share that single flag: the first one
+        to reach the click consumes the only attempt, and every
+        subsequent call (including from a different subsystem) short-
+        circuits to False. Net click volume is still bounded to 1 per
+        Python process, exactly as the revert memory requires.
+
+        Returns True iff the page is no longer on the auth screen
+        after the click. Authorized caller behavior: on True, re-check
+        the target page for real content and proceed. On False, treat
+        the auth failure as terminal for this attempt.
+
+        context_label is purely for log attribution so a post-incident
+        audit can tell which subsystem triggered the click.
+        """
+        if not self._is_manheim_auth_page(page):
+            # Defensive: only burn the single-shot attempt on pages
+            # that are actually on auth. The caller should have
+            # checked already, but we double-check here so a stray
+            # call from a non-auth context doesn't consume the budget.
+            return False
+        LOGGER.info(
+            "Inline auth recovery attempt for %s at url=%s",
+            context_label, page.url,
+        )
+        return self._try_single_shot_login_click(page)
+
+    def _recover_cr_auth_inline(
+        self,
+        source_page: Page,
+        popups: list[Page],
+        context_label: str,
+    ) -> bool:
+        """CR-click-specific recovery helper. A ManheimAuthRedirectError
+        inside _open_via_ove_internal_viewer could have come from the
+        source_page itself (React-routed to auth) OR from one of the
+        collected popups. We don't know which from the exception alone,
+        so we iterate the candidates and try recovery on the first one
+        that's actually on a Manheim auth page.
+
+        Only one candidate ever gets an actual click because the
+        process-wide single-shot flag is consumed on the first attempt.
+        We break after the first candidate that was on auth (whether
+        recovery succeeded or not) because the flag is spent either way.
+        """
+        candidates: list[Page] = []
+        try:
+            if self._is_manheim_auth_page(source_page):
+                candidates.append(source_page)
+        except Exception:
+            pass
+        for popup in popups:
+            try:
+                if popup.is_closed():
+                    continue
+            except Exception:
+                continue
+            try:
+                if self._is_manheim_auth_page(popup):
+                    candidates.append(popup)
+            except Exception:
+                continue
+        for cand in candidates:
+            return self._attempt_inline_login_recovery(cand, context_label)
+        # No candidate is actually on auth — nothing to recover.
+        return False
+
     # Process-wide short-circuit: once we've seen this many consecutive
     # Experian login redirects in a single scraper process, stop opening
     # new tabs for AutoCheck entirely. The vehiclehistservice.manheim.com
@@ -1642,13 +1718,34 @@ class PlaywrightCdpBrowserSession:
                 # Fast URL-based auth detection BEFORE waiting for content.
                 # If the URL redirected to auth.manheim.com the content
                 # will never arrive and waiting wastes 12s per VIN.
+                skip_capture_auth = False
                 if self._url_is_auth_redirect(report_page.url):
-                    self._record_experian_login_redirect()
-                    LOGGER.warning(
-                        "AutoCheck direct nav URL redirected to auth for VIN %s: %s (consecutive=%s)",
-                        vin, report_page.url, self._experian_consecutive_login_redirects,
-                    )
-                else:
+                    # Try inline single-shot login recovery. Per user
+                    # 2026-04-24: Chrome typically has credentials
+                    # pre-filled on the Manheim auth form, so a single
+                    # click on Sign In is usually enough. The recovery
+                    # helper is gated by the process-wide single-shot
+                    # flag, so this is safe.
+                    if self._attempt_inline_login_recovery(report_page, f"autocheck-direct-{vin}"):
+                        # Click succeeded; the post-login SSO bounce
+                        # should redirect us back to the AutoCheck URL.
+                        # Fall through to the content-wait + capture.
+                        LOGGER.info(
+                            "AutoCheck direct nav: auth recovery succeeded for VIN %s, resuming capture",
+                            vin,
+                        )
+                    else:
+                        # Recovery unavailable (flag consumed, no pre-filled
+                        # credentials, or click didn't land us off login).
+                        # Record the redirect; the finally block closes the tab.
+                        self._record_experian_login_redirect()
+                        LOGGER.warning(
+                            "AutoCheck direct nav URL redirected to auth for VIN %s: %s (consecutive=%s)",
+                            vin, report_page.url, self._experian_consecutive_login_redirects,
+                        )
+                        skip_capture_auth = True
+
+                if not skip_capture_auth:
                     # Wait for real content to populate. Experian reports
                     # take 5-8s to fully render per user 2026-04-24;
                     # the 3s wait we had before was catching shells.
@@ -1719,16 +1816,27 @@ class PlaywrightCdpBrowserSession:
                 popup = popup_info.value
                 popup.wait_for_load_state("domcontentloaded", timeout=20000)
 
-                # Same URL-first auth detection as Path A.
+                # Same URL-first auth detection as Path A, with the
+                # inline single-shot login recovery attempt. The flag
+                # is shared across Path A and Path B (and with CR-click
+                # and startup/keepalive paths), so net click volume
+                # stays bounded to 1 per process.
                 if self._url_is_auth_redirect(popup.url):
-                    self._record_experian_login_redirect()
-                    LOGGER.warning(
-                        "AutoCheck popup URL redirected to auth for VIN %s: %s (consecutive=%s)",
-                        vin, popup.url, self._experian_consecutive_login_redirects,
-                    )
-                    if self._experian_short_circuit_tripped():
-                        break
-                    continue
+                    if self._attempt_inline_login_recovery(popup, f"autocheck-popup-{vin}"):
+                        LOGGER.info(
+                            "AutoCheck popup: auth recovery succeeded for VIN %s, resuming capture",
+                            vin,
+                        )
+                        # Fall through to content wait + capture below.
+                    else:
+                        self._record_experian_login_redirect()
+                        LOGGER.warning(
+                            "AutoCheck popup URL redirected to auth for VIN %s: %s (consecutive=%s)",
+                            vin, popup.url, self._experian_consecutive_login_redirects,
+                        )
+                        if self._experian_short_circuit_tripped():
+                            break
+                        continue
 
                 # Wait up to 12s for real content (Experian takes 5-8s to
                 # populate per user 2026-04-24). Fall through if it never
@@ -2894,62 +3002,90 @@ class PlaywrightCdpBrowserSession:
         context.on("page", _on_popup)
         try:
             for attempt in range(max_attempts):
-                # Re-resolve the locator on every attempt — a previous click
-                # may have rebuilt the DOM and the prior handle could be stale.
-                locator = self._find_condition_report_locator(source_page)
-                if locator is None:
-                    LOGGER.warning(
-                        "Condition report locator not found on OVE detail page (attempt %s/%s)",
-                        attempt + 1,
-                        max_attempts,
-                    )
-                    source_page.wait_for_timeout(1500)
-                    continue
                 try:
-                    cr_page = self._click_condition_report_locator(source_page, locator)
-                except ManheimAuthRedirectError:
-                    # The click DID navigate, but to an auth page. Propagate
-                    # immediately — retrying with the same source page will
-                    # not fix an auth state problem.
-                    raise
-                except Exception as click_exc:
-                    last_error = click_exc
+                    # Re-resolve the locator on every attempt — a previous click
+                    # may have rebuilt the DOM and the prior handle could be stale.
+                    locator = self._find_condition_report_locator(source_page)
+                    if locator is None:
+                        LOGGER.warning(
+                            "Condition report locator not found on OVE detail page (attempt %s/%s)",
+                            attempt + 1,
+                            max_attempts,
+                        )
+                        source_page.wait_for_timeout(1500)
+                        continue
+                    try:
+                        cr_page = self._click_condition_report_locator(source_page, locator)
+                    except ManheimAuthRedirectError:
+                        # Re-raise so the outer ManheimAuthRedirectError
+                        # handler below can attempt single-shot login
+                        # recovery before giving up.
+                        raise
+                    except Exception as click_exc:
+                        last_error = click_exc
+                        LOGGER.warning(
+                            "Condition report click attempt %s/%s raised %s; will retry",
+                            attempt + 1,
+                            max_attempts,
+                            click_exc,
+                        )
+                        source_page.wait_for_timeout(1500)
+                        self._inspect_cr_popups_for_auth(collected_popups, artifact_dir, href)
+                        continue
+
+                    # Inspect any popups spawned by the click BEFORE deciding
+                    # success. Raises ManheimAuthRedirectError if a popup
+                    # landed on login or the Manheim "not available" page.
+                    self._inspect_cr_popups_for_auth(collected_popups, artifact_dir, href)
+
+                    if cr_page is not None:
+                        LOGGER.info(
+                            "Opened OVE-internal condition report view (attempt %s/%s, url=%s)",
+                            attempt + 1,
+                            max_attempts,
+                            cr_page.url,
+                        )
+                        self._raise_if_auth_redirect(cr_page, artifact_dir, "post_click", href)
+                        if self._is_cr_unavailable_page(cr_page):
+                            raise ManheimAuthRedirectError(
+                                "Manheim returned 'condition reports are not available' for "
+                                f"intended_href={href}; treating as stale-session auth failure."
+                            )
+                        claimed_page = cr_page
+                        return cr_page
                     LOGGER.warning(
-                        "Condition report click attempt %s/%s raised %s; will retry",
+                        "Condition report click attempt %s/%s produced no navigation; will retry",
                         attempt + 1,
                         max_attempts,
-                        click_exc,
                     )
                     source_page.wait_for_timeout(1500)
-                    self._inspect_cr_popups_for_auth(collected_popups, artifact_dir, href)
-                    continue
-
-                # Inspect any popups spawned by the click BEFORE deciding
-                # success. Raises ManheimAuthRedirectError if a popup
-                # landed on login or the Manheim "not available" page.
-                self._inspect_cr_popups_for_auth(collected_popups, artifact_dir, href)
-
-                if cr_page is not None:
-                    LOGGER.info(
-                        "Opened OVE-internal condition report view (attempt %s/%s, url=%s)",
-                        attempt + 1,
-                        max_attempts,
-                        cr_page.url,
-                    )
-                    self._raise_if_auth_redirect(cr_page, artifact_dir, "post_click", href)
-                    if self._is_cr_unavailable_page(cr_page):
-                        raise ManheimAuthRedirectError(
-                            "Manheim returned 'condition reports are not available' for "
-                            f"intended_href={href}; treating as stale-session auth failure."
+                except ManheimAuthRedirectError:
+                    # Inline single-shot login recovery. Per user 2026-04-24:
+                    # Chrome typically has credentials pre-filled on the
+                    # Manheim auth form, so a single click on Sign In
+                    # is usually enough to restore SSO. The recovery
+                    # helper is gated by the process-wide
+                    # _auto_login_attempted_this_process flag, so this
+                    # shares its one-attempt-per-process budget with
+                    # startup/keepalive/AutoCheck paths. No tight-loop
+                    # retry is possible.
+                    if attempt < max_attempts - 1 and self._recover_cr_auth_inline(
+                        source_page, collected_popups, f"cr-click-recovery-{attempt+1}"
+                    ):
+                        LOGGER.info(
+                            "CR-click: auth recovery succeeded on attempt %s/%s; retrying click",
+                            attempt + 1,
+                            max_attempts,
                         )
-                    claimed_page = cr_page
-                    return cr_page
-                LOGGER.warning(
-                    "Condition report click attempt %s/%s produced no navigation; will retry",
-                    attempt + 1,
-                    max_attempts,
-                )
-                source_page.wait_for_timeout(1500)
+                        # Fresh slate for post-recovery attempt — old
+                        # popups carry stale auth state.
+                        collected_popups.clear()
+                        source_page.wait_for_timeout(1500)
+                        continue
+                    # Recovery failed, flag already consumed, or we're
+                    # out of attempts. Re-raise so the outer caller
+                    # routes this to auth_expired as designed.
+                    raise
 
             # All click attempts exhausted. We deliberately do NOT fall back
             # to a direct goto on the raw Manheim URL. Capture a debug
