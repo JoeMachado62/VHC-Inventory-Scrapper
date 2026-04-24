@@ -788,14 +788,19 @@ def run_hot_deal_reprocess(settings: Settings, logger, *, rescreen: bool) -> Non
             # whether the old reason matches one of the known false-positive
             # patterns and move the VIN back to pending for a fresh scrape.
             old_reason = (row["rejection_reason"] or "").strip()
-            known_false_positives = (
+            # Prefix-match known screener false-positive classes that
+            # have since been fixed. Prefixes (not exact strings) because
+            # the 2026-04-24 screener change started appending the
+            # matching phrase / (system: condition) detail onto the
+            # reason string for post-mortem clarity. Intentionally
+            # narrow — "Branded title" / "Structural damage" / "TMU" /
+            # "Windshield damage" are never auto-promoted back; a
+            # human decides if those were wrong.
+            known_false_positive_prefixes = (
                 "Engine/drivetrain issue detected",
-                # Intentionally narrow — "Branded title" / "Structural
-                # damage" / "TMU" / "Windshield damage" are never
-                # auto-promoted back; a human decides if those were
-                # wrong.
+                "Mechanical finding: engine/drivetrain concern",
             )
-            if old_reason in known_false_positives:
+            if any(old_reason.startswith(p) for p in known_false_positive_prefixes):
                 db_conn.execute(
                     "UPDATE hot_deal_vins SET status='pending', "
                     "rejection_step=NULL, rejection_reason=NULL, cr_data=NULL "

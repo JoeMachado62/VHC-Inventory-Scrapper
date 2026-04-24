@@ -159,6 +159,125 @@ class TestScreenConditionReport:
         result = screen_condition_report(cr, _make_listing())
         assert result.passed is True
 
+    # ------------------------------------------------------------------
+    # 2026-04-24 regression: Manheim template labels leaking through
+    # mechanical_findings (dict-value stringification) and via
+    # announcements were the #1 and #2 false-positive sources (52 of 137
+    # rejections on that day's run).
+    # ------------------------------------------------------------------
+
+    def test_clean_mechanical_finding_engine_noise_passes(self):
+        cr = _make_cr(mechanical_findings=[
+            {"section": "mechanical", "section_label": "Mechanical",
+             "system": "ENGINE NOISE", "condition": "No Issues"},
+        ])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is True, f"clean ENGINE NOISE finding should pass; got {result.reason!r}"
+
+    def test_clean_mechanical_finding_oil_sludge_passes(self):
+        cr = _make_cr(mechanical_findings=[
+            {"system": "ENGINE OIL SLUDGE", "condition": "No Oil Sludge"},
+        ])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is True
+
+    def test_clean_mechanical_finding_dtc_passes(self):
+        cr = _make_cr(mechanical_findings=[
+            {"system": "DIAGNOSTIC TROUBLE CODES", "condition": "No Active Codes"},
+        ])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is True
+
+    def test_clean_mechanical_finding_not_specified_passes(self):
+        cr = _make_cr(mechanical_findings=[
+            {"system": "ACTIVE VISIBLE LEAKS FROM ENGINE OR UNDERCARRIAGE AREA",
+             "condition": "Not Specified"},
+        ])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is True
+
+    def test_clean_mechanical_finding_factory_equipment_passes(self):
+        cr = _make_cr(mechanical_findings=[
+            {"system": "EMISSIONS/CATALYTIC/EXHAUST",
+             "condition": "Factory Equipment Installed"},
+        ])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is True
+
+    def test_real_mechanical_finding_engine_knock_fails(self):
+        cr = _make_cr(mechanical_findings=[
+            {"system": "ENGINE NOISE", "condition": "Engine knock heard on startup"},
+        ])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is False
+        assert "Mechanical finding" in result.reason
+        # Verify the detail was surfaced in the rejection_reason per Layer 3.
+        assert "ENGINE NOISE" in result.reason
+        assert "knock" in result.reason.lower()
+
+    def test_real_mechanical_finding_needs_transmission_fails(self):
+        cr = _make_cr(mechanical_findings=[
+            {"system": "OTHER MECHANICAL COMMENTS",
+             "condition": "Needs new transmission"},
+        ])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is False
+        assert "Mechanical finding" in result.reason
+
+    def test_bare_label_announcement_engine_noise_passes(self):
+        # Manheim's listing-JSON disclosure block can inject
+        # "ENGINE NOISE No Issues"-style text into cr.announcements.
+        # The narrowed regex no longer matches bare label text.
+        cr = _make_cr(announcements=["ENGINE NOISE", "TRANSMISSION NOISE"])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is True
+
+    def test_bare_label_announcement_mechanical_issue_passes(self):
+        # "mechanical issue" / "mechanical problem" used to match as
+        # bare template labels. Now requires "failure" or "damage".
+        cr = _make_cr(announcements=["MECHANICAL ISSUE", "mechanical problem"])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is True
+
+    def test_contextual_engine_noise_reported_still_fails(self):
+        # "Engine noise reported" uses a problem-confirming verb;
+        # must still fail.
+        cr = _make_cr(announcements=["Engine noise reported by seller"])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is False
+
+    def test_transmission_slipping_announcement_fails(self):
+        cr = _make_cr(announcements=["Transmission slipping between gears"])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is False
+
+    def test_green_yellow_lights_still_pass(self):
+        # Synthetic light announcements from listing JSON must never
+        # trip the engine/drivetrain filter.
+        cr = _make_cr(announcements=["Green Light", "Yellow Light"])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is True
+
+    def test_mechanical_concern_reason_includes_detail(self):
+        # Layer 3 observability: rejection_reason should show which
+        # finding (system + condition) triggered the failure.
+        cr = _make_cr(mechanical_findings=[
+            {"system": "POWERTRAIN", "condition": "Transmission slip on upshift"},
+        ])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is False
+        assert "POWERTRAIN" in result.reason
+        assert "slip" in result.reason.lower()
+
+    def test_engine_issue_reason_includes_matched_phrase(self):
+        cr = _make_cr(announcements=["Engine knock reported"])
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is False
+        # The rejection reason should contain the matched phrase for
+        # post-mortem introspection.
+        assert "Engine/drivetrain issue detected" in result.reason
+        assert "knock" in result.reason.lower()
+
 
 # ---------------------------------------------------------------------------
 # Step 2: AutoCheck screening

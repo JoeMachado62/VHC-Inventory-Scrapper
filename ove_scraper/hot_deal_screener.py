@@ -38,32 +38,91 @@ _TMU_PATTERNS = re.compile(
 
 # Engine/drivetrain concern patterns.
 #
-# History (2026-04-23): an earlier pairing of this regex with cr.raw_text
-# scanning caused the Manheim InsightCR template label "ENGINE NOISE"
-# (field value "No Issues") to match on 50/51 rejected VINs — field
-# headings, not inspector findings. The architectural fix is in
-# _collect_text_fields below: scanning no longer touches cr.raw_text,
-# only the parsed findings fields (announcements, remarks,
-# seller_comments_items, problem_highlights) and the itemized
-# mechanical_findings list. Those are the fields that carry actual
-# inspector observations, not template labels.
+# History:
 #
-# Patterns kept permissive because the normalizer already filters out
-# non-finding boilerplate before populating these fields. Defense in
-# depth: "Active Codes" alone is too broad (field label "No Active
-# Codes"), so it requires an explicit powertrain/engine/transmission
-# qualifier. "Check engine" requires an "on/illuminated/reported/active"
-# follow-up.
+# 2026-04-23: raw_text scanning of cr.raw_text was matching the Manheim
+# InsightCR template label "ENGINE NOISE" (field value "No Issues") on
+# 50/51 rejected VINs. Removed raw_text from _collect_text_fields.
+#
+# 2026-04-24: same pattern still caused 52/137 false-positive rejections
+# through two channels:
+#   (a) cr.mechanical_findings contains structured dicts with field
+#       labels in the `system` key, e.g.
+#       {"system": "ENGINE NOISE", "condition": "No Issues"}. The
+#       screener stringified ALL dict values and matched on the
+#       system-label text regardless of the clean-state condition.
+#   (b) cr.announcements is populated from Manheim's listing-JSON
+#       disclosure block which contains field-label-like strings
+#       without problem context.
+#
+# Two fixes applied together:
+#   1. _is_clean_state_finding() filters mechanical_findings that
+#      report a clean inspection result before regex match.
+#   2. Regex narrowed to require problem-indicator VERBS (knock,
+#      misfire, slip, failure, replace, seized, blown, stall, repair,
+#      damage) or specific disambiguating modifiers ("active
+#      powertrain code", "check engine light on", "needs transmission").
+#      Bare label variants (engine noise, engine issue, engine problem,
+#      transmission noise, mechanical issue, mechanical problem, etc.)
+#      are removed because Manheim prints them as field headings on
+#      CLEAN reports.
+#
+# Real findings always use a verb. "Engine knock reported",
+# "Transmission slips on upshift", "Needs new transmission" all match.
+# "ENGINE NOISE: No Issues" no longer matches.
 _ENGINE_DRIVETRAIN_PATTERNS = re.compile(
-    r"engine\s*(?:noise|knock|misfire|issue|problem|failure|replace|seized|blown)|"
-    r"drivetrain\s*(?:noise|issue|problem|failure)|"
-    r"transmission\s*(?:noise|slip|issue|problem|failure|replace)|"
+    r"engine\s+(?:knock|misfire|failure|replace|seized|blown|stall)\b|"
+    r"engine\s+noise\s+(?:reported|heard|observed|present|on\s+startup|from|at)\b|"
+    r"transmission\s+(?:slip|slipping|failure|replace|repair)\b|"
+    r"transmission\s+noise\s+(?:reported|heard|observed|present)\b|"
+    r"drivetrain\s+(?:failure|replace|repair)\b|"
     r"\bactive\s+(?:powertrain|engine|transmission)\s+(?:code|codes|dtc)\b|"
     r"check\s+engine\s+light\s+(?:on|illuminated|reported|active)\b|"
-    r"(?:needs|requires)\s*(?:engine|motor|transmission)|"
-    r"mechanical\s*(?:issue|problem|failure|damage)",
+    r"(?:needs|requires)\s+(?:(?:a|an|new|replacement|rebuilt|another)\s+)?(?:engine|motor|transmission|drivetrain)\b|"
+    r"mechanical\s+(?:failure|damage)\b",
     re.IGNORECASE,
 )
+
+# Clean-state condition values emitted by the Manheim inspection parser.
+# The parser annotates EVERY inspection checkpoint as a mechanical_finding
+# entry — including those that passed. These strings signal "inspected
+# and found no problem" and must not trigger a rejection.
+_CLEAN_STATE_CONDITIONS = frozenset({
+    "no issues",
+    "no active codes",
+    "no oil sludge",
+    "no active leaks",
+    "no smoke",
+    "factory equipment installed",
+    "not specified",
+    "ok",
+    "none",
+    "clean",
+    "no problems",
+})
+
+
+def _is_clean_state_finding(finding: dict) -> bool:
+    """Return True if this mechanical_finding reports a clean inspection.
+
+    A finding like {system: "ENGINE NOISE", condition: "No Issues"} is
+    the Manheim template's way of saying "we inspected for engine
+    noise and found none." Treating it as a concern false-fails every
+    clean Manheim CR (52 VINs on 2026-04-24). We recognise clean state
+    either via the explicit allowlist above or by leading-negation
+    prefixes "no " / "none" that universally mean absence of a problem.
+
+    Empty condition is treated as clean because the screener should
+    only act on positively-confirmed findings, not missing data.
+    """
+    condition = str(finding.get("condition") or "").strip().lower()
+    if not condition:
+        return True
+    if condition in _CLEAN_STATE_CONDITIONS:
+        return True
+    if condition.startswith("no ") or condition.startswith("none"):
+        return True
+    return False
 
 _WINDSHIELD_DAMAGE_PATTERNS = re.compile(
     r"windshield.*(?:crack|broken|shatter|chip|damage)|"
@@ -161,9 +220,14 @@ def screen_condition_report(
     if _TMU_PATTERNS.search(all_text):
         return ScreenResult(passed=False, step="step1", reason="True Miles Unknown (TMU)")
 
-    # Engine / drivetrain issues
-    if _ENGINE_DRIVETRAIN_PATTERNS.search(all_text):
-        return ScreenResult(passed=False, step="step1", reason="Engine/drivetrain issue detected")
+    # Engine / drivetrain issues — surface the matching phrase in the
+    # rejection reason so DB introspection is self-describing (2026-04-24).
+    et_match = _ENGINE_DRIVETRAIN_PATTERNS.search(all_text)
+    if et_match:
+        return ScreenResult(
+            passed=False, step="step1",
+            reason=f"Engine/drivetrain issue detected: {et_match.group(0)!r}",
+        )
 
     # Powertrain diagnostic codes (P0xxx)
     for code in cr.diagnostic_codes:
@@ -173,13 +237,21 @@ def screen_condition_report(
                 reason=f"Powertrain diagnostic code: {code}",
             )
 
-    # Mechanical findings with concerning keywords
+    # Mechanical findings with concerning keywords. Skip clean-state
+    # inspection points first — Manheim's template enumerates every
+    # checkpoint including those that passed ("ENGINE NOISE / No Issues",
+    # "DIAGNOSTIC TROUBLE CODES / No Active Codes", etc.) and those must
+    # never be treated as concerns.
     for finding in cr.mechanical_findings:
+        if _is_clean_state_finding(finding):
+            continue
         desc = " ".join(str(v) for v in finding.values())
         if _ENGINE_DRIVETRAIN_PATTERNS.search(desc):
+            system = finding.get("system") or "mechanical"
+            condition = finding.get("condition") or ""
             return ScreenResult(
                 passed=False, step="step1",
-                reason="Mechanical finding: engine/drivetrain concern",
+                reason=f"Mechanical finding: engine/drivetrain concern ({system}: {condition})",
                 details={"finding": finding},
             )
 
