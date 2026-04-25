@@ -244,11 +244,25 @@ def get_run_summary(conn: sqlite3.Connection, run_id: str) -> dict:
     )
     counts = {row["status"]: row["cnt"] for row in cur.fetchall()}
     run_row = conn.execute("SELECT * FROM hot_deal_runs WHERE run_id=?", (run_id,)).fetchone()
+    # Surface the first error from error_details so the summary
+    # template can show WHY a run failed — readers were getting
+    # confused on 2026-04-25 when an export-step failure produced a
+    # status='failed' summary that just printed lifetime DB counts.
+    failure_reason: str | None = None
+    if run_row and run_row["error_details"]:
+        try:
+            details = json.loads(run_row["error_details"])
+            if isinstance(details, list) and details:
+                failure_reason = str(details[0])[:200]
+        except json.JSONDecodeError:
+            failure_reason = str(run_row["error_details"])[:200]
+
     return {
         "run_id": run_id,
         "status": run_row["status"] if run_row else "unknown",
         "started_at": run_row["started_at"] if run_row else None,
         "finished_at": run_row["finished_at"] if run_row else None,
+        "failure_reason": failure_reason,
         "total_vins": sum(counts.values()),
         "new_vins": run_row["new_vins"] if run_row else 0,
         "sold_vins": run_row["sold_vins"] if run_row else 0,
@@ -296,19 +310,31 @@ def reset_scrape_failed_to_pending(conn: sqlite3.Connection) -> int:
 def reclassify_scraper_failures_as_scrape_failed(conn: sqlite3.Connection) -> int:
     """One-time reclassifier: existing step1_fail rows whose
     rejection_reason looks like a scraper error (CR-click / VIN-not-
-    found) are moved to status='scrape_failed' so they become eligible
-    for re-screening on the next run.
+    found / page-load timeout) are moved to status='scrape_failed' so
+    they become eligible for re-screening on the next run.
 
     Used by the hot-deal-reprocess CLI to recover from the 2026-04-23
     incident where ~69 VINs were terminally rejected because the CR
     popup couldn't be opened after the max-attempts cap was lowered
     to 2. Returns the number of rows reclassified.
+
+    Patterns are anchored with leading '%' wildcards so they match
+    regardless of any prefix the pipeline adds (e.g. the 2026-04-23
+    "ConditionReportClickFailedError on retry: ..." prefix added by
+    _screen_vin_with_classification on its second-strike path). The
+    earlier prefix-anchored patterns missed those rows, leaving 68
+    stuck in step1_fail through 2026-04-25.
     """
     cur = conn.execute(
         "UPDATE hot_deal_vins SET status='scrape_failed' "
         "WHERE status='step1_fail' "
-        "AND (rejection_reason LIKE 'Could not open OVE condition report%' "
-        "     OR rejection_reason LIKE '%is not available in OVE search results')"
+        "AND ("
+        "  rejection_reason LIKE '%Could not open OVE condition report%' "
+        "  OR rejection_reason LIKE '%is not available in OVE search results%' "
+        "  OR rejection_reason LIKE '%ConditionReportClickFailedError%' "
+        "  OR rejection_reason LIKE '%ListingNotFoundError%' "
+        "  OR rejection_reason LIKE '%Page.goto: Timeout%'"
+        ")"
     )
     conn.commit()
     return cur.rowcount or 0

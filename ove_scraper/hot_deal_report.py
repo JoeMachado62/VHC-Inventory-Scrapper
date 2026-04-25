@@ -6,24 +6,55 @@ from typing import Any
 
 def format_hot_deal_summary(run_summary: dict[str, Any], hot_deals: list[dict]) -> str:
     """Plain-text summary for logs and Telegram."""
+    status = run_summary.get("status", "N/A")
+    new_vins = int(run_summary.get("new_vins", 0) or 0)
+
     lines = [
         "=== Hot Deal Screening Summary ===",
         f"Run ID: {run_summary.get('run_id', 'N/A')}",
-        f"Status: {run_summary.get('status', 'N/A')}",
+        f"Status: {status}",
         f"Started: {run_summary.get('started_at', 'N/A')}",
         f"Finished: {run_summary.get('finished_at', 'N/A')}",
-        "",
-        f"Total VINs screened: {run_summary.get('total_vins', 0)}",
-        f"Hot Deals found: {run_summary.get('hot_deals', 0)}",
-        f"Rejected at Step 1 (CR): {run_summary.get('step1_fail', 0)}",
-        f"Rejected at Step 2 (AutoCheck): {run_summary.get('step2_fail', 0)}",
-        f"Rejected at Step 3 (Web search): {run_summary.get('step3_fail', 0)}",
-        f"Still pending: {run_summary.get('pending', 0)}",
     ]
+
+    # When the pipeline failed before doing any screening work (most
+    # commonly an export-step crash), the lifetime DB counts below are
+    # NOT this run's results — they're whatever was already there.
+    # Surface that prominently so the report isn't read as if 78 VINs
+    # failed today when really the export died at minute 2 (observed
+    # 2026-04-25). Same when new_vins=0 and the run failed.
+    if status == "failed" and new_vins == 0:
+        lines.extend([
+            "",
+            ">>> THIS RUN PROCESSED 0 NEW VINs (export or setup failed). <<<",
+            ">>> The counts below are lifetime DB state, NOT today's   <<<",
+            ">>> screening results. Investigate the failure reason     <<<",
+            ">>> in error_details / logs before treating these as new. <<<",
+            "",
+            f"Failure reason: {run_summary.get('failure_reason') or 'see error_details / logs'}",
+        ])
+    elif status == "failed":
+        lines.extend([
+            "",
+            f">>> THIS RUN FAILED MID-EXECUTION after processing {new_vins} new VIN(s). <<<",
+            ">>> Counts below mix this run's work with prior DB state.            <<<",
+        ])
+
+    lines.extend([
+        "",
+        f"VINs new in this run: {new_vins}",
+        f"Total VINs in DB:    {run_summary.get('total_vins', 0)}",
+        f"Hot Deals (DB total): {run_summary.get('hot_deals', 0)}",
+        f"Rejected at Step 1 (DB total): {run_summary.get('step1_fail', 0)}",
+        f"Rejected at Step 2 (DB total): {run_summary.get('step2_fail', 0)}",
+        f"Rejected at Step 3 (DB total): {run_summary.get('step3_fail', 0)}",
+        f"Scrape-failed (retry-eligible): {run_summary.get('scrape_failed', 0)}",
+        f"Still pending: {run_summary.get('pending', 0)}",
+    ])
 
     if hot_deals:
         lines.append("")
-        lines.append("--- Hot Deal Vehicles ---")
+        lines.append("--- Hot Deal Vehicles (DB total) ---")
         for v in hot_deals:
             price_str = f"${v['price']:,.0f}" if v.get("price") else "N/A"
             odo_str = f"{v['odometer']:,} mi" if v.get("odometer") else "N/A"
