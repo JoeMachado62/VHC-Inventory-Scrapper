@@ -389,3 +389,171 @@ def test_extract_image_urls_from_html_dedupes_thumbnail_variants() -> None:
         "https://images.cdn.manheim.com/example-vehicle-2.jpg",
         "https://images.cdn.manheim.com/20170803033944-cbd21c63-18e2-4a36-ab01-c6ffe8dc14b8.jpg",
     ]
+
+
+# ----------------------------------------------------------------------
+# 2026-04-25: hash-route navigation as primary CR-open strategy. The
+# click-based flow has a 100% historical failure rate for insightcr-
+# hosted listings because the OVE React app does not render the CR
+# anchor for protocol-relative insightcr URLs. The hash-route fallback
+# triggers the same React route handler the click would have produced.
+# ----------------------------------------------------------------------
+
+class FakeHashRoutePage:
+    """Minimal Page double for testing hash-route logic. Tracks evaluate
+    calls (hash mutation) and time-controlled URL transitions so we can
+    assert the polling loop terminates correctly.
+    """
+    def __init__(self, initial_url: str, target_url: str | None = None,
+                 transition_after_calls: int = 1,
+                 unavailable_text: str = "") -> None:
+        self.url = initial_url
+        self._target_url = target_url
+        self._transition_after = transition_after_calls
+        self.evaluate_calls: list[tuple[str, object]] = []
+        self.wait_for_timeout_calls: list[int] = []
+        self.wait_for_load_state_calls: list[tuple[str, int | None]] = []
+        self._url_polls = 0
+        self._unavailable_text = unavailable_text
+        self._title = ""
+        self._content = ""
+
+    def evaluate(self, script: str, *args):
+        self.evaluate_calls.append((script, args[0] if args else None))
+        # If the hash setter is called, track that and let URL transition.
+        return self._unavailable_text if "innerText" in script else None
+
+    def wait_for_timeout(self, timeout_ms: int) -> None:
+        self.wait_for_timeout_calls.append(timeout_ms)
+        # Each timeout call advances the simulated URL.
+        self._url_polls += 1
+        if (self._target_url is not None and
+                self._url_polls >= self._transition_after):
+            self.url = self._target_url
+
+    def wait_for_load_state(self, state: str, timeout: int | None = None) -> None:
+        self.wait_for_load_state_calls.append((state, timeout))
+
+    def title(self) -> str:
+        return self._title
+
+    def content(self) -> str:
+        return self._content
+
+    def screenshot(self, **_kwargs) -> None:
+        pass
+
+
+def test_extract_vin_from_source_page_parses_ove_detail_url(tmp_path) -> None:
+    session = PlaywrightCdpBrowserSession(make_settings(tmp_path))
+    page = FakePage("https://www.ove.com/search/results#/details/1FT7W2BT4REE13166/OVE")
+
+    assert session._extract_vin_from_source_page(page) == "1FT7W2BT4REE13166"
+
+
+def test_extract_vin_from_source_page_returns_none_when_url_lacks_details(tmp_path) -> None:
+    session = PlaywrightCdpBrowserSession(make_settings(tmp_path))
+    page = FakePage("https://www.ove.com/search/results")
+
+    assert session._extract_vin_from_source_page(page) is None
+
+
+def test_extract_vin_from_source_page_uppercases_vin(tmp_path) -> None:
+    """OVE URLs sometimes lowercase the VIN; ensure we normalize."""
+    session = PlaywrightCdpBrowserSession(make_settings(tmp_path))
+    page = FakePage("https://www.ove.com/search/results#/details/1ft7w2bt4ree13166/OVE")
+
+    assert session._extract_vin_from_source_page(page) == "1FT7W2BT4REE13166"
+
+
+def test_open_via_hash_route_evaluates_correct_hash_string(tmp_path) -> None:
+    """The hash mutation must use the canonical
+    #/details/{VIN}/OVE/conditionInformation route so React Router
+    actually mounts the CR view."""
+    session = PlaywrightCdpBrowserSession(make_settings(tmp_path))
+    vin = "1HGCY1F27SA019762"
+    target_url = f"https://www.ove.com/search/results#/details/{vin}/OVE/conditionInformation"
+    page = FakeHashRoutePage(
+        initial_url=f"https://www.ove.com/search/results#/details/{vin}/OVE",
+        target_url=target_url,
+        transition_after_calls=1,
+    )
+
+    result = session._open_via_hash_route(
+        page, vin, "https://insightcr.manheim.com/cr-display?...", tmp_path,
+    )
+
+    # The first evaluate call should set window.location.hash to the
+    # canonical conditionInformation route.
+    assert page.evaluate_calls, "evaluate() was never called"
+    first_script, first_arg = page.evaluate_calls[0]
+    assert "window.location.hash" in first_script
+    assert first_arg == f"#/details/{vin}/OVE/conditionInformation"
+    # On URL transition we expect the page to be returned.
+    assert result is page
+
+
+def test_open_via_hash_route_returns_none_if_route_never_settles(tmp_path) -> None:
+    session = PlaywrightCdpBrowserSession(make_settings(tmp_path))
+    vin = "1FT7W2BT4REE13166"
+    # transition_after_calls=999 means the URL never reaches the CR route
+    # within the polling budget.
+    page = FakeHashRoutePage(
+        initial_url=f"https://www.ove.com/search/results#/details/{vin}/OVE",
+        target_url=None,
+        transition_after_calls=999,
+    )
+
+    # Patch time.monotonic-bound deadline by mocking time.monotonic.
+    # Easier: rely on wait_for_timeout consuming most polls and the loop
+    # exiting after the deadline. We don't have access to monotonic;
+    # instead, verify the function returns None when URL never matches
+    # by asserting it's not the success branch (returns None on timeout
+    # — but our test would take ~20s without a mock). We patch out the
+    # deadline by setting the regex to never match and trusting the
+    # timing-bound exit.
+    import time as _time
+    real_monotonic = _time.monotonic
+    fake_now = [real_monotonic()]
+    def fake_monotonic():
+        fake_now[0] += 5.0  # each call advances 5s; loop exits within 4 polls
+        return fake_now[0]
+    _time.monotonic = fake_monotonic
+    try:
+        result = session._open_via_hash_route(
+            page, vin, "https://insightcr.manheim.com/cr-display?...", tmp_path,
+        )
+    finally:
+        _time.monotonic = real_monotonic
+
+    assert result is None
+    # Even on failure, the hash mutation should have been attempted once.
+    assert any("window.location.hash" in script for script, _ in page.evaluate_calls)
+
+
+def test_open_via_hash_route_raises_on_auth_redirect(tmp_path) -> None:
+    """If the hash-route lands on auth.manheim.com, we must propagate
+    ManheimAuthRedirectError so the caller routes to auth_expired
+    instead of falling through to a doomed click attempt."""
+    session = PlaywrightCdpBrowserSession(make_settings(tmp_path))
+    vin = "1FT7W2BT4REE13166"
+    auth_url = "https://auth.manheim.com/as/authorization.oauth2?x=y"
+    page = FakeHashRoutePage(
+        initial_url=f"https://www.ove.com/search/results#/details/{vin}/OVE",
+        target_url=f"https://www.ove.com/search/results#/details/{vin}/OVE/conditionInformation",
+        transition_after_calls=1,
+    )
+    # The flow: hash setter → poll → URL becomes conditionInformation →
+    # _CR_HASH_ROUTE_RE matches → wait_for_load_state called → then
+    # _raise_if_auth_redirect inspects page.url. We swap page.url to
+    # auth_url INSIDE wait_for_load_state so the auth detector sees it.
+    def wait_then_redirect(state, timeout=None):
+        page.wait_for_load_state_calls.append((state, timeout))
+        page.url = auth_url
+    page.wait_for_load_state = wait_then_redirect
+
+    with pytest.raises(ManheimAuthRedirectError):
+        session._open_via_hash_route(
+            page, vin, "https://insightcr.manheim.com/cr-display?...", tmp_path,
+        )
+

@@ -2961,6 +2961,120 @@ class PlaywrightCdpBrowserSession:
                 pass
             return None
 
+    # Regex extracting the VIN segment from an OVE detail URL like
+    # https://www.ove.com/search/results#/details/{VIN}/OVE  — used by
+    # _open_via_hash_route to construct the conditionInformation hash.
+    _OVE_DETAIL_VIN_RE = re.compile(r"#/details/([A-HJ-NPR-Z0-9]+)/", re.IGNORECASE)
+
+    def _extract_vin_from_source_page(self, source_page: Page) -> str | None:
+        """Extract the VIN from the OVE detail page URL hash.
+
+        The OVE webapp uses fragment routing
+        `https://www.ove.com/search/results#/details/{VIN}/OVE` for detail
+        pages. The VIN is the only piece we need to construct a CR hash
+        route — the rest is fixed structure.
+        """
+        try:
+            url = source_page.url or ""
+        except Exception:
+            return None
+        match = self._OVE_DETAIL_VIN_RE.search(url)
+        return match.group(1).upper() if match else None
+
+    def _open_via_hash_route(
+        self,
+        source_page: Page,
+        vin: str,
+        intended_href: str,
+        artifact_dir: Path,
+    ) -> Page | None:
+        """Trigger the OVE React app's CR view by mutating the URL hash
+        directly, bypassing the missing CR anchor.
+
+        Background (2026-04-25 forensic): for listings whose
+        condition_report_link.href points at insightcr.manheim.com, the
+        OVE React app does NOT render the
+        `<a data-test-id="condition-report">` anchor in the detail page
+        DOM — apparently because the conditionReportUrl in OVE's listing
+        JSON is protocol-relative (`//insightcr.manheim.com/...`) which
+        the VehicleReportLink component does not handle. The click flow
+        below therefore can never find a target. 100% of insightcr
+        listings fail at "Condition report locator not found on OVE
+        detail page" — confirmed across 200+ historical attempts (zero
+        successes via _click_condition_report_locator).
+
+        However, the OVE webapp's React Router DOES respond to direct
+        hash mutation. Setting window.location.hash to
+        `#/details/{VIN}/OVE/conditionInformation` triggers the same
+        route handler the click would have, which performs the
+        server-side SSO bounce and renders the CR view.
+
+        Returns source_page on success (now displaying the CR view), or
+        None on failure (caller should fall back to the click flow).
+        Raises ManheimAuthRedirectError if the route lands on a
+        Manheim auth or "CR not available" page.
+        """
+        target_hash = f"#/details/{vin}/OVE/conditionInformation"
+        LOGGER.info(
+            "Attempting CR hash-route navigation for VIN %s (intended_href=%s)",
+            vin, intended_href,
+        )
+        try:
+            # Plain `window.location.hash = ...` triggers React Router's
+            # popstate/hashchange listener. We use it explicitly rather
+            # than goto(url + hash) because Playwright's goto can be
+            # confused by hash-only navigations.
+            source_page.evaluate(
+                "(hash) => { window.location.hash = hash; }",
+                target_hash,
+            )
+        except Exception as exc:
+            LOGGER.warning("Hash-route evaluate failed for VIN %s: %s", vin, exc)
+            return None
+
+        # Poll up to 20s for the route to settle. Same budget as
+        # _click_condition_report_locator's poll loop.
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            try:
+                current_url = source_page.url or ""
+            except Exception:
+                current_url = ""
+            if self._CR_HASH_ROUTE_RE.search(current_url):
+                # Route confirmed; let the React app finish mounting the
+                # CR view (same wait_for_load_state networkidle the
+                # click flow uses).
+                try:
+                    source_page.wait_for_load_state("networkidle", timeout=10000)
+                except PlaywrightTimeoutError:
+                    pass
+                # Defense in depth: confirm we're not on auth or the
+                # "CR not available right now" page. These raise
+                # ManheimAuthRedirectError which the caller propagates.
+                self._raise_if_auth_redirect(
+                    source_page, artifact_dir, "hash_route_post_nav", intended_href,
+                )
+                if self._is_cr_unavailable_page(source_page):
+                    raise ManheimAuthRedirectError(
+                        f"Manheim returned 'condition reports are not available' "
+                        f"for hash-route nav to {target_hash} "
+                        f"(intended_href={intended_href}); "
+                        "treating as stale-session auth failure."
+                    )
+                LOGGER.info(
+                    "CR hash-route navigation succeeded for VIN %s (url=%s)",
+                    vin, current_url,
+                )
+                return source_page
+            source_page.wait_for_timeout(250)
+
+        LOGGER.info(
+            "CR hash-route navigation did not produce expected route within 20s "
+            "for VIN %s; will fall back to click flow",
+            vin,
+        )
+        return None
+
     def _open_via_ove_internal_viewer(
         self,
         source_page: Page,
@@ -2975,9 +3089,20 @@ class PlaywrightCdpBrowserSession:
         # and renders the CR (with all images) inside the OVE webapp,
         # without a popup, without an OAuth handshake the scraper can see.
         #
+        # 2026-04-25: for listings whose CR is hosted on
+        # insightcr.manheim.com, the OVE detail page DOES NOT render the
+        # CR anchor at all (React leaves a hollow
+        # <span class="VehicleReportLink"></span>) — so the click flow's
+        # _find_condition_report_locator search returns None for 100% of
+        # those listings. We now attempt a direct hash-route navigation
+        # FIRST, which produces the same React route change a click
+        # would have. The click flow remains as a fallback for listings
+        # whose anchor IS rendered (e.g., inspectionreport listings that
+        # somehow get routed here despite the dispatcher).
+        #
         # We do NOT pass `href` to a goto here. We use the href ONLY to
-        # label debug artifacts on failure, and the click on the OVE
-        # locator element is the sole navigation mechanism.
+        # label debug artifacts on failure; navigation happens via
+        # in-page hash mutation OR via the locator click.
         #
         # Under a stale OVE SSO the React handler sometimes delegates to
         # window.open(insightcr...) instead of a hash-route change. The
@@ -2994,6 +3119,7 @@ class PlaywrightCdpBrowserSession:
         last_error: Exception | None = None
         collected_popups: list[Page] = []
         claimed_page: Page | None = None
+        hash_route_attempted = False
         context = source_page.context
 
         def _on_popup(new_page: Page) -> None:
@@ -3001,6 +3127,47 @@ class PlaywrightCdpBrowserSession:
 
         context.on("page", _on_popup)
         try:
+            # Strategy 1 (2026-04-25): direct hash-route navigation. Use
+            # this first because for insightcr-hosted listings the click
+            # target literally doesn't exist in the DOM, and the click
+            # flow below has a 100% historical failure rate on those.
+            # For listings whose anchor IS rendered the hash route still
+            # works (it's the same destination the click would produce),
+            # so we lose nothing by trying it first.
+            vin = self._extract_vin_from_source_page(source_page)
+            if vin:
+                hash_route_attempted = True
+                try:
+                    hash_cr_page = self._open_via_hash_route(
+                        source_page, vin, href, artifact_dir,
+                    )
+                except ManheimAuthRedirectError:
+                    # Hash-route definitively landed on auth or "not
+                    # available". Propagate; click flow won't recover
+                    # from that either.
+                    raise
+                if hash_cr_page is not None:
+                    LOGGER.info(
+                        "Opened OVE-internal condition report view via hash-route "
+                        "for VIN %s (url=%s)",
+                        vin, hash_cr_page.url,
+                    )
+                    claimed_page = hash_cr_page
+                    return hash_cr_page
+                LOGGER.info(
+                    "Hash-route did not produce CR view for VIN %s; "
+                    "falling back to anchor-click flow",
+                    vin,
+                )
+            else:
+                LOGGER.info(
+                    "Could not extract VIN from source_page url=%s; "
+                    "skipping hash-route attempt",
+                    source_page.url if hasattr(source_page, 'url') else '<unknown>',
+                )
+
+            # Strategy 2: click-loop fallback for listings whose CR
+            # anchor IS in the DOM.
             for attempt in range(max_attempts):
                 try:
                     # Re-resolve the locator on every attempt — a previous click
@@ -3103,9 +3270,17 @@ class PlaywrightCdpBrowserSession:
                 )
             except Exception as snap_exc:
                 LOGGER.warning("Could not capture cr-click-failed debug snapshot: %s", snap_exc)
+            try:
+                final_url = source_page.url
+            except Exception:
+                final_url = "<unknown>"
             raise ConditionReportClickFailedError(
-                f"Could not open OVE condition report after {max_attempts} click attempts; "
-                f"intended_href={href}; last_error={last_error}"
+                f"Could not open OVE condition report; "
+                f"intended_href={href}; "
+                f"hash_route_attempted={hash_route_attempted}; "
+                f"click_attempts={max_attempts}; "
+                f"final_source_url={final_url}; "
+                f"last_error={last_error}"
             )
         finally:
             try:
