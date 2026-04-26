@@ -557,3 +557,147 @@ def test_open_via_hash_route_raises_on_auth_redirect(tmp_path) -> None:
             page, vin, "https://insightcr.manheim.com/cr-display?...", tmp_path,
         )
 
+
+# ----------------------------------------------------------------------
+# 2026-04-26: AutoCheck Snapshot Report parser fixes. Forensic analysis
+# of 188 captured autocheck-report.html files showed:
+#   - 178 of 182 snapshots had buyback_protection extracted as
+#     "Program." because the regex matched descriptive text inside the
+#     title-brand explainer block instead of the actual finding.
+#   - All 182 captures had trailing "More info \n More info" tooltip
+#     noise concatenated to every check value.
+#   - 5 of 188 captures were Experian "Your request cannot be
+#     processed" error pages stored as scrape_status='success' with
+#     empty fields.
+# ----------------------------------------------------------------------
+
+# Realistic Snapshot Report body text — pulled from a captured artifact.
+# Inner-text-style: newlines preserved, contiguous whitespace collapsed.
+_SNAPSHOT_OK_TEXT = """\
+Welcome to AutoCheck - Snapshot Report
+ AutoCheck Report
+ 2023 Jeep Wrangler Rubicon
+ SUV 2D
+ VIN: 1C4HJXCG7PW628257
+No. of Historical Events
+8
+Calculated Owners
+1
+Number of Accidents
+0
+ Last Reported Mileage: 17,790
+ 96
+ 90
+ 95
+ This vehicle's AutoCheck Score: 96
+Major State Title Brand Check -
+ OK
+ More info
+ More info
+Major State Title Brand Check
+AutoCheck checks the following major title brands. If there are any title brand below
+reported, the vehicle is not qualified for Buyback Protection Program.
+Fire brand
+Salvage brand
+Accident Check -
+ OK
+ More info
+ More info
+Damage Check -
+ OK
+ More info
+ More info
+Odometer Check -
+ OK
+ More info
+ More info
+Vehicle Usage Check -
+ Personal Use
+ More info
+ More info
+AutoCheck Buyback Protection -
+ Qualifies
+ More info
+ More info
+"""
+
+_SNAPSHOT_BRANDED_TEXT = _SNAPSHOT_OK_TEXT.replace(
+    "Major State Title Brand Check -\n OK\n More info\n More info",
+    "Major State Title Brand Check -\n Problem Reported\n More info\n More info",
+).replace(
+    "AutoCheck Buyback Protection -\n Qualifies",
+    "AutoCheck Buyback Protection -\n Does Not Qualify",
+)
+
+
+def test_parse_autocheck_buyback_protection_extracts_actual_value() -> None:
+    """Regression: prior regex matched 'Buyback Protection Program.' in the
+    title-brand explainer block. Anchored-on-'AutoCheck Buyback Protection -'
+    fix must extract the real finding instead."""
+    parsed = PlaywrightCdpBrowserSession._parse_autocheck_content(_SNAPSHOT_OK_TEXT)
+    assert parsed["buyback_protection"] == "Qualifies"
+    assert "Program" not in parsed["buyback_protection"]
+
+
+def test_parse_autocheck_buyback_protection_extracts_does_not_qualify() -> None:
+    parsed = PlaywrightCdpBrowserSession._parse_autocheck_content(_SNAPSHOT_BRANDED_TEXT)
+    assert parsed["buyback_protection"] == "Does Not Qualify"
+
+
+def test_parse_autocheck_strips_more_info_trailing_noise() -> None:
+    """All check fields must come out clean, not with trailing
+    '\\n More info \\n More info' tooltip text."""
+    parsed = PlaywrightCdpBrowserSession._parse_autocheck_content(_SNAPSHOT_OK_TEXT)
+    assert parsed["title_brand_check"] == "OK", parsed["title_brand_check"]
+    assert parsed["accident_check"] == "OK"
+    assert parsed["damage_check"] == "OK"
+    assert parsed["odometer_check"] == "OK"
+    assert parsed["vehicle_use"] == "Personal Use"
+    # No "More info" anywhere in any extracted value.
+    for field in ("title_brand_check", "accident_check", "damage_check",
+                  "odometer_check", "vehicle_use", "buyback_protection"):
+        assert "More info" not in parsed[field], (field, parsed[field])
+
+
+def test_parse_autocheck_problem_reported_still_caught() -> None:
+    """The screener relies on 'problem reported' substring to fail
+    branded-title VINs. The cleanup must not strip the keyword."""
+    parsed = PlaywrightCdpBrowserSession._parse_autocheck_content(_SNAPSHOT_BRANDED_TEXT)
+    assert parsed["title_brand_check"] == "Problem Reported"
+    assert "problem reported" in parsed["title_brand_check"].lower()
+
+
+def test_parse_autocheck_score_owners_accidents_extracted() -> None:
+    parsed = PlaywrightCdpBrowserSession._parse_autocheck_content(_SNAPSHOT_OK_TEXT)
+    assert parsed["autocheck_score"] == 96
+    assert parsed["owner_count"] == 1
+    assert parsed["accident_count"] == 0
+
+
+def test_clean_check_value_handles_edge_cases() -> None:
+    clean = PlaywrightCdpBrowserSession._clean_check_value
+    # Standard snapshot output
+    assert clean("OK \n More info \n More info") == "OK"
+    # Single trailing tooltip
+    assert clean("Problem Reported\n More info") == "Problem Reported"
+    # No tooltip — pass through unchanged but trimmed
+    assert clean("  Personal Use  ") == "Personal Use"
+    # Empty / falsy
+    assert clean("") == ""
+    assert clean(None) == ""  # type: ignore[arg-type]
+    # Multi-word value with internal spaces preserved
+    assert clean("Does Not Qualify\nMore info\nMore info") == "Does Not Qualify"
+
+
+def test_is_experian_error_page_detects_request_cannot_be_processed() -> None:
+    detect = PlaywrightCdpBrowserSession._is_experian_error_page
+    # The actual ~3KB error stub Experian returns
+    assert detect("Your request cannot be processed h1 { color: #004986 }") is True
+    # Variant casing
+    assert detect("YOUR REQUEST CANNOT BE PROCESSED") is True
+    # Real snapshot — must NOT be flagged
+    assert detect("Welcome to AutoCheck - Snapshot Report ...") is False
+    # Empty / None safe
+    assert detect("") is False
+    assert detect(None) is False  # type: ignore[arg-type]
+

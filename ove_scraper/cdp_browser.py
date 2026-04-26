@@ -1772,6 +1772,20 @@ class PlaywrightCdpBrowserSession:
                             "AutoCheck direct nav landed on login for VIN %s: url=%s (consecutive=%s)",
                             vin, report_page.url, self._experian_consecutive_login_redirects,
                         )
+                    elif self._is_experian_error_page(full_text):
+                        LOGGER.warning(
+                            "AutoCheck direct nav landed on Experian error page for VIN %s "
+                            "('Your request cannot be processed'); treating as partial",
+                            vin,
+                        )
+                        return {
+                            "scrape_status": "partial",
+                            "failure_category": "experian_rate_limited",
+                            "failure_message": (
+                                "Experian returned 'Your request cannot be processed' "
+                                "(typically a rate-limit or stale session-token response)."
+                            ),
+                        }
                     else:
                         self._reset_experian_login_redirect_counter()
                         self._merge_full_experian_report(result, full_text)
@@ -1860,6 +1874,20 @@ class PlaywrightCdpBrowserSession:
                     if self._experian_short_circuit_tripped():
                         break
                     continue
+                if self._is_experian_error_page(popup_text):
+                    LOGGER.warning(
+                        "AutoCheck popup landed on Experian error page for VIN %s "
+                        "('Your request cannot be processed'); treating as partial",
+                        vin,
+                    )
+                    return {
+                        "scrape_status": "partial",
+                        "failure_category": "experian_rate_limited",
+                        "failure_message": (
+                            "Experian returned 'Your request cannot be processed' "
+                            "(typically a rate-limit or stale session-token response)."
+                        ),
+                    }
                 self._reset_experian_login_redirect_counter()
                 self._merge_full_experian_report(result, popup_text)
                 LOGGER.info("AutoCheck full report captured via popup click for VIN %s (%d chars)", vin, len(popup_text))
@@ -1904,6 +1932,23 @@ class PlaywrightCdpBrowserSession:
     def _looks_like_login_page(text: str) -> bool:
         head = (text or "").lower()[:400]
         return ("sign in" in head) or ("username" in head) or ("password" in head and "log in" in head)
+
+    @staticmethod
+    def _is_experian_error_page(text: str) -> bool:
+        """Detect Experian's 'Your request cannot be processed' rejection
+        page.
+
+        Observed on 5 of 188 reports captured 2026-04-25 — these are
+        ~3KB stub pages Experian returns when the cs= session token in
+        the AutoCheck URL has expired or when the VIN is not in their
+        database. Without this detector the captures are stored as
+        scrape_status='success' with empty AutoCheck fields, masking
+        the real failure. Detected pages should be downgraded to
+        scrape_status='partial' with a clear failure_category so
+        downstream consumers know the data is missing.
+        """
+        head = (text or "").strip()[:400].lower()
+        return "your request cannot be processed" in head
 
     @staticmethod
     def _url_is_auth_redirect(url: str) -> bool:
@@ -2027,8 +2072,37 @@ class PlaywrightCdpBrowserSession:
         return result
 
     @staticmethod
+    def _clean_check_value(raw: str) -> str:
+        """Strip the AutoCheck Snapshot Report's repeated 'More info'
+        tooltip text from an extracted check value.
+
+        Snapshots render every check section with two tooltip elements:
+        ``OK \\n More info \\n More info``. The non-greedy regex match
+        captures all of it. Truncating at the first 'More info' gives a
+        clean value (``OK``, ``Problem Reported``, ``Personal Use``,
+        ``Qualifies``, etc.) suitable for both DB persistence and VPS
+        template rendering.
+        """
+        if not raw:
+            return ""
+        # Cut everything from the first "More info" onward.
+        cleaned = re.split(r'\s*More\s+info\b', raw, maxsplit=1)[0]
+        # Collapse internal whitespace (newlines, tabs) to a single space.
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        return cleaned
+
+    @staticmethod
     def _parse_autocheck_content(raw_text: str) -> dict[str, Any]:
-        """Parse raw AutoCheck modal text into structured sections."""
+        """Parse raw AutoCheck modal text into structured sections.
+
+        Tuned for the AutoCheck Snapshot Report (the only tier the
+        OVE-internal viewer returns — the Full Vehicle History Report
+        requires Manheim Dealer Elite membership). The Snapshot is
+        sufficient for screening: it includes the AutoCheck Score, owner
+        count, accident count, and OK/Problem-Reported verdicts on the
+        title-brand / accident / damage / odometer / vehicle-use /
+        buyback-protection checks.
+        """
         result: dict[str, Any] = {"raw_text": raw_text}
 
         sections = {
@@ -2037,12 +2111,23 @@ class PlaywrightCdpBrowserSession:
             "damage_check": r"Damage\s*Check\s*[-–—]?\s*(.*?)(?=\n[A-Z]|\Z)",
             "odometer_check": r"Odometer\s*Check\s*[-–—]?\s*(.*?)(?=\n[A-Z]|\Z)",
             "vehicle_use": r"Vehicle\s*Usage?\s*Check\s*[-–—]?\s*(.*?)(?=\n[A-Z]|\Z)",
-            "buyback_protection": r"(?:AutoCheck\s*)?Buyback\s*Protection\s*[-–—]?\s*(.*?)(?=\n[A-Z]|\Z)",
+            # Anchored on the literal phrase "AutoCheck Buyback Protection"
+            # with a REQUIRED hyphen separator, NOT on bare
+            # "Buyback Protection". The Snapshot's title-brand explainer
+            # block contains "...not qualified for Buyback Protection
+            # Program. Fire brand..." which the prior regex matched first,
+            # extracting "Program." as the value on 178 of 182 reports.
+            "buyback_protection": r"AutoCheck\s+Buyback\s+Protection\s*[-–—]\s*(.*?)(?=\n[A-Z]|\Z)",
         }
 
         for key, pattern in sections.items():
             match = re.search(pattern, raw_text, re.IGNORECASE | re.DOTALL)
-            result[key] = match.group(1).strip() if match else ""
+            # _clean_check_value strips the "More info \n More info"
+            # tooltip noise the Snapshot renders on every check.
+            result[key] = (
+                PlaywrightCdpBrowserSession._clean_check_value(match.group(1))
+                if match else ""
+            )
 
         # Extract score if present
         score_match = re.search(r"(?:AutoCheck\s*Score|score)\s*:?\s*(\d+)", raw_text, re.IGNORECASE)
@@ -2054,7 +2139,10 @@ class PlaywrightCdpBrowserSession:
         if accident_match:
             result["accident_count"] = int(accident_match.group(1))
 
-        # Extract owner count
+        # Extract owner count. Note: 18% of Snapshot reports legitimately
+        # OMIT this line entirely (typical of low-mileage / new vehicles
+        # where Experian has not yet computed an owner count). Returning
+        # None is the correct outcome in that case.
         owner_match = re.search(r"(?:Calculated\s*)?Owners?\s*:?\s*(\d+)", raw_text, re.IGNORECASE)
         if owner_match:
             result["owner_count"] = int(owner_match.group(1))
