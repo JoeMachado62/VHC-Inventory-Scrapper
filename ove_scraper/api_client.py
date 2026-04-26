@@ -57,6 +57,41 @@ class VCHApiClient:
         )
         return response.json()
 
+    def push_hot_deals_batch(
+        self,
+        batch_payload: dict[str, Any],
+        *,
+        endpoint_path: str = "/inventory/ove/hot-deals/ingest",
+    ) -> dict[str, Any]:
+        """POST the curated Hot Deals batch to the VPS.
+
+        Per HOT_DEALS_SCRAPER_CONTRACT.md: this is a single-batch push
+        per completed VHC Marketing List run. Use snapshot_mode=
+        "full_replace" so the VPS can deactivate hot deals that fell
+        off the latest list.
+
+        Note: contract specifies an Authorization: Bearer header for
+        this endpoint, distinct from the X-Service-Token header the
+        rest of the API uses. We add Bearer for this one POST without
+        mutating the client's default headers.
+        """
+        # Caller passes a fully-built batch dict (no Pydantic schema —
+        # the VPS contract is loose enough that strict validation here
+        # would block legitimate edge fields). The VPS does its own
+        # per-VIN validation and returns a per-VIN error list when
+        # entries are rejected.
+        bearer_headers = dict(self.headers)
+        bearer_headers["Authorization"] = bearer_headers.get(
+            "Authorization", f"Bearer {self.headers.get('X-Service-Token', '')}"
+        )
+        response = self._request_with_retry(
+            "POST",
+            f"{self.base_url}{endpoint_path}",
+            json=batch_payload,
+            headers=bearer_headers,
+        )
+        return response.json()
+
     def claim_pending_detail_requests(
         self,
         *,

@@ -156,6 +156,7 @@ def main() -> None:
                     runner = HotDealPipelineRunner(
                         settings=settings, browser=browser, db_conn=db_conn,
                         log=logger, notifier=notifier,
+                        api_client=api_client,
                     )
                     result = runner.run_once()
                     logger.info("Hot Deal pipeline finished: %s", result.get("status", "unknown"))
@@ -299,7 +300,9 @@ def main() -> None:
                                     "Hot Deal auto-run: firing (%s)", decision["reason"],
                                 )
                                 run_hot_deal_with_recovery(
-                                    settings, browser, logger, notifier=notifier,
+                                    settings, browser, logger,
+                                    notifier=notifier,
+                                    api_client=api_client,
                                 )
                             else:
                                 logger.debug(
@@ -950,6 +953,7 @@ def run_hot_deal_with_recovery(
     browser,
     logger,
     notifier: AdminNotifier | None = None,
+    api_client: VCHApiClient | None = None,
 ) -> None:
     """Execute one Hot Deal pipeline run, persist state, and surface
     failures. Mirrors run_sync_once_with_recovery / run_poll_once_with_recovery
@@ -991,6 +995,7 @@ def run_hot_deal_with_recovery(
             runner = HotDealPipelineRunner(
                 settings=settings, browser=browser, db_conn=db_conn,
                 log=logger, notifier=notifier,
+                api_client=api_client,
             )
             result = runner.run_once()
         finally:

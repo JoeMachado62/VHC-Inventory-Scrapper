@@ -140,6 +140,15 @@ class Settings:
     # eligible for retry. Conservative default: 2 hours (pipeline runs
     # observed at ~50 min for 100 VINs; doubled for headroom).
     hot_deal_stale_start_seconds: int = 7200
+    # Hot Deals VPS push (HOT_DEALS_SCRAPER_CONTRACT.md). After a
+    # successful Hot Deal pipeline run, POST the curated batch to the
+    # VPS so it can render the marketing UI. Set the enabled flag to
+    # false during VPS rollouts where the endpoint is not yet live —
+    # the pipeline still screens VINs and persists payload-data.json
+    # files; the push step is the only thing skipped.
+    hot_deal_vps_push_enabled: bool = True
+    hot_deal_vps_endpoint_path: str = "/inventory/ove/hot-deals/ingest"
+    hot_deal_min_delta_below_mmr: int = 1000
     openai_api_key: str = ""
     openai_model: str = "gpt-5.4"
 
@@ -240,6 +249,12 @@ class Settings:
             hot_deal_retry_delay_seconds=_get_int("HOT_DEAL_RETRY_DELAY_SECONDS", 1800),
             hot_deal_max_daily_attempts=_get_int("HOT_DEAL_MAX_DAILY_ATTEMPTS", 3),
             hot_deal_stale_start_seconds=_get_int("HOT_DEAL_STALE_START_SECONDS", 7200),
+            hot_deal_vps_push_enabled=_get_bool("HOT_DEAL_VPS_PUSH_ENABLED", True),
+            hot_deal_vps_endpoint_path=os.getenv(
+                "HOT_DEAL_VPS_ENDPOINT_PATH",
+                "/inventory/ove/hot-deals/ingest",
+            ),
+            hot_deal_min_delta_below_mmr=_get_int("HOT_DEAL_MIN_DELTA_BELOW_MMR", 1000),
             openai_api_key=os.getenv("OPENAI_API_KEY", ""),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-5.4"),
         )
