@@ -14,7 +14,7 @@ from urllib.error import URLError
 from urllib.request import urlopen
 from zoneinfo import ZoneInfo
 
-from ove_scraper.automation_lock import AutomationLockBusyError, OveAutomationLock
+from ove_scraper.automation_lock import AutomationLockBusyError, OveAutomationLock, lock_name_for_port
 from ove_scraper.browser import BrowserSessionError, SavedSearchPageEmpty
 from ove_scraper.api_client import VCHApiClient
 from ove_scraper.cdp_browser import PlaywrightCdpBrowserSession
@@ -396,7 +396,14 @@ def main() -> None:
 
 
 def build_runtime(settings: Settings, logger):
-    browser = PlaywrightCdpBrowserSession(settings)
+    """Construct the runtime objects. When `settings.chrome_debug_port_sync`
+    is set (Path 2 / two-Chrome architecture, 2026-04-26), the saved-search
+    sync runs on a SECOND Chrome instance with its own browser session,
+    its own settings copy (so `chrome_debug_port` points at the secondary
+    port), and its own automation-lock mutex (so it never contends with
+    the primary Chrome that hosts hot-deal + deep-scrape work).
+    """
+    primary_browser = PlaywrightCdpBrowserSession(settings)
     api_client = VCHApiClient(settings.vch_api_base_url, settings.vch_service_token)
     notifier = AdminNotifier(
         smtp_host=settings.smtp_host,
@@ -408,10 +415,35 @@ def build_runtime(settings: Settings, logger):
         admin_alert_email=settings.admin_alert_email,
         cooldown_seconds=settings.admin_alert_cooldown_seconds,
     )
-    sync_runner = HourlySyncRunner(settings, browser, api_client, logger, notifier=notifier)
-    deep_scrape_worker = DeepScrapeWorker(api_client, browser, logger, settings, notifier=notifier)
+
+    if settings.chrome_debug_port_sync and settings.chrome_debug_port_sync != settings.chrome_debug_port:
+        # Path 2: clone Settings with the secondary port so the sync's
+        # PlaywrightCdpBrowserSession connects to Login B's Chrome. Every
+        # other field — VCH API URL, sync schedule, saved-search names,
+        # Eastern-time window — is identical, so the sync runner's
+        # business logic is unchanged.
+        from dataclasses import replace as _dataclass_replace
+        sync_settings = _dataclass_replace(
+            settings, chrome_debug_port=settings.chrome_debug_port_sync,
+        )
+        sync_browser = PlaywrightCdpBrowserSession(sync_settings)
+        logger.info(
+            "Two-Chrome mode: sync runner -> port %d (Login B), "
+            "hot-deal/deep-scrape -> port %d (Login A)",
+            settings.chrome_debug_port_sync,
+            settings.chrome_debug_port,
+        )
+        sync_runner = HourlySyncRunner(sync_settings, sync_browser, api_client, logger, notifier=notifier)
+    else:
+        sync_browser = primary_browser
+        sync_runner = HourlySyncRunner(settings, primary_browser, api_client, logger, notifier=notifier)
+
+    deep_scrape_worker = DeepScrapeWorker(api_client, primary_browser, logger, settings, notifier=notifier)
     logger.info("Configured deep-scrape worker pool size: %s", settings.deep_scrape_max_workers)
-    return browser, api_client, sync_runner, deep_scrape_worker, notifier
+    # Tuple is intentionally backwards-compatible — same arity as before.
+    # `sync_browser` is reachable via sync_runner.browser; callers that
+    # need to drive sync recovery use the runner, not the raw browser.
+    return primary_browser, api_client, sync_runner, deep_scrape_worker, notifier
 
 
 def run_sync_once_with_recovery(
@@ -422,8 +454,26 @@ def run_sync_once_with_recovery(
     sync_runner: HourlySyncRunner | None = None,
     notifier: AdminNotifier | None = None,
 ):
-    runner = sync_runner or HourlySyncRunner(settings, browser, api_client, logger, notifier=notifier)
-    return run_browser_operation(settings, browser, logger, runner.run_once, "hourly sync", notifier=notifier)
+    # Path 2: when a separate sync_runner is supplied (the typical case
+    # after build_runtime), it carries its own browser pointed at the
+    # secondary Chrome. Use that browser + a port-derived lock name so
+    # the mutex doesn't collide with the primary Chrome's lock.
+    if sync_runner is not None:
+        sync_browser = sync_runner.browser
+        sync_settings = sync_runner.settings
+    else:
+        sync_runner = HourlySyncRunner(settings, browser, api_client, logger, notifier=notifier)
+        sync_browser = browser
+        sync_settings = settings
+    return run_browser_operation(
+        sync_settings,
+        sync_browser,
+        logger,
+        sync_runner.run_once,
+        "hourly sync",
+        notifier=notifier,
+        lock_name=lock_name_for_port(sync_settings.chrome_debug_port),
+    )
 
 
 def send_heartbeat(
@@ -512,9 +562,26 @@ def run_poll_once_with_recovery(
     return run_browser_operation(settings, browser, logger, worker.process_pending_once, "detail poll", notifier=notifier)
 
 
-def run_browser_operation(settings: Settings, browser, logger, operation, operation_name: str, notifier: AdminNotifier | None = None):
+def run_browser_operation(
+    settings: Settings,
+    browser,
+    logger,
+    operation,
+    operation_name: str,
+    notifier: AdminNotifier | None = None,
+    lock_name: str | None = None,
+):
+    """Run a browser-driven operation under the OveAutomationLock.
+
+    `lock_name` lets the caller scope the mutex per-Chrome (Path 2
+    / two-Chrome architecture). When None, the historical default
+    (`Local\\OVE_Browser_Automation`) is used so single-Chrome callers
+    are byte-identical to prior behavior.
+    """
+    if lock_name is None:
+        lock_name = lock_name_for_port(settings.chrome_debug_port)
     try:
-        with OveAutomationLock(timeout_seconds=_browser_operation_lock_timeout_seconds(operation_name)):
+        with OveAutomationLock(name=lock_name, timeout_seconds=_browser_operation_lock_timeout_seconds(operation_name)):
             ensure_browser_session(settings, browser, logger, notifier=notifier)
             try:
                 return operation()
