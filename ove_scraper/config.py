@@ -46,6 +46,15 @@ class Settings:
     vch_service_token: str
     chrome_debug_host: str = "127.0.0.1"
     chrome_debug_port: int = 9222
+    # Optional secondary Chrome port for the saved-search sync workflow
+    # (Path 2 / two-Chrome architecture, 2026-04-26). When > 0, the sync
+    # runner connects to a SECOND Chrome instance on this port — typically
+    # logged into a different OVE account ("Login B") — so the sync's
+    # CSV-export work no longer competes with the hot-deal pipeline or
+    # deep-scrape worker for the primary browser session. When 0 (the
+    # default), behavior is byte-identical to the historical single-Chrome
+    # mode. Tunable via CHROME_DEBUG_PORT_SYNC env var.
+    chrome_debug_port_sync: int = 0
     sync_interval_seconds: int = 3600
     deep_scrape_poll_interval_seconds: int = 30
     # Reduced from 900s (15 min) to 300s (5 min) per the 2026-04-11
@@ -166,6 +175,7 @@ class Settings:
             vch_service_token=service_token,
             chrome_debug_host=os.getenv("CHROME_DEBUG_HOST", "127.0.0.1"),
             chrome_debug_port=_get_int("CHROME_DEBUG_PORT", 9222),
+            chrome_debug_port_sync=_get_int("CHROME_DEBUG_PORT_SYNC", 0),
             sync_interval_seconds=_get_int("SYNC_INTERVAL_SECONDS", 3600),
             deep_scrape_poll_interval_seconds=_get_int("DEEP_SCRAPE_POLL_INTERVAL_SECONDS", 30),
             browser_keepalive_interval_seconds=_get_int("BROWSER_KEEPALIVE_INTERVAL_SECONDS", 300),
