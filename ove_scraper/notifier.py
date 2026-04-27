@@ -155,6 +155,106 @@ class AdminNotifier:
         body = format_hot_deal_summary(run_summary, hot_deals)
         return self._send_with_cooldown(key="hot-deal-complete", subject=subject, body=body, logger=logger)
 
+    def notify_hot_deal_cluster_rejection(
+        self,
+        *,
+        clusters: list[dict[str, Any]],
+        run_id: str,
+        total_screened: int,
+        logger=None,
+    ) -> bool:
+        """Alert when many VINs in one run reject for the identical reason.
+
+        Real-world precedent (2026-04-26): a parser regex matched a UI
+        label and false-rejected 17 vehicles with "Structural damage
+        reported". The pipeline finished cleanly; only the trailing
+        WARNING lines hinted at the problem and they were easy to miss.
+        This alert turns the bug pattern into an inbox event.
+        """
+        if not clusters:
+            return False
+        biggest = clusters[0]
+        subject = (
+            f"Hot Deal: {biggest['count']} VINs rejected for the same reason "
+            f"({biggest['reason'][:60]})"
+        )
+        body_lines = [
+            "The Hot Deal pipeline detected one or more rejection-reason clusters.",
+            "A cluster means many VINs failed step 1, 2, or 3 with the IDENTICAL",
+            "rejection reason — strongly suggesting a screener bug rather than",
+            "many independently-bad vehicles. Investigate before relying on the",
+            "hot deal list this run produced.",
+            "",
+            f"Run ID:         {run_id}",
+            f"Total screened: {total_screened}",
+            "",
+            "Clusters detected:",
+        ]
+        for c in clusters:
+            body_lines.append(f"  - {c['count']:>4} VINs  |  {c['reason']}")
+            body_lines.append(f"           sample: {', '.join(c['sample_vins'][:5])}")
+        body_lines.append("")
+        body_lines.append(
+            "Action: pull one of the sample VINs' artifacts (artifacts/<VIN>/) "
+            "and verify the rejection is real. If not, the screener regex or "
+            "data-source extraction needs fixing."
+        )
+        return self._send_with_cooldown(
+            key=f"hot-deal-cluster-reject:{biggest['reason'][:80]}",
+            subject=subject,
+            body="\n".join(body_lines),
+            logger=logger,
+        )
+
+    def notify_hot_deal_push_zero(
+        self,
+        *,
+        hot_deal_rows_count: int,
+        missing_payload_count: int,
+        skipped_at_build_count: int,
+        skipped_sample: list[str],
+        logger=None,
+    ) -> bool:
+        """Alert when the curated batch is empty but DB has hot_deal rows.
+
+        Real-world precedent (2026-04-26): the MMR extractor only knew
+        the legacy ``priceRange`` schema but production listings used
+        ``mmrPrice``. Every VIN was skipped at batch-build time, the
+        batch came out empty, and the VPS push silently sent nothing.
+        The user only noticed when the marketing area was still empty
+        the next day.
+        """
+        subject = (
+            f"Hot Deal VPS push SKIPPED — batch empty despite "
+            f"{hot_deal_rows_count} hot_deal rows in DB"
+        )
+        body_lines = [
+            "The Hot Deal pipeline finished with hot_deal-status rows in the DB,",
+            "but the VPS push was SKIPPED because the curated batch came out empty.",
+            "",
+            "This almost always means a payload-builder bug or a schema drift in",
+            "the OVE listing JSON. Symptom: the marketing list won't update.",
+            "",
+            f"Hot deal rows in DB:        {hot_deal_rows_count}",
+            f"Missing payload-data.json:  {missing_payload_count}",
+            f"Skipped at batch build:     {skipped_at_build_count}",
+        ]
+        if skipped_sample:
+            body_lines.append(f"Sample skipped VINs:        {', '.join(skipped_sample[:5])}")
+        body_lines.append("")
+        body_lines.append(
+            "Action: pull one skipped VIN's artifacts/hot-deal/<VIN>/payload-data.json "
+            "and step through ove_scraper.hot_deal_payload.build_deal_entry to find "
+            "which required field is missing. Most likely culprits: MMR extraction, "
+            "auction_end_at, or year/make/model on the listing JSON."
+        )
+        return self._send_with_cooldown(
+            key="hot-deal-push-zero",
+            subject=subject,
+            body="\n".join(body_lines),
+            logger=logger,
+        )
+
     def notify_hot_deal_pipeline_failed(
         self,
         *,

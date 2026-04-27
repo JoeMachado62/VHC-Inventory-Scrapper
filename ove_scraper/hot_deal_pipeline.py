@@ -36,6 +36,7 @@ from ove_scraper.hot_deal_db import (
     finish_run,
     get_active_vins,
     get_hot_deals,
+    get_rejection_clusters_for_run,
     get_run_summary,
     insert_new_vins,
     reset_scrape_failed_to_pending,
@@ -204,6 +205,26 @@ class HotDealPipelineRunner:
         hot_deals = get_hot_deals(self.db)
         report_text = format_hot_deal_summary(summary, hot_deals)
         self.log.info("Hot Deal pipeline complete:\n%s", report_text)
+
+        # Cluster-rejection alert: many VINs in this run rejected for the
+        # IDENTICAL reason → almost always a screener bug, not real data.
+        # 2026-04-26 incident: 17 VINs falsely failed step1 with
+        # "Structural damage reported" because of a parser regex bug.
+        # The pipeline status was "completed" and the only signal was a
+        # WARNING line buried in the log. Surface it as an inbox event.
+        try:
+            clusters = get_rejection_clusters_for_run(
+                self.db, run_id, min_cluster_size=10,
+            )
+            if clusters and self.notifier:
+                self.notifier.notify_hot_deal_cluster_rejection(
+                    clusters=clusters,
+                    run_id=run_id,
+                    total_screened=summary.get("total_vins", 0),
+                    logger=self.log,
+                )
+        except Exception as exc:
+            self.log.warning("Failed to compute/send rejection-cluster alert: %s", exc)
 
         if self.notifier:
             try:
@@ -548,6 +569,21 @@ class HotDealPipelineRunner:
                 "skipped_at_build=%d) — not pushing",
                 len(hot_deals_rows), len(missing_payload), len(skipped),
             )
+            # 2026-04-26 incident: this WARNING line was the only signal
+            # that the curated batch was empty, and the user didn't notice
+            # for a day. Promote to an inbox alert so the silent-failure
+            # mode produces a loud notification.
+            if self.notifier:
+                try:
+                    self.notifier.notify_hot_deal_push_zero(
+                        hot_deal_rows_count=len(hot_deals_rows),
+                        missing_payload_count=len(missing_payload),
+                        skipped_at_build_count=len(skipped),
+                        skipped_sample=skipped,
+                        logger=self.log,
+                    )
+                except Exception as exc:
+                    self.log.warning("Failed to send push-zero alert: %s", exc)
             return {
                 "pushed": 0,
                 "skipped": skipped,

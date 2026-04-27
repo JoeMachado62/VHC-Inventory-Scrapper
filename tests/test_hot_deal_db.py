@@ -14,6 +14,7 @@ from ove_scraper.hot_deal_db import (
     finish_run,
     get_active_vins,
     get_hot_deals,
+    get_rejection_clusters_for_run,
     get_run_summary,
     init_db,
     insert_new_vins,
@@ -269,3 +270,91 @@ def test_scrape_failed_not_counted_as_rejected_in_run_summary(db: sqlite3.Connec
     assert run_row["rejected_vins"] == 1
     assert summary["scrape_failed"] == 1
     assert summary["step1_fail"] == 1
+
+
+def test_get_rejection_clusters_for_run_finds_buggy_clusters(db: sqlite3.Connection) -> None:
+    """Regression test: 17 VINs falsely failed step1 with the same reason
+    on 2026-04-26 because of a parser regex bug. The cluster query is
+    what an alert wires off — it must surface that pattern.
+    """
+    run_id = create_run(db, ["VCH Marketing List"])
+
+    # 12 VINs falsely fail with the same reason (above the default
+    # threshold of 10) — this is what the alert should flag.
+    cluster_vins = [f"BUG{i:014d}" for i in range(12)]
+    insert_new_vins(db, [{"vin": v, "year": 2024, "make": "Ford", "model": "F-150"} for v in cluster_vins])
+    for v in cluster_vins:
+        claim_next_pending(db)
+        advance_status(
+            db, v, "step1_fail",
+            rejection_step="step1",
+            rejection_reason="Structural damage reported",
+        )
+
+    # 3 unrelated step3 rejections that should NOT cluster (different
+    # reason strings) — these are real rejections, must be ignored.
+    legit_vins = [f"OK{i:015d}" for i in range(3)]
+    insert_new_vins(db, [{"vin": v, "year": 2024, "make": "Honda", "model": "Civic"} for v in legit_vins])
+    for i, v in enumerate(legit_vins):
+        claim_next_pending(db)
+        advance_status(
+            db, v, "step3_fail",
+            rejection_step="step3",
+            rejection_reason=f"VIN found on salvage site(s): site{i}.com",
+        )
+
+    finish_run(db, run_id, "completed")
+
+    clusters = get_rejection_clusters_for_run(db, run_id, min_cluster_size=10)
+    assert len(clusters) == 1
+    assert clusters[0]["count"] == 12
+    assert clusters[0]["reason"] == "Structural damage reported"
+    assert len(clusters[0]["sample_vins"]) == 5  # capped at 5 per the implementation
+
+
+def test_get_rejection_clusters_for_run_respects_threshold(db: sqlite3.Connection) -> None:
+    """A cluster of 9 with the default threshold of 10 should NOT trip."""
+    run_id = create_run(db, ["VCH Marketing List"])
+    vins = [f"BELOW{i:012d}" for i in range(9)]
+    insert_new_vins(db, [{"vin": v, "year": 2024, "make": "Ford", "model": "F-150"} for v in vins])
+    for v in vins:
+        claim_next_pending(db)
+        advance_status(db, v, "step1_fail", rejection_step="step1", rejection_reason="As-Is vehicle")
+    finish_run(db, run_id, "completed")
+
+    assert get_rejection_clusters_for_run(db, run_id, min_cluster_size=10) == []
+    # Lowering threshold below the cluster size DOES trip
+    clusters = get_rejection_clusters_for_run(db, run_id, min_cluster_size=5)
+    assert len(clusters) == 1 and clusters[0]["count"] == 9
+
+
+def test_get_rejection_clusters_for_run_scopes_to_run_window(db: sqlite3.Connection) -> None:
+    """Rejections outside the run's started_at..finished_at window are
+    excluded — clusters from prior runs must not bleed in.
+    """
+    # Run 1: 12 same-reason rejections, then finish
+    run1_id = create_run(db, ["VCH Marketing List"])
+    old_vins = [f"OLD{i:014d}" for i in range(12)]
+    insert_new_vins(db, [{"vin": v, "year": 2024, "make": "Ford", "model": "F-150"} for v in old_vins])
+    for v in old_vins:
+        claim_next_pending(db)
+        advance_status(db, v, "step1_fail", rejection_step="step1", rejection_reason="Old run reason")
+    finish_run(db, run1_id, "completed")
+
+    # Run 2: only 2 rejections in its window, with DIFFERENT reason
+    import time; time.sleep(0.01)
+    run2_id = create_run(db, ["VCH Marketing List"])
+    new_vins = [f"NEW{i:014d}" for i in range(2)]
+    insert_new_vins(db, [{"vin": v, "year": 2024, "make": "Ford", "model": "F-150"} for v in new_vins])
+    for v in new_vins:
+        claim_next_pending(db)
+        advance_status(db, v, "step1_fail", rejection_step="step1", rejection_reason="New run reason")
+    finish_run(db, run2_id, "completed")
+
+    # Run 2 should NOT see Run 1's cluster
+    assert get_rejection_clusters_for_run(db, run2_id, min_cluster_size=2) == [
+        {"reason": "New run reason", "count": 2,
+         "sample_vins": [v for v in new_vins]}
+    ]
+    # Run 1 still sees its own cluster
+    assert get_rejection_clusters_for_run(db, run1_id, min_cluster_size=10)[0]["count"] == 12

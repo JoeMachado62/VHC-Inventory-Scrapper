@@ -286,6 +286,65 @@ def get_hot_deals(conn: sqlite3.Connection) -> list[dict]:
     return [dict(row) for row in cur.fetchall()]
 
 
+def get_rejection_clusters_for_run(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    min_cluster_size: int = 10,
+) -> list[dict]:
+    """Return rejection-reason clusters within a run's time window.
+
+    A "cluster" is a single ``rejection_reason`` string shared by
+    ``min_cluster_size`` or more VINs that were screened during this
+    run (between the run's ``started_at`` and ``finished_at``, or the
+    current time if the run hasn't finished yet).
+
+    The intent is to detect bug-pattern rejections — the 2026-04-26
+    incident had 17 VINs falsely rejected with the identical reason
+    "Structural damage reported" because of a parser regex that
+    matched a UI label. Legit rejections rarely cluster this hard.
+
+    Returns a list of {"reason": str, "count": int, "sample_vins":
+    [vin, ...]} dicts, ordered by count desc.
+    """
+    started_row = conn.execute(
+        "SELECT started_at, finished_at FROM hot_deal_runs WHERE run_id=?",
+        (run_id,),
+    ).fetchone()
+    if not started_row:
+        return []
+    started_at = started_row["started_at"]
+    finished_at = started_row["finished_at"] or _utc_now_iso()
+
+    cur = conn.execute(
+        """
+        SELECT rejection_reason AS reason, COUNT(*) AS cnt
+        FROM hot_deal_vins
+        WHERE rejection_reason IS NOT NULL
+          AND screened_at IS NOT NULL
+          AND screened_at >= ?
+          AND screened_at <= ?
+        GROUP BY rejection_reason
+        HAVING COUNT(*) >= ?
+        ORDER BY cnt DESC
+        """,
+        (started_at, finished_at, min_cluster_size),
+    )
+    clusters = []
+    for row in cur.fetchall():
+        sample = conn.execute(
+            "SELECT vin FROM hot_deal_vins WHERE rejection_reason=? "
+            "AND screened_at >= ? AND screened_at <= ? LIMIT 5",
+            (row["reason"], started_at, finished_at),
+        ).fetchall()
+        clusters.append({
+            "reason": row["reason"],
+            "count": row["cnt"],
+            "sample_vins": [r["vin"] for r in sample],
+        })
+    return clusters
+
+
 def reset_scrape_failed_to_pending(conn: sqlite3.Connection) -> int:
     """Reset any scrape_failed VINs to pending so they're re-claimed for
     screening.
