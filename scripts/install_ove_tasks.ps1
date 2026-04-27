@@ -2,21 +2,28 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $browserScript = Join-Path $PSScriptRoot "start_ove_browser.ps1"
+$browserSyncScript = Join-Path $PSScriptRoot "start_ove_browser_sync.ps1"
 $scraperScript = Join-Path $PSScriptRoot "start_ove_scraper.ps1"
 $taskBrowser = "OVE Browser Session"
+$taskBrowserSync = "OVE Browser Session B"
 $taskScraper = "OVE Scraper"
 $startupDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
 $startupBrowser = Join-Path $startupDir "OVE Browser Session.cmd"
+$startupBrowserSync = Join-Path $startupDir "OVE Browser Session B.cmd"
 $startupScraper = Join-Path $startupDir "OVE Scraper.cmd"
 
 if (-not (Test-Path $browserScript)) {
     throw "Missing browser launcher script: $browserScript"
+}
+if (-not (Test-Path $browserSyncScript)) {
+    throw "Missing browser sync launcher script: $browserSyncScript"
 }
 if (-not (Test-Path $scraperScript)) {
     throw "Missing scraper launcher script: $scraperScript"
 }
 
 $browserAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -File `"$browserScript`""
+$browserSyncAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -File `"$browserSyncScript`""
 $scraperAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -File `"$scraperScript`""
 
 # Two triggers per task: at logon AND at startup. The startup trigger
@@ -45,13 +52,16 @@ $settings = New-ScheduledTaskSettingsSet `
 
 try {
     Unregister-ScheduledTask -TaskName $taskBrowser -Confirm:$false -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $taskBrowserSync -Confirm:$false -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $taskScraper -Confirm:$false -ErrorAction SilentlyContinue
 
-    Register-ScheduledTask -TaskName $taskBrowser -Action $browserAction -Trigger @($logonTrigger, $startupTrigger) -Settings $settings -Description "Launch dedicated Chrome CDP profile for OVE scraping"
+    Register-ScheduledTask -TaskName $taskBrowser -Action $browserAction -Trigger @($logonTrigger, $startupTrigger) -Settings $settings -Description "Launch dedicated Chrome CDP profile for OVE scraping (Login A, port 9222)"
+    Register-ScheduledTask -TaskName $taskBrowserSync -Action $browserSyncAction -Trigger @($logonTrigger, $startupTrigger) -Settings $settings -Description "Launch secondary Chrome CDP profile for OVE saved-search sync (Login B, port 9223)"
     Register-ScheduledTask -TaskName $taskScraper -Action $scraperAction -Trigger @($logonTrigger, $startupTrigger) -Settings $settings -Description "Run the long-lived OVE scraper and keep the machine awake"
 
     Write-Host "Installed scheduled tasks:"
     Write-Host " - $taskBrowser"
+    Write-Host " - $taskBrowserSync"
     Write-Host " - $taskScraper"
 }
 catch {
@@ -59,9 +69,11 @@ catch {
     New-Item -ItemType Directory -Force $startupDir | Out-Null
 
     Set-Content -Path $startupBrowser -Encoding ASCII -Value "@echo off`r`npowershell -ExecutionPolicy Bypass -File `"$browserScript`"`r`n"
+    Set-Content -Path $startupBrowserSync -Encoding ASCII -Value "@echo off`r`npowershell -ExecutionPolicy Bypass -File `"$browserSyncScript`"`r`n"
     Set-Content -Path $startupScraper -Encoding ASCII -Value "@echo off`r`npowershell -ExecutionPolicy Bypass -File `"$scraperScript`"`r`n"
 
     Write-Host "Installed Startup folder launchers:"
     Write-Host " - $startupBrowser"
+    Write-Host " - $startupBrowserSync"
     Write-Host " - $startupScraper"
 }
