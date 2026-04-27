@@ -303,6 +303,92 @@ class TestBuildHotDealsBatch:
 
 
 # ---------------------------------------------------------------------------
+# MMR schema variants — regression for the 2026-04-26 silent VPS-push failure
+# ---------------------------------------------------------------------------
+
+def _make_payload_data_mmrPrice_schema(
+    vin: str = "1FT8W2BN0PEC12345",
+    *,
+    mmr_price: float = 58500.0,
+    buy_now_price: float = 56049.0,
+) -> dict:
+    """Payload-data shaped like the OVE listings actually return today.
+
+    Verified empirically on 2026-04-26: 99/99 hot_deal listings exposed
+    ``mmrPrice`` / ``averageMMRValuation`` and 0/99 had ``priceRange``.
+    The original ``_extract_mmr`` only looked at ``priceRange`` with
+    ``mmrValue`` / ``mmr`` fallbacks — none of which exist in this
+    schema — so every VIN was silently dropped at batch-build time and
+    the VPS push sent an empty batch. This fixture locks in the schema
+    variant that was missed.
+    """
+    base = _make_payload_data(vin=vin, buy_now_price=buy_now_price)
+    # Strip the priceRange block; the production schema doesn't include it.
+    base["listing_json"].pop("priceRange", None)
+    # Add the flat fields production listings actually expose.
+    base["listing_json"]["mmrPrice"] = mmr_price
+    base["listing_json"]["averageMMRValuation"] = mmr_price
+    base["listing_json"]["aboveMmr"] = mmr_price + 4000.0
+    base["listing_json"]["belowMmr"] = mmr_price - 4000.0
+    return base
+
+
+class TestMmrSchemaVariants:
+    def test_mmrPrice_schema_produces_a_deal(self):
+        # The 2026-04-26 production schema. Before the fix, batch was empty.
+        payload, skipped = build_hot_deals_batch(
+            [_make_payload_data_mmrPrice_schema(buy_now_price=56049.0, mmr_price=58500.0)],
+            batch_id="mmrPrice-schema-test",
+        )
+        assert skipped == [], "no VINs should be skipped on the production schema"
+        assert len(payload["deals"]) == 1
+        deal = payload["deals"][0]
+        assert deal["pricing"]["mmr_value"] == 58500.0
+        assert deal["pricing"]["asking_price"] == 56049.0
+        assert deal["pricing"]["deal_delta"] == 2451.0  # 58500 - 56049
+
+    def test_priceRange_schema_still_works_for_backwards_compat(self):
+        # The legacy schema we originally coded against. Some listings may
+        # still use it; either schema should produce a deal.
+        payload, skipped = build_hot_deals_batch(
+            [_make_payload_data(buy_now_price=56049.0, mmr_high=58500.0)],
+            batch_id="priceRange-schema-test",
+        )
+        assert skipped == []
+        assert len(payload["deals"]) == 1
+
+    def test_smoke_test_against_live_payload_files(self, tmp_path):
+        """Catch any future MMR/payload schema drift at commit time.
+
+        Walks the artifacts/hot-deal/<VIN>/payload-data.json directory if
+        present and asserts that build_hot_deals_batch produces a non-zero
+        number of deals (or returns no input). Skips when the directory
+        is empty or absent so the test stays usable in fresh checkouts
+        and CI runs without artifacts.
+        """
+        import json
+        from pathlib import Path
+        artifact_root = Path("artifacts/hot-deal")
+        if not artifact_root.is_dir():
+            pytest.skip("artifacts/hot-deal not present; skipping live-data smoke test")
+        deals = []
+        for vin_dir in artifact_root.iterdir():
+            payload_file = vin_dir / "payload-data.json"
+            if payload_file.is_file():
+                deals.append(json.loads(payload_file.read_text(encoding="utf-8")))
+        if not deals:
+            pytest.skip("no payload-data.json files present; skipping live-data smoke test")
+        payload, skipped = build_hot_deals_batch(deals, batch_id="smoke-test")
+        # If 100% of live VINs are skipped, the schema has drifted again
+        # and the build is silently producing empty batches. Fail loud.
+        assert len(payload["deals"]) > 0, (
+            f"build_hot_deals_batch produced 0 deals from {len(deals)} live "
+            f"payload files (skipped={len(skipped)}). MMR or pricing schema "
+            f"likely drifted again. First few skipped VINs: {skipped[:5]}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # build_persisted_payload_data — what the pipeline persists per-VIN
 # ---------------------------------------------------------------------------
 
