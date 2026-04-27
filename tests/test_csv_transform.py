@@ -629,6 +629,40 @@ def test_normalize_condition_report_prefers_structured_inspection_report_fields(
     assert "/Comments -- Title" not in report.problem_highlights
 
 
+def test_normalize_condition_report_does_not_synthesize_structural_damage_from_listing_page_text() -> None:
+    # Regression: the OVE detail page DOM contains the bare label
+    # "Structural Damage" as a section title (the value sits in a sibling
+    # span). Before 2026-04-26, the cdp_browser caller fell back to the
+    # listing page body_text as the CR's raw_text when the CR popup goto
+    # timed out, and the generic CR parser regex matched the label and set
+    # structural_damage=True. The screener then false-rejected vehicles
+    # that had no actual damage. Caller now passes raw_text=None on CR
+    # capture failure; this test locks in that None raw_text never produces
+    # structural_damage=True regardless of report_link host.
+    listing_page_text = (
+        "Vehicle Details Highlights Mileage 12,345 Condition 4.2 Title Clean "
+        "Structural Damage  Frame Damage  Prior Paint  Hail Damage "
+        "Announcements No Announcements"
+    )
+    report = normalize_condition_report(
+        ConditionReport(),
+        raw_text=listing_page_text,
+        report_link={"href": "https://inspectionreport.manheim.com/?CLIENT=SIMUC&listingID=123"},
+    )
+    assert report is not None
+    assert report.structural_damage is not True
+
+    # And when raw_text is None (CR popup capture failed), the parser must
+    # not synthesize structural_damage from the report_link alone.
+    report_no_text = normalize_condition_report(
+        ConditionReport(),
+        raw_text=None,
+        report_link={"href": "https://inspectionreport.manheim.com/?CLIENT=SIMUC&listingID=123"},
+    )
+    assert report_no_text is not None
+    assert report_no_text.structural_damage is None
+
+
 def test_report_link_selector_rejects_generic_ove_condition_order_page() -> None:
     settings = Settings(vch_api_base_url="https://example.com/v1", vch_service_token="token")
     browser = PlaywrightCdpBrowserSession(settings)

@@ -483,9 +483,19 @@ def _parse_generic_condition_report(report_text: str) -> dict[str, Any]:
     elif title_branding := (_line_after(lines, "Title Branding") or _extract_line_value(text, "Title Branding")):
         parsed["title_branding"] = title_branding
 
+    # Generic parser runs as fallback against any text. The True branch
+    # requires an explicit positive declaration (verb/value), not just the
+    # bare label, because section headings on listing pages or non-CR
+    # documents can include the literal phrase "Structural Damage" without
+    # actually reporting damage. The False branch keeps the simple match
+    # because "No Structural Damage" is itself a complete declaration.
     if re.search(r"No Structural Damage", text, flags=re.IGNORECASE):
         parsed["structural_damage"] = False
-    elif re.search(r"Structural Damage", text, flags=re.IGNORECASE):
+    elif re.search(
+        r"Structural Damage\s*(?:[:\-]\s*Yes|Reported|Present|Detected|Confirmed)",
+        text,
+        flags=re.IGNORECASE,
+    ):
         parsed["structural_damage"] = True
 
     if re.search(r"No Prior\s+Paint", text, flags=re.IGNORECASE):
@@ -689,9 +699,21 @@ def _parse_manheim_insightcr(report_text: str) -> dict[str, Any]:
     if title_fields.get("Title Branding"):
         parsed["title_branding"] = title_fields["Title Branding"][0]
 
+    # Same defensive narrowing as _parse_generic_condition_report. The
+    # hash-route CR flow for insightcr.manheim.com listings sometimes
+    # captures the OVE detail page (parent doc) instead of the Manheim
+    # iframe content — that page has a UI section labeled "Structural
+    # Damage" with the value rendered in a sibling span. Without an
+    # explicit positive marker in the regex, the bare label false-flags
+    # clean vehicles. Real damaged InsightCR text contains a verb/value
+    # ("Yes" / "Reported" / "Present" / etc.) alongside the heading.
     if re.search(r"No Structural Damage", text, flags=re.IGNORECASE):
         parsed["structural_damage"] = False
-    elif re.search(r"Structural Damage", text, flags=re.IGNORECASE):
+    elif re.search(
+        r"Structural Damage\s*(?:[:\-]\s*Yes|Reported|Present|Detected|Confirmed)",
+        text,
+        flags=re.IGNORECASE,
+    ):
         parsed["structural_damage"] = True
 
     if re.search(r"No Prior\s+Paint", text, flags=re.IGNORECASE):

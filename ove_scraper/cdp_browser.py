@@ -845,9 +845,17 @@ class PlaywrightCdpBrowserSession:
                 },
             )
             condition_report = build_condition_report(snapshot, condition_report_link)
+            # Only feed CR popup body text into the structured CR parser. The
+            # OVE detail page (payload.body_text) contains UI section labels
+            # like "Structural Damage" / "Title Status" that the generic
+            # parser regexes match as if they were CR field values, producing
+            # false positives (e.g. cr.structural_damage=True from a listing
+            # page that has no actual damage data). When the CR popup capture
+            # fails, raw_text MUST be None so the structured parser exits
+            # early instead of guessing fields from the wrong source.
             condition_report = normalize_condition_report(
                 condition_report,
-                raw_text=report_page_text or payload.get("body_text"),
+                raw_text=report_page_text,
                 report_link=condition_report_link,
                 listing_json=listing_json,
             )

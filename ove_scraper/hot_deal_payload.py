@@ -100,22 +100,32 @@ def _coerce_int(value: Any) -> int | None:
 def _extract_mmr(listing_json: dict[str, Any]) -> float | None:
     """Extract a single MMR value from the OVE listing JSON.
 
-    OVE exposes MMR as a ``priceRange`` object with ``adjustedLow`` and
-    ``adjustedHigh`` keys. The "MMR value" displayed in OVE's UI is the
-    high end of that range — that's the conservative wholesale value
-    typical buyers reference. Falls back to a flat ``mmrValue`` field
-    on listings that omit the priceRange.
+    OVE listings come in two schema variants depending on auction type:
+
+      - Some listings expose ``priceRange.adjustedHigh`` / ``adjustedLow``
+        (the band Manheim renders in OVE's UI).
+      - Most current listings expose ``mmrPrice`` (and the alias
+        ``averageMMRValuation``) as a flat numeric field, with
+        ``aboveMmr`` / ``belowMmr`` for the band edges.
+
+    Verified 2026-04-26 across 99 hot_deal listings: 0/99 had
+    ``priceRange``; 99/99 had ``mmrPrice`` and ``averageMMRValuation``.
+    Without the flat fallbacks, every VIN was skipped at batch build
+    time and the VPS push silently sent nothing.
     """
     pr = listing_json.get("priceRange") or {}
     if isinstance(pr, dict):
         high = _coerce_float(pr.get("adjustedHigh"))
         if high is not None:
             return high
-        # Fallback to midpoint if only adjustedLow present
         low = _coerce_float(pr.get("adjustedLow"))
         if low is not None:
             return low
-    return _coerce_float(listing_json.get("mmrValue") or listing_json.get("mmr"))
+    for key in ("mmrPrice", "averageMMRValuation", "mmrValue", "mmr"):
+        value = _coerce_float(listing_json.get(key))
+        if value is not None and value > 0:
+            return value
+    return None
 
 
 def _extract_asking_price(listing_json: dict[str, Any], vin_row: dict[str, Any]) -> float | None:
