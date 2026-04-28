@@ -578,12 +578,26 @@ def _heartbeat_ticker(settings: Settings, logger) -> None:
     on a closed connection. The standalone client is cheap (one POST
     every 30s) and immune to the main-loop rebuild cycle.
     """
+    # Long-lived httpx.Client instead of module-level httpx.post() per call.
+    # Module-level httpx.post() creates a fresh Client per invocation, and
+    # httpx >= 0.28 on Python 3.12 Windows has a known interaction with
+    # anyio's backend detection: each fresh Client briefly probes for an
+    # async backend, which in some configurations installs transient
+    # asyncio policy state that bleeds across threads. Over time, this
+    # poisons the main thread's asyncio detection so Playwright's sync
+    # API refuses to run with "Sync API inside the asyncio loop". A
+    # single reused Client (this thread's only client) avoids the per-
+    # tick probe entirely. See 2026-04-28 incident report.
     import httpx as _httpx
 
     logger.info("Heartbeat ticker started (interval=%ss)", _HEARTBEAT_INTERVAL_SECONDS)
     base_url = settings.vch_api_base_url.rstrip("/")
     headers = {"X-Service-Token": settings.vch_service_token, "Content-Type": "application/json"}
     endpoint = f"{base_url}/inventory/ove/scraper-heartbeat"
+
+    # Single Client for the lifetime of the ticker thread. Closed in the
+    # finally so a clean shutdown drops the connection pool gracefully.
+    client = _httpx.Client(timeout=10.0)
 
     def _tick(note_override: str | None = None) -> None:
         body: dict[str, Any] = {
@@ -598,15 +612,21 @@ def _heartbeat_ticker(settings: Settings, logger) -> None:
                 body[key] = val
         body["status_note"] = note_override or _HEARTBEAT_STATE.get("status_note") or "ticker"
         try:
-            resp = _httpx.post(endpoint, json=body, headers=headers, timeout=10.0)
+            resp = client.post(endpoint, json=body, headers=headers)
             if resp.status_code >= 400:
                 logger.debug("Heartbeat tick returned %s", resp.status_code)
         except Exception as exc:
             logger.debug("Heartbeat tick failed: %s", exc)
 
-    _tick(note_override="ticker_boot")
-    while not SHUTDOWN_EVENT.wait(timeout=_HEARTBEAT_INTERVAL_SECONDS):
-        _tick()
+    try:
+        _tick(note_override="ticker_boot")
+        while not SHUTDOWN_EVENT.wait(timeout=_HEARTBEAT_INTERVAL_SECONDS):
+            _tick()
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
     logger.info("Heartbeat ticker exiting on shutdown event")
 
 

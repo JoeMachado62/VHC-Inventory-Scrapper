@@ -899,6 +899,20 @@ class PlaywrightCdpBrowserSession:
                 self._browser = None
 
         if self._playwright is None:
+            # Defense (2026-04-28): clear any stray asyncio state on this
+            # thread BEFORE starting Playwright. Playwright's sync API
+            # checks `asyncio.events._get_running_loop()` and refuses if
+            # one is set. Some HTTP libraries (httpx 0.28 + anyio on
+            # Python 3.12 Windows in particular) can leave a transient
+            # event-loop reference attached to the calling thread, which
+            # gets misclassified as "Sync API inside the asyncio loop".
+            # Forcing the running-loop slot to None here makes Playwright
+            # see a clean state regardless of upstream pollution.
+            try:
+                import asyncio as _asyncio
+                _asyncio.events._set_running_loop(None)
+            except Exception:
+                pass
             self._playwright = sync_playwright().start()
 
         try:
