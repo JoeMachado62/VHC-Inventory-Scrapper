@@ -14,6 +14,7 @@ from urllib.error import URLError
 from urllib.request import urlopen
 from zoneinfo import ZoneInfo
 
+from dataclasses import dataclass
 from ove_scraper.automation_lock import AutomationLockBusyError, OveAutomationLock, lock_name_for_port
 from ove_scraper.browser import BrowserSessionError, SavedSearchPageEmpty
 from ove_scraper.api_client import VCHApiClient
@@ -25,6 +26,65 @@ from ove_scraper.logging_utils import configure_logging
 from ove_scraper.notifier import AdminNotifier
 from ove_scraper.schemas import PendingDetailRequest
 from ove_scraper.sync_service import HourlySyncRunner
+
+
+# ---------------------------------------------------------------------------
+# Chrome instance descriptors — Path 2 / two-Chrome architecture (2026-04-28)
+# ---------------------------------------------------------------------------
+#
+# Each Chrome instance the scraper drives has THREE coupled identifiers:
+#   - the CDP debug port (9222 primary, 9223 secondary sync)
+#   - the user-data-dir on disk (different profile state per instance)
+#   - the launcher PS1 script that spawns it with the right flags
+#
+# Before the two-Chrome architecture there was implicitly only one Chrome,
+# so all three identifiers were hardcoded into the recovery code paths
+# (_kill_stale_chrome, launch_browser_script, _clear_chrome_cookies).
+#
+# When the sync workflow moved to a second Chrome (Login B on port 9223
+# with the C:\Users\joema\AppData\Local\ove_sync profile), the recovery
+# code kept killing/relaunching the PRIMARY Chrome on every sync failure
+# — leaving Login B's broken session untouched while repeatedly thrashing
+# Login A's session for an issue that had nothing to do with it. The
+# observable symptom: Login A's Chrome window count grew during a Login
+# B auth-failure cycle, while Login B stayed stuck.
+#
+# ChromeInstance bundles the three identifiers so every recovery callsite
+# can route to the correct Chrome by Settings.chrome_debug_port.
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+
+
+@dataclass(frozen=True, slots=True)
+class ChromeInstance:
+    port: int
+    profile_path: Path
+    launcher_script: Path  # absolute path to the .ps1 launcher
+
+
+PRIMARY_CHROME = ChromeInstance(
+    port=9222,
+    profile_path=Path("C:/chrome-cdp-profile"),
+    launcher_script=_SCRIPTS_DIR / "start_ove_browser.ps1",
+)
+
+SYNC_CHROME = ChromeInstance(
+    port=9223,
+    profile_path=Path("C:/Users/joema/AppData/Local/ove_sync"),
+    launcher_script=_SCRIPTS_DIR / "start_ove_browser_sync.ps1",
+)
+
+
+def chrome_for_port(port: int) -> ChromeInstance:
+    """Return the ChromeInstance descriptor for a given debug port.
+
+    Defaults to PRIMARY_CHROME for unknown ports — including the legacy
+    single-Chrome case where chrome_debug_port_sync is 0/unset and all
+    code paths see the primary's port.
+    """
+    if port == SYNC_CHROME.port:
+        return SYNC_CHROME
+    return PRIMARY_CHROME
 
 EASTERN_TZ = ZoneInfo("America/New_York")
 
@@ -617,9 +677,16 @@ def ensure_browser_session(settings: Settings, browser, logger, notifier: AdminN
 
 
 def recover_browser_session(settings: Settings, browser, logger, notifier: AdminNotifier | None = None) -> None:
+    """Recover the SPECIFIC Chrome session this `settings` describes.
+
+    Routes by `settings.chrome_debug_port` so a sync-side recovery
+    (Login B on 9223) doesn't kill/relaunch the primary Chrome (Login A
+    on 9222) it has nothing to do with — the bug fixed 2026-04-28.
+    """
+    chrome = chrome_for_port(settings.chrome_debug_port)
     browser.close()
-    _kill_stale_chrome(settings, logger)
-    launch_browser_script(logger)
+    _kill_stale_chrome(chrome, logger)
+    launch_browser_script(chrome, logger)
     wait_for_cdp(settings, logger, timeout_seconds=45)
     try:
         browser.ensure_session()
@@ -637,14 +704,24 @@ def recover_browser_session(settings: Settings, browser, logger, notifier: Admin
         raise
 
 
-def _kill_stale_chrome(settings: Settings, logger) -> None:
-    """Kill any Chrome process using the CDP profile that is no longer
-    listening on the debug port. Belt-and-suspenders with the TCP check
-    in start_ove_browser.ps1 — this Python-side kill runs BEFORE the
-    PS1 script so the script's 'existing process' check sees a clean
-    state. Failures here are non-fatal; the PS1 script's own check is
-    the fallback.
+def _kill_stale_chrome(chrome: ChromeInstance, logger) -> None:
+    """Kill any Chrome process using THIS instance's debug port + profile.
+
+    Belt-and-suspenders with the TCP check in the launcher PS1 — this
+    Python-side kill runs BEFORE the PS1 script so the script's
+    'existing process' check sees a clean state. Failures here are
+    non-fatal; the PS1 script's own check is the fallback.
+
+    Caller passes a ChromeInstance so this filter targets the right
+    Chrome. Killing the wrong Chrome (e.g. killing the primary when the
+    sync browser is the one in trouble) was the root cause of the
+    multi-window thrashing observed 2026-04-28.
     """
+    # Backslashes need doubling for PowerShell's wildcard match. The
+    # profile path is rendered as a Windows path here so the
+    # CommandLine match against Chrome's --user-data-dir argument lines
+    # up character-for-character.
+    profile_str = str(chrome.profile_path).replace("/", "\\")
     try:
         result = subprocess.run(
             [
@@ -653,21 +730,24 @@ def _kill_stale_chrome(settings: Settings, logger) -> None:
                 (
                     "Get-CimInstance Win32_Process | "
                     "Where-Object { $_.Name -eq 'chrome.exe' -and "
-                    "$_.CommandLine -like '*--remote-debugging-port=9222*' -and "
-                    "$_.CommandLine -like '*chrome-cdp-profile*' } | "
+                    f"$_.CommandLine -like '*--remote-debugging-port={chrome.port}*' -and "
+                    f"$_.CommandLine -like '*{profile_str}*' " + "} | "
                     "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
                 ),
             ],
             capture_output=True,
             timeout=15,
         )
-        logger.info("Killed stale Chrome CDP processes (exit=%s)", result.returncode)
+        logger.info(
+            "Killed stale Chrome CDP processes (port=%d, exit=%s)",
+            chrome.port, result.returncode,
+        )
         time.sleep(2)
     except Exception as exc:
-        logger.warning("Failed to kill stale Chrome processes: %s", exc)
-
-
-_CHROME_CDP_PROFILE = Path("C:/chrome-cdp-profile")
+        logger.warning(
+            "Failed to kill stale Chrome processes for port %d: %s",
+            chrome.port, exc,
+        )
 
 
 def _clear_chrome_cookies(settings: Settings, browser, logger) -> None:
@@ -677,14 +757,16 @@ def _clear_chrome_cookies(settings: Settings, browser, logger) -> None:
 
     Called when OVE shows 'No Saved Searches' — the session cookie looks
     valid to OVE's page shell (no login redirect) but the backend token
-    is stale, so it silently returns zero searches.
+    is stale, so it silently returns zero searches. Routes by
+    settings.chrome_debug_port so the right Chrome's cookies get wiped.
     """
+    chrome = chrome_for_port(settings.chrome_debug_port)
     browser.close()
-    _kill_stale_chrome(settings, logger)
+    _kill_stale_chrome(chrome, logger)
 
     cookie_files = [
-        _CHROME_CDP_PROFILE / "Default" / "Network" / "Cookies",
-        _CHROME_CDP_PROFILE / "Default" / "Network" / "Cookies-journal",
+        chrome.profile_path / "Default" / "Network" / "Cookies",
+        chrome.profile_path / "Default" / "Network" / "Cookies-journal",
     ]
     for path in cookie_files:
         try:
@@ -695,19 +777,27 @@ def _clear_chrome_cookies(settings: Settings, browser, logger) -> None:
             logger.warning("Failed to delete cookie file %s: %s", path, exc)
 
 
-def launch_browser_script(logger) -> None:
-    script_path = Path(__file__).resolve().parent.parent / "scripts" / "start_ove_browser.ps1"
-    if not script_path.exists():
-        raise BrowserSessionError(f"Browser launcher script not found: {script_path}")
+def launch_browser_script(chrome: ChromeInstance, logger) -> None:
+    """Invoke THIS Chrome instance's launcher PS1.
 
-    logger.info("Launching OVE browser via %s", script_path)
+    Caller passes a ChromeInstance so primary/secondary recovery routes
+    to the correct launcher. Pre-2026-04-28 this was hardcoded to
+    start_ove_browser.ps1 and Sync-Chrome failures triggered Primary-
+    Chrome relaunches (the multi-window leak).
+    """
+    if not chrome.launcher_script.exists():
+        raise BrowserSessionError(
+            f"Browser launcher script not found: {chrome.launcher_script}"
+        )
+
+    logger.info("Launching OVE browser via %s", chrome.launcher_script)
     subprocess.run(
         [
             "powershell",
             "-ExecutionPolicy",
             "Bypass",
             "-File",
-            str(script_path),
+            str(chrome.launcher_script),
         ],
         check=True,
     )
