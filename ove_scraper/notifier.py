@@ -31,9 +31,27 @@ class AdminNotifier:
         self._last_sent_by_key: dict[str, float] = {}
 
     def notify_browser_auth_lost(self, *, reason: str, context: dict[str, Any] | None = None, logger=None) -> bool:
-        subject = "OVE scraper login required"
+        # Path 2 / two-Chrome architecture (2026-04-28): the alert subject
+        # and dedupe key now disambiguate which Chrome lost its session.
+        # Pre-fix the subject was "OVE scraper login required" with no
+        # indication of which login — the user couldn't tell whether to
+        # re-auth Login A (port 9222, hot-deal/deep-scrape) or Login B
+        # (port 9223, sync). Subject now reads e.g.
+        # "OVE scraper login required: Login A (port 9222)".
+        port = (context or {}).get("chrome_debug_port")
+        if port == 9223:
+            login_label = "Login B (port 9223, sync)"
+            cooldown_key = "browser-auth-lost:9223"
+        elif port == 9222:
+            login_label = "Login A (port 9222, hot-deal/deep-scrape)"
+            cooldown_key = "browser-auth-lost:9222"
+        else:
+            login_label = f"Chrome on port {port}" if port else "OVE Chrome session"
+            cooldown_key = f"browser-auth-lost:{port or 'unknown'}"
+
+        subject = f"OVE scraper login required: {login_label}"
         body_lines = [
-            "The OVE scraper lost its authenticated browser session and could not recover automatically.",
+            f"The {login_label} lost its authenticated browser session and could not recover automatically.",
             "",
             f"Reason: {reason}",
         ]
@@ -41,9 +59,12 @@ class AdminNotifier:
             body_lines.append("")
             body_lines.extend(f"{key}: {value}" for key, value in context.items())
         body_lines.append("")
-        body_lines.append("Action required: log back into the dedicated OVE Chrome session.")
+        body_lines.append(
+            f"Action required: switch to the {login_label} Chrome window "
+            "and log back into OVE manually. Other Chrome sessions are unaffected."
+        )
         return self._send_with_cooldown(
-            key="browser-auth-lost",
+            key=cooldown_key,
             subject=subject,
             body="\n".join(body_lines),
             logger=logger,

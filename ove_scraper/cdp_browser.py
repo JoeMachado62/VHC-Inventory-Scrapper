@@ -2405,33 +2405,50 @@ class PlaywrightCdpBrowserSession:
         raise BrowserSessionError(f"Timed out waiting for VIN {vin} search results")
 
     def _prepare_vin_search_page(self, page: Page) -> Page:
-        if self._is_login_page(page):
-            raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
-
-        candidate_urls = [
-            self._vin_results_url(),
-            f"{self.settings.ove_base_url}/buy#/",
-            self.settings.ove_listings_url,
-            self.settings.ove_base_url,
-        ]
-        tried: set[str] = set()
-        for url in candidate_urls:
-            if not url or url in tried:
-                continue
-            tried.add(url)
-            page.goto(url, wait_until="domcontentloaded")
-            page.wait_for_timeout(2500)
+        # Tab-leak fix (2026-04-28): the original loop fell through to a
+        # bare `raise` at the bottom without closing `page` if every
+        # candidate URL failed to render the search input. Each failure
+        # left the worker page navigated to one of the candidate URLs
+        # (most often `/buy#/`), so a sustained auth-failure storm
+        # accumulated `/buy#/` tabs in the visible Chrome window. We now
+        # close the page on the failure path before re-raising so the
+        # caller doesn't have to reason about page ownership across
+        # exception boundaries.
+        try:
             if self._is_login_page(page):
                 raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
-            try:
-                self._find_vin_search_input(page)
-                if url == self._vin_results_url():
-                    self._clear_active_search_filters(page)
-                LOGGER.info("Prepared OVE VIN search page at %s", page.url)
-                return page
-            except BrowserSessionError:
-                continue
-        raise BrowserSessionError("Unable to locate the OVE VIN search input")
+
+            candidate_urls = [
+                self._vin_results_url(),
+                f"{self.settings.ove_base_url}/buy#/",
+                self.settings.ove_listings_url,
+                self.settings.ove_base_url,
+            ]
+            tried: set[str] = set()
+            for url in candidate_urls:
+                if not url or url in tried:
+                    continue
+                tried.add(url)
+                page.goto(url, wait_until="domcontentloaded")
+                page.wait_for_timeout(2500)
+                if self._is_login_page(page):
+                    raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
+                try:
+                    self._find_vin_search_input(page)
+                    if url == self._vin_results_url():
+                        self._clear_active_search_filters(page)
+                    LOGGER.info("Prepared OVE VIN search page at %s", page.url)
+                    return page
+                except BrowserSessionError:
+                    continue
+            raise BrowserSessionError("Unable to locate the OVE VIN search input")
+        except BaseException:
+            # Catch BaseException (not just Exception) so we still close
+            # the leaked page even on KeyboardInterrupt / SystemExit
+            # during recovery storms. The page is fresh-allocated by the
+            # caller per call, so closing it here is always safe.
+            self._close_page(page)
+            raise
 
     def _wait_for_search_submission(self, page: Page, vin: str, start_url: str, timeout_seconds: int = 8) -> bool:
         deadline = time.monotonic() + timeout_seconds
@@ -3026,7 +3043,19 @@ class PlaywrightCdpBrowserSession:
         # mmsc400.manheim.com. Returns the new Page on success. On failure
         # we close the page and return None so the lease queue retries via
         # the standard /fail flow.
+        #
+        # Tab-leak fix (2026-04-28): the previous version called
+        # _close_page() in the except branch but BEFORE the
+        # artifact_dir.mkdir/write block. If artifact_dir.mkdir raised
+        # (filesystem error, permission denied), the close would have
+        # run, but if anything between new_page() and the close raised
+        # while page was already assigned... actually the existing flow
+        # is mostly OK. The real protection is to use try/finally so
+        # the close ALWAYS runs on the failure path regardless of what
+        # comes after, and to set `page = None` once we want to hand it
+        # off so the finally can tell success from failure.
         page: Page | None = None
+        success = False
         try:
             page = context.new_page()
             LOGGER.info("Opening CR via direct goto: %s", href)
@@ -3043,11 +3072,10 @@ class PlaywrightCdpBrowserSession:
             # _capture_condition_report_page will catch it post-snapshot
             # and route the request via /fail with auth_expired. We do NOT
             # silently swallow that case here.
+            success = True
             return page
         except Exception as exc:
             LOGGER.warning("Direct-goto CR open failed for %s: %s", href, exc)
-            if page is not None:
-                self._close_page(page)
             try:
                 artifact_dir.mkdir(parents=True, exist_ok=True)
                 (artifact_dir / "cr-direct-goto-failed.txt").write_text(
@@ -3056,6 +3084,11 @@ class PlaywrightCdpBrowserSession:
             except Exception:
                 pass
             return None
+        finally:
+            # Always close the page on the failure path, no matter how we
+            # got there (catch handler, BaseException, etc.).
+            if not success and page is not None:
+                self._close_page(page)
 
     # Regex extracting the VIN segment from an OVE detail URL like
     # https://www.ove.com/search/results#/details/{VIN}/OVE  — used by

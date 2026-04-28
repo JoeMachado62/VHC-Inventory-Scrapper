@@ -668,11 +668,47 @@ def run_browser_operation(
         return None
 
 
+def _is_process_state_error(exc: BaseException) -> bool:
+    """Return True if `exc` describes a Python-process-state issue rather
+    than a real OVE browser problem.
+
+    The big example (2026-04-28): Playwright's sync API raises
+    "It looks like you are using Playwright Sync API inside the asyncio
+    loop" once SOMETHING in the process has started an asyncio event
+    loop (typically a background thread spawned by an HTTP client
+    library after the hot-deal pipeline runs). The error keeps firing
+    on every subsequent Playwright sync call because the loop persists
+    in the process; killing/relaunching Chrome can't fix it. Treating
+    this as "auth lost" produced the false-positive email storm and
+    the visible Chrome-tab accumulation from the recovery cycle.
+
+    For these errors, the right move is to let the launcher restart
+    the Python process (which clears the polluted asyncio state) — NOT
+    to thrash Chrome.
+    """
+    msg = str(exc)
+    return (
+        "Playwright Sync API inside the asyncio loop" in msg
+        or "Sync API inside the asyncio loop" in msg
+    )
+
+
 def ensure_browser_session(settings: Settings, browser, logger, notifier: AdminNotifier | None = None) -> None:
     try:
         browser.ensure_session()
     except BrowserSessionError as exc:
         logger.warning("OVE browser session unavailable: %s", exc)
+        if _is_process_state_error(exc):
+            # Process is contaminated — Chrome is fine, Python is not.
+            # Re-raise so the main loop's auth-failure circuit breaker
+            # ticks down and the launcher restarts Python with a fresh
+            # asyncio state. Do NOT touch Chrome.
+            logger.error(
+                "Process-state failure (asyncio/Playwright conflict); not "
+                "touching Chrome — exiting so launcher can restart Python."
+            )
+            SHUTDOWN_EVENT.set()
+            raise
         recover_browser_session(settings, browser, logger, notifier=notifier)
 
 
@@ -682,7 +718,14 @@ def recover_browser_session(settings: Settings, browser, logger, notifier: Admin
     Routes by `settings.chrome_debug_port` so a sync-side recovery
     (Login B on 9223) doesn't kill/relaunch the primary Chrome (Login A
     on 9222) it has nothing to do with — the bug fixed 2026-04-28.
+
+    Skips the Chrome kill/relaunch dance when the underlying error is a
+    Python-process-state issue (e.g. polluted asyncio loop). In that
+    case Chrome is healthy and recovery would just thrash tabs.
     """
+    # Same guard at the recover entry — _clear_chrome_cookies path
+    # leads here too and we don't want to kill/relaunch on a
+    # process-state error from there either.
     chrome = chrome_for_port(settings.chrome_debug_port)
     browser.close()
     _kill_stale_chrome(chrome, logger)
@@ -691,6 +734,16 @@ def recover_browser_session(settings: Settings, browser, logger, notifier: Admin
     try:
         browser.ensure_session()
     except BrowserSessionError as exc:
+        if _is_process_state_error(exc):
+            # Don't fire the auth-lost alert for this — Chrome is fine,
+            # Python is the problem. Set shutdown so launcher restarts.
+            logger.error(
+                "Recovery hit process-state failure (asyncio/Playwright "
+                "conflict); not alerting on auth and exiting for clean "
+                "Python restart."
+            )
+            SHUTDOWN_EVENT.set()
+            raise
         if notifier is not None:
             notifier.notify_browser_auth_lost(
                 reason=str(exc),
