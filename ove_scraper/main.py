@@ -831,14 +831,26 @@ def _is_process_state_error(exc: BaseException) -> bool:
     this as "auth lost" produced the false-positive email storm and
     the visible Chrome-tab accumulation from the recovery cycle.
 
-    For these errors, the right move is to let the launcher restart
-    the Python process (which clears the polluted asyncio state) — NOT
-    to thrash Chrome.
+    Second observed variant (2026-04-29 post-power-outage): the same
+    underlying asyncio-state pollution can surface as a different
+    Playwright error message — "got Future <Future pending> attached
+    to a different loop" — when a coroutine future is awaited on a
+    loop that no longer matches the running thread's recorded loop.
+    Same root cause, same correct response: let the launcher restart
+    Python with clean asyncio state. Adding the "attached to a
+    different loop" string here ensures these errors take the same
+    safe-exit path instead of being misclassified as auth failure
+    (the misclassification on 2026-04-29 contributed to the Login B
+    Chrome relaunch storm that preceded the Manheim account lockout).
+
+    For all matched errors, the right move is to let the launcher
+    restart the Python process — NOT to thrash Chrome.
     """
     msg = str(exc)
     return (
         "Playwright Sync API inside the asyncio loop" in msg
         or "Sync API inside the asyncio loop" in msg
+        or "attached to a different loop" in msg
     )
 
 

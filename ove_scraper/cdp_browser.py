@@ -1098,30 +1098,42 @@ class PlaywrightCdpBrowserSession:
     )
 
     def sweep_orphan_tabs(self) -> int:
-        """Close every orphan auth / login tab in the connected Chrome.
+        """Close every orphan auth / login / stray-blank tab in the
+        connected Chrome.
 
         Belt-and-suspenders defense (Fix B, 2026-04-28): the only
-        guaranteed way to prevent auth-tab pile-ups across multiple
-        leak paths is to actively sweep them. Per-call leak fixes have
-        been made four times and each missed a different code path.
-        This sweeper does NOT trust per-operation cleanup: it walks
-        every page in every context and closes the ones whose URLs
-        match _ORPHAN_TAB_URL_PATTERNS.
+        guaranteed way to prevent tab pile-ups across multiple leak
+        paths is to actively sweep them. Per-call leak fixes have been
+        made four times and each missed a different code path. This
+        sweeper does NOT trust per-operation cleanup: it walks every
+        page in every context and closes:
+
+          1. Tabs whose URL matches _ORPHAN_TAB_URL_PATTERNS (auth /
+             login / signin endpoints) — always safe to close.
+          2. Stray `about:blank` tabs, BUT ONLY when the same context
+             also contains at least one OVE page (e.g. an active worker
+             or seed tab). The "OVE page exists" gate is what makes
+             this safe: during launcher boot the only tab is about:blank
+             and we MUST NOT close it (or Python would have nothing to
+             navigate). Once Python has navigated about:blank to OVE,
+             a separate stray about:blank is a leak — usually from
+             Chrome's "Continue where you left off" session-restore
+             reopening tabs after an unclean shutdown (the 2026-04-29
+             post-power-outage observation). Closing it doesn't break
+             the seed.
 
         Safe to call from any context (keepalive tick, post-recovery,
-        between operations) because:
-          - It only closes pages matching the orphan URL patterns,
-            never the canonical OVE pages or in-use worker pages
-            (worker pages stay on www.ove.com URLs).
+        between operations):
           - Failures inside the sweep are swallowed — the sweep is a
-            safety net, not a critical-path operation. A close error
-            on one tab doesn't prevent closing the rest.
-          - Counts and logs what it closed so operator can monitor
+            safety net, not a critical-path operation.
+          - Per-context decisions: OVE-tab gating is evaluated against
+            each context's pages independently, so a non-OVE context
+            (rare) won't lose its only blank tab.
+          - Counts and logs what it closed so the operator can see
             whether the sweep is doing real work.
 
-        Returns the number of pages closed. Returns 0 silently if the
-        browser handle isn't connected; the next operation will
-        reconnect.
+        Returns the total number of pages closed. Returns 0 silently
+        if the browser handle isn't connected.
         """
         if self._browser is None:
             return 0
@@ -1131,11 +1143,30 @@ class PlaywrightCdpBrowserSession:
         except Exception as exc:
             LOGGER.debug("sweep_orphan_tabs: failed to enumerate contexts: %s", exc)
             return 0
+        ove_base_url_lower = (self.settings.ove_base_url or "").lower()
         for context in contexts:
             try:
                 pages = list(context.pages)
             except Exception:
                 continue
+
+            # Gate for the about:blank rule: only sweep stray blank
+            # tabs when at least one OVE tab exists in this context.
+            # This snapshot is computed BEFORE we close anything; we
+            # don't want to flip the gate mid-loop by closing the only
+            # OVE tab.
+            has_ove_tab = False
+            for page in pages:
+                try:
+                    if page.is_closed():
+                        continue
+                    page_url = (page.url or "").lower()
+                except Exception:
+                    continue
+                if ove_base_url_lower and ove_base_url_lower in page_url:
+                    has_ove_tab = True
+                    break
+
             for page in pages:
                 try:
                     if page.is_closed():
@@ -1145,17 +1176,24 @@ class PlaywrightCdpBrowserSession:
                     continue
                 if not url:
                     continue
-                if not any(pattern in url for pattern in self._ORPHAN_TAB_URL_PATTERNS):
+                close_reason: str | None = None
+                if any(pattern in url for pattern in self._ORPHAN_TAB_URL_PATTERNS):
+                    close_reason = "auth orphan"
+                elif has_ove_tab and url in ("about:blank", ""):
+                    # url == "" handled above by `if not url: continue`,
+                    # so this branch only fires for literal about:blank.
+                    close_reason = "stray about:blank (OVE seed exists)"
+                if close_reason is None:
                     continue
                 LOGGER.warning(
-                    "sweep_orphan_tabs: closing orphan auth tab url=%s",
-                    page.url,
+                    "sweep_orphan_tabs: closing %s tab url=%s",
+                    close_reason, page.url,
                 )
                 self._close_page(page)
                 closed += 1
         if closed:
             LOGGER.warning(
-                "sweep_orphan_tabs: closed %d orphan auth tab(s) on port %d",
+                "sweep_orphan_tabs: closed %d orphan tab(s) on port %d",
                 closed, self.settings.chrome_debug_port,
             )
         return closed
