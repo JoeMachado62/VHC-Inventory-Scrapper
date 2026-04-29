@@ -3,7 +3,12 @@ $ErrorActionPreference = "Stop"
 $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
 $profilePath = "C:\chrome-cdp-profile"
 $debugPort = 9222
-$oveUrl = "https://www.ove.com/buy#/"
+# 2026-04-28 hardening: launch Chrome with about:blank instead of the OVE
+# URL. Pre-fix, every Chrome relaunch loaded ove.com/buy#/ which redirects
+# to Manheim auth — and Chrome's password manager auto-fill could submit
+# credentials before Python even attached. Now Python explicitly navigates
+# to OVE on its own schedule, gated by the disk-backed auth lockout.
+$oveUrl = "about:blank"
 
 if (-not (Test-Path $chromePath)) {
     throw "Chrome not found at $chromePath"
@@ -61,8 +66,21 @@ if (-not $existing) {
             if ($prefsJson.profile) {
                 $prefsJson.profile.exit_type = "Normal"
                 $prefsJson.profile.exited_cleanly = $true
-                $prefsJson | ConvertTo-Json -Depth 100 -Compress | Set-Content $prefsPath -Encoding UTF8
             }
+            # 2026-04-28 hardening: disable Chrome's auto-sign-in feature
+            # so the password manager fills the login form but does NOT
+            # automatically submit it. Pre-fix, a stale-session redirect
+            # to Manheim auth could cause Chrome to auto-submit before
+            # Python attached, racing the disk-backed lockout. With
+            # auto-sign-in disabled, the only path that submits is the
+            # explicit Python click in _try_single_shot_login_click —
+            # which IS gated by the lockout.
+            if (-not $prefsJson.credentials_enable_autosignin -or $prefsJson.credentials_enable_autosignin -ne $false) {
+                # Add or overwrite. ConvertFrom-Json returns a PSCustomObject;
+                # use Add-Member to set the property idempotently.
+                $prefsJson | Add-Member -NotePropertyName credentials_enable_autosignin -NotePropertyValue $false -Force
+            }
+            $prefsJson | ConvertTo-Json -Depth 100 -Compress | Set-Content $prefsPath -Encoding UTF8
         } catch {
             Write-Host "Could not patch Chrome Preferences: $_"
         }

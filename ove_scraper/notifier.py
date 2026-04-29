@@ -70,6 +70,68 @@ class AdminNotifier:
             logger=logger,
         )
 
+    def notify_manheim_account_locked(
+        self,
+        *,
+        port: int | None = None,
+        reason: str,
+        logger=None,
+    ) -> bool:
+        """Alert when Manheim's account-locked page has been detected.
+
+        This is the most severe auth-state alert we send. Triggers a
+        long disk-backed cooldown across the whole scraper deployment
+        (default 6 hours). Email uses the standard cooldown; the disk
+        lockout prevents subsequent detections from re-firing the
+        alert during the lockout window anyway.
+        """
+        if port == 9223:
+            login_label = "Login B (port 9223, sync)"
+            cooldown_key = "manheim-account-locked:9223"
+        elif port == 9222:
+            login_label = "Login A (port 9222, hot-deal/deep-scrape)"
+            cooldown_key = "manheim-account-locked:9222"
+        else:
+            login_label = f"Chrome on port {port}" if port else "OVE Chrome"
+            cooldown_key = f"manheim-account-locked:{port or 'unknown'}"
+
+        subject = f"MANHEIM ACCOUNT LOCKED: {login_label}"
+        body_lines = [
+            f"Manheim has locked the account on {login_label}. The scraper has",
+            "detected the account-locked error page and recorded a 6-hour cooldown",
+            "in state/auth_lockout.json. Every Python process will refuse to attempt",
+            "auth interaction until the cooldown expires OR you run the manual unlock",
+            "command (see below).",
+            "",
+            "Detected text head:",
+            f"  {reason}",
+            "",
+            "WHAT THIS MEANS:",
+            "  Something — the scraper, an external tool, or you — submitted enough",
+            "  bad / repeated auth attempts that Manheim invoked a lockout. While",
+            "  the lockout is active, ANY new login attempt risks extending it,",
+            "  so the safe move is: do nothing for several hours.",
+            "",
+            "WHAT TO DO:",
+            "  1. DO NOT log into OVE in any Chrome window for at least an hour.",
+            "  2. After waiting, manually log into OVE in a regular Chrome window",
+            "     (not the scraper profile) to confirm Manheim has lifted the lock.",
+            "  3. Once confirmed, log into the scraper profile with Remember Me",
+            "     checked.",
+            "  4. Run: python -m ove_scraper.main unlock",
+            "  5. THEN restart the scraper.",
+            "",
+            "If two account-locks land within 24 hours, the scraper escalates to",
+            "manual-unlock-required mode and won't auto-clear even after the",
+            "cooldown expires. Run the unlock command above to clear it.",
+        ]
+        return self._send_with_cooldown(
+            key=cooldown_key,
+            subject=subject,
+            body="\n".join(body_lines),
+            logger=logger,
+        )
+
     def notify_credentials_not_saved(
         self,
         *,

@@ -15,6 +15,7 @@ from urllib.request import urlopen
 from zoneinfo import ZoneInfo
 
 from dataclasses import dataclass
+from ove_scraper import auth_lockout
 from ove_scraper.automation_lock import AutomationLockBusyError, OveAutomationLock, lock_name_for_port
 from ove_scraper.browser import BrowserSessionError, SavedSearchPageEmpty
 from ove_scraper.api_client import VCHApiClient
@@ -26,6 +27,14 @@ from ove_scraper.logging_utils import configure_logging
 from ove_scraper.notifier import AdminNotifier
 from ove_scraper.schemas import PendingDetailRequest
 from ove_scraper.sync_service import HourlySyncRunner
+
+# Exit code emitted when the scraper is starting up while a disk-backed
+# auth lockout is in effect. Distinct from 0 (clean shutdown) and 1
+# (crash) so the launcher PowerShell script can detect it and refuse
+# to restart Python until the lockout clears. This is the linchpin of
+# the cross-process lockout: without it, the launcher's `while ($true)`
+# loop would respawn Python and burn another login click attempt.
+EXIT_CODE_AUTH_LOCKOUT_ACTIVE = 99
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +171,19 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("sync-once")
     subparsers.add_parser("poll-once")
     subparsers.add_parser("run")
+    subparsers.add_parser(
+        "unlock",
+        help=(
+            "Clear the disk-backed auth lockout state at "
+            "state/auth_lockout.json. Use after Manheim has lifted an "
+            "account lock and you have manually re-authed Chrome. "
+            "Without this, every Python process refuses auth attempts."
+        ),
+    )
+    subparsers.add_parser(
+        "lockout-status",
+        help="Print the current auth-lockout state and exit.",
+    )
     scrape_vin = subparsers.add_parser("scrape-vin")
     scrape_vin.add_argument("vin")
     scrape_vin.add_argument("--output", default="")
@@ -196,6 +218,52 @@ def main() -> None:
     settings = Settings.from_env()
     logger = configure_logging(settings.log_level, settings.log_file_path)
     _install_signal_handlers(logger)
+
+    # Admin commands that operate on the lockout state directly. These
+    # must run BEFORE build_runtime so they're usable even when the
+    # browser session can't be constructed (e.g. Chrome isn't running).
+    if args.command == "unlock":
+        auth_lockout.unlock(settings.artifact_dir)
+        print(f"Auth lockout cleared. State: {auth_lockout.describe_state(settings.artifact_dir)}")
+        print(
+            "REMINDER: confirm Manheim has lifted any account lock on their side "
+            "before restarting the scraper, or you'll trigger another lockout."
+        )
+        return
+
+    if args.command == "lockout-status":
+        print(auth_lockout.describe_state(settings.artifact_dir))
+        return
+
+    # Cross-process auth lockout gate (2026-04-28 hardening). Every
+    # operational command (run, sync-once, poll-once, scrape-vin,
+    # hot-deal*) must check the disk-backed lockout state at startup
+    # and refuse to run if blocked. Exiting with EXIT_CODE_AUTH_LOCKOUT_ACTIVE
+    # signals the launcher PowerShell to NOT respawn Python — which
+    # is the only way to break the launcher's `while ($true)` loop
+    # from inside Python without killing the whole supervision tree.
+    #
+    # We do this BEFORE build_runtime() so we don't waste time
+    # connecting to Chrome only to refuse work.
+    operational_commands = {"run", "sync-once", "poll-once", "scrape-vin", "hot-deal", "hot-deal-reprocess"}
+    if args.command in operational_commands:
+        lockout_state = auth_lockout.get_state(settings.artifact_dir)
+        if lockout_state.blocked:
+            logger.error(
+                "STARTUP BLOCKED by auth lockout: %s",
+                lockout_state.reason,
+            )
+            logger.error(
+                "Lockout state file: %s",
+                settings.artifact_dir / "_state" / "auth_lockout.json",
+            )
+            logger.error(
+                "To clear manually after Manheim has lifted any account lock: "
+                "python -m ove_scraper.main unlock"
+            )
+            print(f"BLOCKED: {lockout_state.reason}")
+            raise SystemExit(EXIT_CODE_AUTH_LOCKOUT_ACTIVE)
+
     browser, api_client, sync_runner, deep_scrape_worker, notifier = build_runtime(settings, logger)
 
     try:
@@ -804,6 +872,24 @@ def recover_browser_session(settings: Settings, browser, logger, notifier: Admin
     Python-process-state issue (e.g. polluted asyncio loop). In that
     case Chrome is healthy and recovery would just thrash tabs.
     """
+    # Auth-lockout gate (2026-04-28 hardening): if the disk-backed
+    # lockout is active, refuse to relaunch Chrome. Relaunching opens
+    # a fresh Chrome window pointed at OVE; if Chrome's password
+    # manager auto-fills+submits, that's another login attempt against
+    # an already-locked account, which extends the lockout. Raising
+    # BrowserSessionError sends control back to the main loop which
+    # backs off and eventually exits via the auth-fail park threshold
+    # — clean, no Chrome thrashing.
+    lockout_state = auth_lockout.get_state(settings.artifact_dir)
+    if lockout_state.blocked:
+        logger.error(
+            "recover_browser_session REFUSED by auth lockout: %s",
+            lockout_state.reason,
+        )
+        raise BrowserSessionError(
+            f"Browser recovery skipped — auth lockout active: {lockout_state.reason}"
+        )
+
     # Same guard at the recover entry — _clear_chrome_cookies path
     # leads here too and we don't want to kill/relaunch on a
     # process-state error from there either.

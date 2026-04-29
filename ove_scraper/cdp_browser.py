@@ -19,6 +19,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
+from ove_scraper import auth_lockout
 from ove_scraper.browser import (
     BrowserSessionError,
     ConditionReportClickFailedError,
@@ -407,11 +408,62 @@ class PlaywrightCdpBrowserSession:
                 "A process restart is required to try again."
             )
             return False
+
+        # Cross-process lockout check (2026-04-28 hardening): the
+        # in-process single-shot flag above is reset every time the
+        # launcher loop respawns Python, which is how 12-360
+        # login-click attempts per hour became possible during a
+        # sustained auth failure. The disk-backed lockout is the
+        # belt-and-suspenders defense: a click ledger written to
+        # state/auth_lockout.json that survives process restarts and
+        # rate-limits clicks across the entire scraper deployment.
+        # Refusing here is the safest possible behavior — at worst
+        # we leave the scraper unable to auto-recover and the
+        # operator must log in manually, which is FINE compared to
+        # triggering another Manheim account lock.
+        try:
+            lockout_state = auth_lockout.get_state(self.settings.artifact_dir)
+        except Exception as exc:
+            LOGGER.warning("Auth-lockout state read failed (treating as unblocked): %s", exc)
+            lockout_state = None
+        if lockout_state is not None and lockout_state.blocked:
+            LOGGER.error(
+                "Auto-login click REFUSED by disk-backed lockout: %s",
+                lockout_state.reason,
+            )
+            # Do NOT mark the in-process flag here. We didn't actually
+            # click; the lockout will be re-checked on the next legitimate
+            # call (e.g. after the lockout expires) and the click can
+            # proceed then. Marking would waste the in-process budget
+            # for no reason.
+            return False
+
         # Mark FIRST — before we even try — so that any exception during
         # the click still counts as a consumed attempt. This matches the
         # spirit of "single-shot" strictly: one chance to recover, not
         # one successful click.
         type(self)._auto_login_attempted_this_process = True
+
+        # Record the click attempt in the cross-process ledger BEFORE
+        # the actual click. If the ledger write fails we still proceed
+        # (don't let an I/O hiccup block the click), but log loudly so
+        # the operator knows the rate-limit safety net is degraded.
+        try:
+            post_record_state = auth_lockout.record_login_click(self.settings.artifact_dir)
+            if post_record_state.blocked:
+                LOGGER.error(
+                    "Auto-login click REFUSED post-record (rate limit just tripped): %s",
+                    post_record_state.reason,
+                )
+                # The ledger now shows we attempted; future calls will
+                # see the rate-limit cooldown until it expires.
+                return False
+        except Exception as ledger_exc:
+            LOGGER.error(
+                "Auth-lockout ledger write FAILED — proceeding without rate-limit "
+                "protection (this is dangerous; check disk permissions): %s",
+                ledger_exc,
+            )
 
         try:
             filled = page.evaluate(
@@ -483,6 +535,46 @@ class PlaywrightCdpBrowserSession:
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
             try:
+                # Account-locked detection (2026-04-28): if the page
+                # rendered Manheim's account-locked error page after
+                # our click, we have triggered a lockout (or one was
+                # already in effect). Record it in the disk-backed
+                # state so EVERY future Python process refuses to
+                # click again until the cooldown expires. This is the
+                # hardest stop we have against re-locking the account.
+                if self._is_manheim_account_locked_page(page):
+                    page_text_head = ""
+                    try:
+                        page_text_head = (page.evaluate(
+                            "() => (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 500)"
+                        ) or "").strip()
+                    except Exception:
+                        pass
+                    LOGGER.error(
+                        "MANHEIM ACCOUNT LOCKED detected after auto-login click. url=%s text_head=%r",
+                        page.url, page_text_head,
+                    )
+                    try:
+                        auth_lockout.record_manheim_account_locked(
+                            self.settings.artifact_dir,
+                            reason=(
+                                f"detected on port {self.settings.chrome_debug_port} "
+                                f"after auto-login click; first 500 chars of page: "
+                                f"{page_text_head}"
+                            ),
+                        )
+                    except Exception as record_exc:
+                        LOGGER.error("Failed to record account-lock in lockout state: %s", record_exc)
+                    if self._notifier is not None:
+                        try:
+                            self._notifier.notify_manheim_account_locked(
+                                port=self.settings.chrome_debug_port,
+                                reason=page_text_head or "Manheim account-locked page detected after auto-login click",
+                                logger=LOGGER,
+                            )
+                        except Exception as alert_exc:
+                            LOGGER.warning("Failed to fire account-locked alert: %s", alert_exc)
+                    return False
                 if not self._is_login_page(page):
                     LOGGER.info(
                         "Auto-login succeeded: page left the login screen (url=%s)",
@@ -3595,6 +3687,51 @@ class PlaywrightCdpBrowserSession:
             title = ""
         if title == "sign in" or title == "log in" or title == "login":
             return True
+        return False
+
+    # Phrases Manheim uses on its account-locked / too-many-attempts
+    # error pages. Conservative: must match one of the strong phrases
+    # OR (the word "locked" AND the word "account") to avoid false
+    # positives on unrelated pages that happen to mention "locked".
+    _MANHEIM_ACCOUNT_LOCKED_STRONG_PHRASES: tuple[str, ...] = (
+        "your account has been locked",
+        "your account is locked",
+        "account has been temporarily locked",
+        "account is temporarily locked",
+        "too many failed login attempts",
+        "too many login attempts",
+        "too many sign in attempts",
+        "too many sign-in attempts",
+        "your account is currently locked",
+    )
+
+    def _is_manheim_account_locked_page(self, page: Page) -> bool:
+        """Detect Manheim's account-locked error page so the scraper
+        can record a long cooldown and stop attempting auth.
+
+        Conservative on purpose: a false positive sets a 6-hour
+        cooldown, which is annoying but recoverable; a false negative
+        means we keep trying and trigger an actual Manheim lockout,
+        which is much worse. Match strong phrases first; fall back to
+        ('locked' AND 'account') only inside a narrow head-of-page
+        window to limit scope."""
+        try:
+            text = page.evaluate(
+                "() => (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase()"
+            )
+        except Exception:
+            return False
+        if not isinstance(text, str):
+            return False
+        head = text[:3000]
+        for phrase in self._MANHEIM_ACCOUNT_LOCKED_STRONG_PHRASES:
+            if phrase in head:
+                return True
+        # Fuzzier conservative match: 'locked' and 'account' AND one of
+        # the lockout-context cues, all near the top of the page.
+        if "locked" in head and "account" in head:
+            if any(cue in head for cue in ("contact", "support", "try again later", "try later", "wait")):
+                return True
         return False
 
     def _is_cr_unavailable_page(self, page: Page) -> bool:
