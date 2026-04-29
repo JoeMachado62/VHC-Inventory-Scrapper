@@ -322,9 +322,37 @@ class DeepScrapeWorker:
                             "request_id": request.request_id,
                             "vin": request.vin,
                             "error_category": error_category,
+                            "chrome_debug_port": self.settings.chrome_debug_port,
                         },
                         logger=self.logger,
                     )
+                # Fix A (2026-04-28): for auth_expired, RE-RAISE after
+                # terminaling the request so run_browser_operation in
+                # main.py triggers recover_browser_session — which kills
+                # and relaunches Chrome, wiping any orphan auth tabs
+                # that accumulated during the failure cascade.
+                #
+                # Without this re-raise, BrowserSessionError gets fully
+                # consumed here: the request is terminaled on VPS, the
+                # email fires, this method returns request.vin, and the
+                # poll loop continues to the next VIN on the SAME stale
+                # Chrome with the SAME orphan tabs. Multiplied across
+                # N VINs in the queue, this is the volume driver of
+                # the 29-tab incident (2026-04-28).
+                #
+                # Only auth_expired escalates to Chrome restart. Other
+                # categories (not_found, browser_error, page_structure_changed)
+                # don't benefit from the heavy-handed kill+relaunch and
+                # would just cause unnecessary thrashing.
+                #
+                # The terminal call above already informed the VPS, so
+                # nothing is lost by abandoning the rest of the batch:
+                # this request will not be re-claimed; other in-flight
+                # leases will expire on the VPS-side timeout (default
+                # 900s) and be re-claimable from the freshly-recovered
+                # Chrome.
+                if error_category == "auth_expired":
+                    raise
                 return request.vin
             retry_after_seconds = self.settings.deep_scrape_retry_delay_seconds
             self._fail_claimed_request(

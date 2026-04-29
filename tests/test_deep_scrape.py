@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
 from ove_scraper.api_client import ApiClientError
 from ove_scraper.browser import (
     BrowserSessionError,
@@ -283,7 +285,13 @@ def test_conditionreport_click_failed_error_terminals_immediately_as_auth_expire
     the VPS re-queueing the request and spawning orphan tabs on every
     attempt. After the fix: one attempt, straight to /terminal with
     reason=max_attempts_exceeded, and the operator is notified so they
-    can re-login Chrome."""
+    can re-login Chrome.
+
+    Updated 2026-04-28 (Fix A): the worker now ALSO re-raises
+    BrowserSessionError after terminaling so run_browser_operation
+    triggers recover_browser_session — the only thing that wipes
+    accumulated orphan auth tabs. The terminal call, notifier alert,
+    and re-raise happen in that order on the same code path."""
     request = make_request("ZFF96NMA4N0272307", request_id="ferrari-req")
     settings = Settings(
         vch_api_base_url="https://example.com/v1",
@@ -304,9 +312,13 @@ def test_conditionreport_click_failed_error_terminals_immediately_as_auth_expire
         notifier=notifier,
     )
 
-    processed = worker.process_pending_once()
+    # Fix A: auth_expired re-raises after terminaling. The terminal
+    # call AND the notifier alert still happen — they precede the raise
+    # — but the worker now propagates the exception so the outer
+    # run_browser_operation triggers Chrome kill+relaunch.
+    with pytest.raises(ConditionReportClickFailedError):
+        worker.process_pending_once()
 
-    assert processed == ["ZFF96NMA4N0272307"]
     assert browser.calls == 1
     assert api_client.terminals == [("ferrari-req", settings.detail_worker_id, "max_attempts_exceeded")]
     assert api_client.failures == []  # no /fail call — we skipped straight to /terminal

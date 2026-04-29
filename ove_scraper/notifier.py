@@ -70,6 +70,61 @@ class AdminNotifier:
             logger=logger,
         )
 
+    def notify_credentials_not_saved(
+        self,
+        *,
+        port: int | None = None,
+        logger=None,
+    ) -> bool:
+        """Alert when Chrome's password manager has no saved OVE credentials.
+
+        This state makes auto-recovery permanently impossible: the
+        single-shot login click in PlaywrightCdpBrowserSession requires
+        Chrome to pre-fill the password field, and an empty field means
+        the operator has not checked "Remember Me" on the OVE login form.
+        Without that, every auth-failure cascade leaks orphan tabs and
+        the only recovery is manual login — exactly the failure mode
+        observed 2026-04-28 (29+ accumulated auth tabs).
+
+        Distinct subject + cooldown key from notify_browser_auth_lost so
+        this state can't be hidden by an in-progress auth-lost cooldown.
+        """
+        if port == 9223:
+            login_label = "Login B (port 9223, sync)"
+            cooldown_key = "credentials-not-saved:9223"
+        elif port == 9222:
+            login_label = "Login A (port 9222, hot-deal/deep-scrape)"
+            cooldown_key = "credentials-not-saved:9222"
+        else:
+            login_label = f"Chrome on port {port}" if port else "OVE Chrome"
+            cooldown_key = f"credentials-not-saved:{port or 'unknown'}"
+
+        subject = f"OVE auto-recovery DISABLED: {login_label} has no saved credentials"
+        body_lines = [
+            f"The {login_label} Chrome profile does NOT have saved credentials in its",
+            "password manager. This means the scraper's auto-recovery (single-shot",
+            "Sign-In click) cannot run — when auth expires, the only recovery is",
+            "manual login.",
+            "",
+            "Symptom this prevents: auth-failure storms accumulating dozens of",
+            "auth.manheim.com tabs in Chrome until the profile is manually re-authed.",
+            "",
+            "Action required:",
+            f"  1. Switch to the {login_label} Chrome window.",
+            "  2. Log out, then log back in to OVE.",
+            "  3. CHECK THE 'Remember Me' BOX on the login form before submitting.",
+            "  4. Confirm the password row appears in chrome://password-manager/passwords.",
+            "",
+            "Until this is resolved, any auth failure on this Chrome will require",
+            "manual re-login, and the orphan-tab sweeper will be doing the cleanup.",
+        ]
+        return self._send_with_cooldown(
+            key=cooldown_key,
+            subject=subject,
+            body="\n".join(body_lines),
+            logger=logger,
+        )
+
     def notify_snapshot_safety_gate_blocked(
         self,
         *,

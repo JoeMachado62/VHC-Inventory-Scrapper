@@ -339,6 +339,8 @@ def main() -> None:
                         break
 
                     if now >= next_keepalive_at:
+                        # Login A keepalive (port 9222 in two-Chrome mode,
+                        # the only Chrome in single-Chrome mode).
                         run_browser_operation(
                             settings,
                             browser,
@@ -347,6 +349,56 @@ def main() -> None:
                             "browser keepalive",
                             notifier=notifier,
                         )
+                        # Fix C (2026-04-28): symmetric keepalive for
+                        # Login B. Pre-fix, Login B's session was only
+                        # touched during the hourly sync, so an hour of
+                        # idle time was enough for OVE to expire it —
+                        # which guaranteed the next sync hit a stale
+                        # session and triggered an auth-failure cascade.
+                        # Now Login B gets the same 5-minute touch as
+                        # Login A. Guard against the single-Chrome case
+                        # (sync_runner.browser IS browser) so we don't
+                        # double-touch.
+                        if (
+                            sync_runner is not None
+                            and sync_runner.browser is not browser
+                        ):
+                            run_browser_operation(
+                                sync_runner.settings,
+                                sync_runner.browser,
+                                logger,
+                                sync_runner.browser.touch_session,
+                                "browser keepalive (sync)",
+                                notifier=notifier,
+                                lock_name=lock_name_for_port(
+                                    sync_runner.settings.chrome_debug_port
+                                ),
+                            )
+                        # Fix B (2026-04-28): orphan-tab sweeper. Defense
+                        # in depth against any leak path we haven't
+                        # plugged: enumerate every page on each Chrome
+                        # and close the ones whose URL matches the auth
+                        # / login / signin patterns — i.e. tabs the
+                        # scraper spawned during a CR click but failed
+                        # to close. Runs after the touch_session calls
+                        # so any legitimate auth-redirect tabs that
+                        # touch_session itself opened (single-shot
+                        # sign-in click flow) have been resolved.
+                        sweep_targets = [browser]
+                        if (
+                            sync_runner is not None
+                            and sync_runner.browser is not browser
+                        ):
+                            sweep_targets.append(sync_runner.browser)
+                        for _b in sweep_targets:
+                            try:
+                                if hasattr(_b, "sweep_orphan_tabs"):
+                                    _b.sweep_orphan_tabs()
+                            except Exception as sweep_exc:
+                                logger.warning(
+                                    "Orphan-tab sweep raised (non-fatal): %s",
+                                    sweep_exc,
+                                )
                         next_keepalive_at = now + settings.browser_keepalive_interval_seconds
 
                     if SHUTDOWN_EVENT.is_set():
@@ -500,6 +552,15 @@ def build_runtime(settings: Settings, logger):
 
     deep_scrape_worker = DeepScrapeWorker(api_client, primary_browser, logger, settings, notifier=notifier)
     logger.info("Configured deep-scrape worker pool size: %s", settings.deep_scrape_max_workers)
+    # Wire the notifier into BOTH browser sessions so the recovery path
+    # can fire alerts about states only it can observe — specifically
+    # the credentials-not-saved state detected by the single-shot login
+    # click (Fix D, 2026-04-28). Without this the alert can only fire
+    # if the caller explicitly threads a notifier through every recovery
+    # call site, which the prior code did not do consistently.
+    for _b in (primary_browser, sync_browser):
+        if _b is not None and hasattr(_b, "set_notifier"):
+            _b.set_notifier(notifier)
     # Tuple is intentionally backwards-compatible — same arity as before.
     # `sync_browser` is reachable via sync_runner.browser; callers that
     # need to drive sync recovery use the runner, not the raw browser.

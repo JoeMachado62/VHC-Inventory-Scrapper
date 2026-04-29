@@ -340,6 +340,20 @@ class PlaywrightCdpBrowserSession:
         self.settings = settings
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
+        # Optional admin notifier wired in by build_runtime (main.py) after
+        # construction. Used to fire distinct-subject alerts from deep
+        # in the recovery path — e.g. when Chrome's password manager has
+        # no saved credentials and auto-recovery is therefore disabled.
+        # None in unit tests / standalone usage; gated everywhere by
+        # `if self._notifier is not None`.
+        self._notifier: Any = None
+
+    def set_notifier(self, notifier: Any) -> None:
+        """Attach an AdminNotifier so the recovery path can fire alerts
+        about states the caller can't observe (e.g. credentials-not-saved
+        detected during a single-shot login click). Safe to call multiple
+        times; the most recent notifier wins."""
+        self._notifier = notifier
 
     def close(self) -> None:
         if self._playwright is not None:
@@ -417,6 +431,25 @@ class PlaywrightCdpBrowserSession:
                 "Auto-login skipped: password field is empty — Chrome's saved "
                 "credentials are not available. Operator must log in manually."
             )
+            # Loud-failure alert (Fix D, 2026-04-28): empty password field
+            # means Chrome has no saved credentials, which permanently
+            # disables auto-recovery for the lifetime of this profile.
+            # Without this alert the operator only sees per-VIN auth_lost
+            # emails that don't say "your auto-recovery is broken at the
+            # root" — exactly the failure mode that produced the 29-tab
+            # auth-storm incident. Notifier has its own cooldown so this
+            # cannot spam.
+            if self._notifier is not None:
+                try:
+                    self._notifier.notify_credentials_not_saved(
+                        port=self.settings.chrome_debug_port,
+                        logger=LOGGER,
+                    )
+                except Exception as alert_exc:
+                    LOGGER.warning(
+                        "Failed to fire credentials-not-saved alert: %s",
+                        alert_exc,
+                    )
             return False
 
         submit_locators = [
@@ -957,6 +990,83 @@ class PlaywrightCdpBrowserSession:
                 page.close()
         except Exception:
             pass
+
+    # URL fragments that identify a tab as an orphaned auth/recovery
+    # popup the scraper does NOT want to keep around. The sweeper closes
+    # any tab whose URL contains one of these. Match is case-insensitive.
+    # See sweep_orphan_tabs() for usage and the 2026-04-28 incident
+    # write-up for why this defense exists.
+    _ORPHAN_TAB_URL_PATTERNS: tuple[str, ...] = (
+        "auth.manheim.com",
+        "auth0.manheim.com",
+        "signin.manheim.com",
+        "/as/authorization",
+        "/as/login",
+        "accounts.manheim.com",
+    )
+
+    def sweep_orphan_tabs(self) -> int:
+        """Close every orphan auth / login tab in the connected Chrome.
+
+        Belt-and-suspenders defense (Fix B, 2026-04-28): the only
+        guaranteed way to prevent auth-tab pile-ups across multiple
+        leak paths is to actively sweep them. Per-call leak fixes have
+        been made four times and each missed a different code path.
+        This sweeper does NOT trust per-operation cleanup: it walks
+        every page in every context and closes the ones whose URLs
+        match _ORPHAN_TAB_URL_PATTERNS.
+
+        Safe to call from any context (keepalive tick, post-recovery,
+        between operations) because:
+          - It only closes pages matching the orphan URL patterns,
+            never the canonical OVE pages or in-use worker pages
+            (worker pages stay on www.ove.com URLs).
+          - Failures inside the sweep are swallowed — the sweep is a
+            safety net, not a critical-path operation. A close error
+            on one tab doesn't prevent closing the rest.
+          - Counts and logs what it closed so operator can monitor
+            whether the sweep is doing real work.
+
+        Returns the number of pages closed. Returns 0 silently if the
+        browser handle isn't connected; the next operation will
+        reconnect.
+        """
+        if self._browser is None:
+            return 0
+        closed = 0
+        try:
+            contexts = self._browser.contexts
+        except Exception as exc:
+            LOGGER.debug("sweep_orphan_tabs: failed to enumerate contexts: %s", exc)
+            return 0
+        for context in contexts:
+            try:
+                pages = list(context.pages)
+            except Exception:
+                continue
+            for page in pages:
+                try:
+                    if page.is_closed():
+                        continue
+                    url = (page.url or "").lower()
+                except Exception:
+                    continue
+                if not url:
+                    continue
+                if not any(pattern in url for pattern in self._ORPHAN_TAB_URL_PATTERNS):
+                    continue
+                LOGGER.warning(
+                    "sweep_orphan_tabs: closing orphan auth tab url=%s",
+                    page.url,
+                )
+                self._close_page(page)
+                closed += 1
+        if closed:
+            LOGGER.warning(
+                "sweep_orphan_tabs: closed %d orphan auth tab(s) on port %d",
+                closed, self.settings.chrome_debug_port,
+            )
+        return closed
 
     def _create_worker_page(self, context: BrowserContext, *, start_url: str | None = None) -> Page:
         page = context.new_page()
@@ -3389,6 +3499,19 @@ class PlaywrightCdpBrowserSession:
                         )
                         # Fresh slate for post-recovery attempt — old
                         # popups carry stale auth state.
+                        # Tab-leak fix (Fix E, 2026-04-28): the prior
+                        # version called .clear() WITHOUT closing the
+                        # popups first. The orphaned auth tabs persisted
+                        # in Chrome (no longer tracked, finally block
+                        # had nothing to close) and accumulated across
+                        # VINs — a contributor to the 29-tab incident.
+                        # Close every popup before dropping it from the
+                        # tracking list. claimed_page is None at this
+                        # point in the flow (we wouldn't be in the
+                        # except handler if a CR view had been claimed),
+                        # so no risk of closing the page we want to keep.
+                        for _stale_popup in collected_popups:
+                            self._close_page(_stale_popup)
                         collected_popups.clear()
                         source_page.wait_for_timeout(1500)
                         continue
