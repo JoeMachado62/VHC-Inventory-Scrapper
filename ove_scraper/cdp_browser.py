@@ -646,6 +646,36 @@ class PlaywrightCdpBrowserSession:
                         raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
             finally:
                 self._close_page(page)
+        except PlaywrightTimeoutError as exc:
+            # 2026-04-30 fix: a timeout during keepalive does NOT mean
+            # auth is lost or Chrome is broken. It just means OVE was
+            # slow for this one tick. Pre-fix this raised
+            # BrowserSessionError, which propagated to
+            # run_browser_operation, which called recover_browser_session
+            # — kill+relaunch Chrome — which created a fresh about:blank
+            # tab on every cycle. Login B exhibited this 6 times in 5
+            # minutes on 2026-04-30 (09:21–09:26 burst), producing the
+            # user-visible "about:blank tab opens over and over on
+            # Login B" symptom.
+            #
+            # The keepalive is a liveness probe, not a workload. The
+            # right behavior on a transient probe failure is to log and
+            # try again on the next 5-minute tick. If a real auth
+            # problem exists, the next REAL operation (hourly sync or
+            # per-VIN scrape) will hit it through a code path that has
+            # proper retry semantics and IS allowed to escalate to
+            # recovery.
+            #
+            # We deliberately do NOT reset self._browser here — the CDP
+            # connection itself wasn't broken, only the page load was
+            # slow. Resetting would force a needless reconnect on the
+            # next tick.
+            LOGGER.warning(
+                "Keepalive goto timed out (treating as transient, NOT escalating "
+                "to Chrome recovery): %s",
+                exc,
+            )
+            return
         except Exception as exc:
             self._browser = None
             raise BrowserSessionError(f"OVE browser keepalive failed: {exc}") from exc
