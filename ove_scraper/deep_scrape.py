@@ -10,6 +10,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from playwright.sync_api import (
+    Error as PlaywrightError,
+    TimeoutError as PlaywrightTimeoutError,
+)
+
 from ove_scraper.api_client import ApiClientError, VCHApiClient
 from ove_scraper.browser import (
     BrowserSession,
@@ -253,11 +258,24 @@ class DeepScrapeWorker:
                     retry_after_seconds=self.settings.deep_scrape_retry_delay_seconds,
                 )
                 return None
-        except (ApiClientError, BrowserSessionError, ValueError) as exc:
+        except (ApiClientError, BrowserSessionError, ValueError, PlaywrightError) as exc:
             # ManheimAuthRedirectError is a BrowserSessionError subclass and
             # is therefore caught here. _classify_failure routes it to
             # auth_expired which is the correct retry semantics per
             # SCRAPER_CONTRACT.md §5.1 (60s backoff after re-login).
+            #
+            # PlaywrightError added 2026-04-30 (Fix 1): the prior tuple
+            # missed Playwright's own exception classes
+            # (e.g. "Page.goto: Target page, context or browser has
+            # been closed"). Such exceptions leaked past the worker
+            # all the way to main.py's broad `except Exception` clause,
+            # which rebuilt the entire runtime — see the 22:12 incident
+            # walkthrough where one transient deep-scrape error caused
+            # an auth-recovery loop and Manheim SMS-challenged the
+            # account. PlaywrightError is the public base class; its
+            # subclass TimeoutError is also covered. _classify_failure
+            # routes Playwright errors via the explicit isinstance
+            # checks added below.
             if isinstance(exc, ApiClientError) and self._is_terminal_missing_vehicle_error(exc):
                 self._terminal_claimed_request(
                     api_client,
@@ -700,6 +718,26 @@ class DeepScrapeWorker:
             if "status 5" in lowered:
                 return "transient_network"
             return "transient_network"
+        # Playwright errors (Fix 1, 2026-04-30). PlaywrightTimeoutError
+        # is a subclass of PlaywrightError so the order matters here:
+        # check the more specific class first.
+        if isinstance(exc, PlaywrightTimeoutError):
+            return "transient_network"
+        if isinstance(exc, PlaywrightError):
+            # "Target page, context or browser has been closed" was the
+            # 2026-04-30 22:12 failure trigger. Treating as browser_error
+            # gets it into the standard /fail flow with retry_after_seconds,
+            # bounded by the per-category fail-streak cap.
+            if (
+                "target page" in lowered
+                or "frame was detached" in lowered
+                or "browser has been closed" in lowered
+                or "context or browser" in lowered
+            ):
+                return "browser_error"
+            if "net::err_" in lowered:
+                return "transient_network"
+            return "browser_error"
         if isinstance(exc, ValueError):
             return "page_structure_changed"
         return "transient_network"

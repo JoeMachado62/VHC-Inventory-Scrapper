@@ -270,7 +270,7 @@ class FakeLoginPage:
 
 def _reset_auto_login_flag() -> None:
     from ove_scraper.cdp_browser import PlaywrightCdpBrowserSession
-    PlaywrightCdpBrowserSession._auto_login_attempted_this_process = False
+    PlaywrightCdpBrowserSession._auto_login_last_attempt_at = None
 
 
 def test_single_shot_auto_login_clicks_and_returns_true_when_url_changes(tmp_path) -> None:
@@ -284,7 +284,9 @@ def test_single_shot_auto_login_clicks_and_returns_true_when_url_changes(tmp_pat
 
     assert session._try_single_shot_login_click(page) is True
     assert page._submit.clicks == 1
-    assert PlaywrightCdpBrowserSession._auto_login_attempted_this_process is True
+    # Timestamp is set after the click attempt, gating any subsequent
+    # call within the cooldown window.
+    assert PlaywrightCdpBrowserSession._auto_login_last_attempt_at is not None
 
 
 def test_single_shot_auto_login_does_not_click_if_password_not_prefilled(tmp_path) -> None:
@@ -297,15 +299,15 @@ def test_single_shot_auto_login_does_not_click_if_password_not_prefilled(tmp_pat
 
     assert session._try_single_shot_login_click(page) is False
     assert page._submit.clicks == 0
-    # The flag IS set — we used our one chance and found the
-    # precondition unmet. Operator must log in manually.
-    assert PlaywrightCdpBrowserSession._auto_login_attempted_this_process is True
+    # The timestamp IS set — we used our one chance per cooldown and
+    # found the precondition unmet. Operator must log in manually.
+    assert PlaywrightCdpBrowserSession._auto_login_last_attempt_at is not None
 
 
-def test_single_shot_auto_login_is_process_wide_single_shot(tmp_path) -> None:
+def test_single_shot_auto_login_is_single_shot_within_cooldown(tmp_path) -> None:
     """Regression guard against the Manheim account lock incident.
-    Even if the scraper tries multiple times to recover auth within
-    one Python process, we only ever click Sign In ONCE."""
+    Within the cooldown window, the scraper only ever clicks Sign In
+    ONCE — even if multiple subsystems hit the recovery helper."""
     _reset_auto_login_flag()
     session = PlaywrightCdpBrowserSession(make_settings(tmp_path))
     first_page = FakeLoginPage(
@@ -324,9 +326,47 @@ def test_single_shot_auto_login_is_process_wide_single_shot(tmp_path) -> None:
 
     assert first_result is True
     assert first_page._submit.clicks == 1
-    # Second call is blocked by the process-wide flag — no click attempted.
+    # Second call is blocked by the cooldown — no click attempted.
     assert second_result is False
     assert second_page._submit.clicks == 0
+
+
+def test_auto_login_allows_new_click_after_cooldown_elapsed(tmp_path) -> None:
+    """Fix 2 (2026-04-30): the timestamp-based cooldown replaces the
+    boolean flag so long-running processes can recover from rare
+    auth events. After the cooldown window elapses, a fresh click
+    is allowed (still rate-limited by the cross-process click
+    ledger)."""
+    from datetime import datetime, timedelta, timezone
+    from ove_scraper.cdp_browser import PlaywrightCdpBrowserSession
+
+    _reset_auto_login_flag()
+    session = PlaywrightCdpBrowserSession(make_settings(tmp_path))
+
+    first_page = FakeLoginPage(
+        url="https://login.example.com/as/authorization",
+        password_filled=True,
+        url_after_click="https://www.ove.com/buy#/",
+    )
+    assert session._try_single_shot_login_click(first_page) is True
+    assert first_page._submit.clicks == 1
+
+    # Move the timestamp backward beyond the cooldown so the next
+    # call is allowed. Real wall-clock waiting would make the test
+    # multi-hour; we instead manipulate the class state directly.
+    PlaywrightCdpBrowserSession._auto_login_last_attempt_at = (
+        datetime.now(timezone.utc)
+        - PlaywrightCdpBrowserSession._AUTO_LOGIN_COOLDOWN
+        - timedelta(seconds=1)
+    )
+
+    second_page = FakeLoginPage(
+        url="https://login.example.com/as/authorization",
+        password_filled=True,
+        url_after_click="https://www.ove.com/buy#/",
+    )
+    assert session._try_single_shot_login_click(second_page) is True
+    assert second_page._submit.clicks == 1
 
 
 def test_single_shot_auto_login_returns_false_if_still_on_login_after_click(tmp_path) -> None:

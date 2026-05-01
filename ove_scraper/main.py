@@ -119,6 +119,23 @@ _AUTH_FAIL_COUNT = 0
 _AUTH_FAIL_MAX_BACKOFF = 300          # 5 minutes cap
 _AUTH_FAIL_PARK_THRESHOLD = 5         # after 5 consecutive failures, park
 
+# Transient per-operation error counter (Fix 3, 2026-04-30). The main
+# loop's `except Exception` handler used to rebuild the entire runtime
+# on ANY non-BrowserSessionError exception. That was too broad — a
+# transient Page.goto error from one VIN's deep-scrape (e.g.
+# "Target page, context or browser has been closed") cascaded to a
+# full runtime rebuild → re-attach to OVE → got auth-redirected → the
+# auth-recovery loop tore through Chrome's session state and Manheim
+# SMS-challenged the account (the 2026-04-30 22:12 incident).
+#
+# The new behavior: classify the exception with
+# _is_transient_per_operation_error, and on transient ones just log
+# and continue without rebuilding. The counter below is the safety
+# escape hatch — if transient errors keep firing in a row, eventually
+# escalate to a real rebuild.
+_TRANSIENT_ERROR_COUNT = 0
+_TRANSIENT_ERROR_REBUILD_THRESHOLD = 10   # rebuild only after this many in a row
+
 # Shared mutable heartbeat state. The main loop updates these fields as
 # it observes new events (sync_ok, poll_ok, claim taken, etc); the
 # background heartbeat ticker reads them every 30s and POSTs them to
@@ -193,23 +210,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "One-shot recovery: reclassify prior step1_fail rows with scraper-error "
             "reasons back to 'scrape_failed' so the next Hot Deal run re-screens them. "
-            "Also re-screens any rows in the DB whose rejection predates the current "
-            "screener fixes."
+            "With --rescreen, also queues current Hot Deal rows for a full fresh "
+            "screen before the next VPS push."
         ),
     )
     reprocess.add_argument(
         "--rescreen",
         action="store_true",
         help=(
-            "Also re-run the screener against every current step1_fail VIN's cr_data "
-            "using today's screening logic; promote any that now pass back to pending."
+            "Queue current hot_deal rows for full fresh screening and re-run the "
+            "screener against every current step1_fail VIN's stored cr_data; promote "
+            "any fixed false positives back to pending."
         ),
     )
     return parser
 
 
 def main() -> None:
-    global _AUTH_FAIL_COUNT  # must appear before any assignment in this scope
+    global _AUTH_FAIL_COUNT, _TRANSIENT_ERROR_COUNT  # must appear before any assignment in this scope
     # Suppress Node.js deprecation warnings from Playwright
     os.environ["NODE_OPTIONS"] = "--no-deprecation"
 
@@ -364,6 +382,7 @@ def main() -> None:
                                 notifier=notifier,
                             )
                             _AUTH_FAIL_COUNT = 0  # reset circuit breaker on success
+                            _TRANSIENT_ERROR_COUNT = 0  # reset transient counter on success
                             if sync_result is not None and getattr(sync_result, "execution_status", None) == "Success":
                                 _HEARTBEAT_STATE["last_sync_at"] = _utc_now_iso()
                                 _HEARTBEAT_STATE["status_note"] = "snapshot_ok"
@@ -394,6 +413,7 @@ def main() -> None:
                             notifier=notifier,
                         )
                         _AUTH_FAIL_COUNT = 0  # reset circuit breaker on success
+                        _TRANSIENT_ERROR_COUNT = 0  # reset transient counter on success
                         _HEARTBEAT_STATE["last_poll_at"] = _utc_now_iso()
                         if isinstance(poll_result, list) and poll_result:
                             _HEARTBEAT_STATE["last_claim_at"] = _HEARTBEAT_STATE["last_poll_at"]
@@ -535,6 +555,48 @@ def main() -> None:
                     browser, api_client, sync_runner, deep_scrape_worker, notifier = build_runtime(settings, logger)
 
                 except Exception as exc:
+                    # Fix 3 (2026-04-30): the prior implementation
+                    # rebuilt the entire runtime on ANY non-
+                    # BrowserSessionError exception. That was too
+                    # broad: a single transient Page.goto error from
+                    # one VIN's deep-scrape (e.g. "Target page,
+                    # context or browser has been closed") cascaded
+                    # to a runtime rebuild → re-attach to OVE → got
+                    # auth-redirected → started the recovery loop
+                    # that ended with Manheim SMS-challenging the
+                    # account (the 22:12 incident).
+                    #
+                    # Now we classify the exception. Transient
+                    # per-operation errors get logged + continue
+                    # without rebuilding. The escape hatch is the
+                    # _TRANSIENT_ERROR_REBUILD_THRESHOLD counter:
+                    # if these keep firing in a row, eventually we
+                    # DO rebuild (something might genuinely be
+                    # broken).
+                    if _is_transient_per_operation_error(exc):
+                        _TRANSIENT_ERROR_COUNT += 1
+                        if _TRANSIENT_ERROR_COUNT < _TRANSIENT_ERROR_REBUILD_THRESHOLD:
+                            logger.warning(
+                                "Transient per-operation error #%d/%d (continuing without rebuild): %s",
+                                _TRANSIENT_ERROR_COUNT,
+                                _TRANSIENT_ERROR_REBUILD_THRESHOLD,
+                                exc,
+                            )
+                            # Brief pause so we don't pin CPU if the
+                            # error repeats instantly. SHUTDOWN_EVENT
+                            # check lets Ctrl+C/SIGTERM still wake us.
+                            if SHUTDOWN_EVENT.wait(timeout=5.0):
+                                break
+                            continue
+                        # Threshold tripped — fall through to
+                        # rebuild. Reset the counter so we don't
+                        # rebuild on every iteration after this.
+                        logger.error(
+                            "Transient errors hit %d in a row; escalating to runtime rebuild",
+                            _TRANSIENT_ERROR_COUNT,
+                        )
+                        _TRANSIENT_ERROR_COUNT = 0
+
                     logger.exception("OVE main loop crashed (non-auth); rebuilding runtime: %s", exc)
                     try:
                         api_client.close()
@@ -854,6 +916,46 @@ def _is_process_state_error(exc: BaseException) -> bool:
     )
 
 
+def _is_transient_per_operation_error(exc: BaseException) -> bool:
+    """Return True if `exc` describes a recoverable per-operation error
+    that should NOT trigger a full runtime rebuild.
+
+    Background (Fix 3, 2026-04-30): a transient Page.goto error from
+    one deep-scrape attempt at 22:12 caused the main loop's broad
+    `except Exception` clause to rebuild the entire runtime. The
+    rebuild re-attached to OVE, got auth-redirected, and started a
+    Chrome kill+relaunch loop that ended with Manheim SMS-challenging
+    the account. The triggering exception was just one transient
+    Playwright error — handling it locally would have avoided the
+    cascade entirely.
+
+    The Playwright errors below are common Chrome/network blips. They
+    don't indicate Chrome itself is broken or auth is lost; they
+    mean one operation needs to fail and be retried via the standard
+    /fail flow. The right response is log + continue, NOT a runtime
+    rebuild.
+
+    Process-state errors (asyncio loop pollution) are deliberately
+    NOT covered here — those are still classified by
+    _is_process_state_error and routed to a clean Python restart.
+    """
+    msg = str(exc)
+    # Common Chrome/Playwright transient signals.
+    transient_markers = (
+        "Target page, context or browser has been closed",
+        "Target page, context or browser",
+        "Frame was detached",
+        "Navigation interrupted",
+        "Page.goto: Timeout",
+        "net::ERR_",
+        "Protocol error",
+        "Browser has been closed",
+        "Connection closed while reading",
+        "WebSocket is not open",
+    )
+    return any(marker in msg for marker in transient_markers)
+
+
 def ensure_browser_session(settings: Settings, browser, logger, notifier: AdminNotifier | None = None) -> None:
     try:
         browser.ensure_session()
@@ -1121,7 +1223,12 @@ def run_hot_deal_reprocess(settings: Settings, logger, *, rescreen: bool) -> Non
        moved to status='scrape_failed'. The next normal Hot Deal run
        will reset those back to pending and re-screen them.
 
-    2. With --rescreen, every remaining step1_fail row whose cr_data
+    2. With --rescreen, every current status='hot_deal' row is moved
+       back to pending and its prior screen payloads are cleared, so
+       the next pipeline run performs a full fresh CR + AutoCheck +
+       web-search screen before the VPS batch push.
+
+    3. With --rescreen, every remaining step1_fail row whose cr_data
        was captured is re-run through the current screener. Rows that
        now pass are moved back to 'pending' so the next run re-screens
        them end-to-end (CR + AutoCheck + web search). Those that still
@@ -1131,16 +1238,24 @@ def run_hot_deal_reprocess(settings: Settings, logger, *, rescreen: bool) -> Non
     """
     from ove_scraper.hot_deal_db import (
         init_db,
+        reclassify_autocheck_capture_failures_as_scrape_failed,
         reclassify_scraper_failures_as_scrape_failed,
+        reset_hot_deals_to_pending_for_rescreen,
     )
 
     db_conn = init_db(settings.hot_deal_db_path)
     try:
         moved = reclassify_scraper_failures_as_scrape_failed(db_conn)
+        autocheck_moved = reclassify_autocheck_capture_failures_as_scrape_failed(db_conn)
         logger.info(
             "Hot Deal reprocess: %d scraper-failed VIN(s) moved to scrape_failed for retry",
             moved,
         )
+        if autocheck_moved:
+            logger.info(
+                "Hot Deal reprocess: %d AutoCheck capture-failure VIN(s) moved to scrape_failed for retry",
+                autocheck_moved,
+            )
 
         if not rescreen:
             logger.info(
@@ -1148,6 +1263,13 @@ def run_hot_deal_reprocess(settings: Settings, logger, *, rescreen: bool) -> Non
                 "Next daily run will re-screen them."
             )
             return
+
+        current_hot_deals_reset = reset_hot_deals_to_pending_for_rescreen(db_conn)
+        logger.info(
+            "Hot Deal reprocess (--rescreen): %d current Hot Deal VIN(s) queued "
+            "for a full fresh screen before the next VPS push",
+            current_hot_deals_reset,
+        )
 
         # --rescreen: re-run screener against stored cr_data for each
         # step1_fail row. Because the screener only needs
@@ -1211,7 +1333,7 @@ def run_hot_deal_reprocess(settings: Settings, logger, *, rescreen: bool) -> Non
         logger.info(
             "Next daily run will re-screen %d VIN(s). Tomorrow's 07:00 ET "
             "auto-run will pick these up automatically.",
-            moved + promoted,
+            moved + current_hot_deals_reset + promoted,
         )
     finally:
         db_conn.close()

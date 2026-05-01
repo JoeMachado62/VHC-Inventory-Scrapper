@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -322,20 +323,35 @@ DETAIL_EXTRACTION_SCRIPT = """
 
 
 class PlaywrightCdpBrowserSession:
-    # Process-wide single-shot flag for the auto-click login recovery.
-    # Set to True after the FIRST auto-click attempt (success OR failure)
-    # and never reset for the lifetime of this Python process. Rebuilding
-    # the PlaywrightCdpBrowserSession instance (main.py's auth-fail
-    # rebuild path) does NOT reset it because it's a class attribute.
+    # Process-wide timestamp of the most recent auto-click login
+    # recovery attempt (success OR failure). None means "never
+    # attempted in this process". Used together with
+    # _AUTO_LOGIN_COOLDOWN below to gate the next attempt.
     #
-    # Guardrail reason: the prior autonomous login feature (commit
+    # Guardrail history: the prior autonomous login feature (commit
     # 1f1d8ee, reverted in eaf37cf 2026-04-21) retried the login in a
-    # tight loop on failure and Manheim locked the OVE account. A
-    # process-wide single-shot limits us to exactly one click per
-    # scraper process — a restart is required to try again, which
-    # bounds total click volume to the scheduled-task restart budget
-    # (Count=3). Memory: feedback_ove_auto_login_account_lock.md.
-    _auto_login_attempted_this_process: bool = False
+    # tight loop on failure and Manheim locked the OVE account. The
+    # original fix was a hard "one click per Python process, ever"
+    # boolean flag. That worked for short-lived processes but failed
+    # for long-running ones: the 2026-04-30 22:12 incident saw a
+    # 30-hour-uptime process whose flag had been consumed earlier in
+    # its lifetime, leaving NO recovery path when a real auth event
+    # finally arrived. Manheim ended up SMS-challenging the account
+    # because the kill+relaunch loop tore through Chrome's session
+    # state with no auto-recovery available.
+    #
+    # Fix 2 (2026-04-30): replace the boolean with a timestamp +
+    # cooldown. After the cooldown window elapses, a new click is
+    # allowed. The cross-process click ledger
+    # (ove_scraper.auth_lockout) continues to enforce the absolute
+    # rate limits (3 clicks / 10 min, etc.), so this CANNOT create a
+    # click storm — at worst ~4 clicks per 24 hours.
+    #
+    # Cooldown choice: 6 hours. Aligns with the default Manheim
+    # account-lock cooldown so a process whose lockout just expired
+    # doesn't immediately attempt another click.
+    _auto_login_last_attempt_at: datetime | None = None
+    _AUTO_LOGIN_COOLDOWN: timedelta = timedelta(hours=6)
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -393,27 +409,53 @@ class PlaywrightCdpBrowserSession:
 
         Returns True if the page is no longer on the login screen after
         the click; False in every other case (not attempted because
-        fields aren't pre-filled, process-wide flag already set, click
+        fields aren't pre-filled, process-wide cooldown active, click
         failed, or we're still on login after waiting).
 
-        Never clicks more than once per Python process. Never types
-        credentials. Never retries. The prior revert (eaf37cf) was
-        because the reverted implementation retried on failure and
-        Manheim locked the OVE account — this version is single-shot by
-        construction. See feedback_ove_auto_login_account_lock.md.
-        """
-        if type(self)._auto_login_attempted_this_process:
-            LOGGER.info(
-                "Skipping auto-login click: already attempted once in this process. "
-                "A process restart is required to try again."
-            )
-            return False
+        Click rate limiting is layered:
 
-        # Cross-process lockout check (2026-04-28 hardening): the
-        # in-process single-shot flag above is reset every time the
-        # launcher loop respawns Python, which is how 12-360
-        # login-click attempts per hour became possible during a
-        # sustained auth failure. The disk-backed lockout is the
+          1. In-process timestamp + cooldown: at most one click per
+             cls._AUTO_LOGIN_COOLDOWN (default 6h) within a single
+             Python process. Replaces the original "one click ever per
+             process" boolean — see the 2026-04-30 22:12 incident
+             write-up for why a hard one-shot was too strict for
+             long-uptime processes.
+
+          2. Cross-process click ledger
+             (ove_scraper.auth_lockout.record_login_click): rate-
+             limits clicks across the entire scraper deployment
+             regardless of how many Python processes have come and
+             gone. 3 clicks / 10 min, 5 / 60 min, 8 / 4 h are the
+             current thresholds.
+
+          3. Manheim account-lock detection: if a previous click
+             produced an account-locked page, the lockout file is
+             set and this method refuses for the lockout duration.
+
+        Together these prevent the original tight-loop revert
+        (eaf37cf) and the long-uptime starvation (2026-04-30) from
+        recurring. Never types credentials.
+        """
+        # Layer 1: in-process cooldown. Check BEFORE consulting the
+        # disk-backed lockout because a No-op return is cheaper than
+        # an I/O read on the keepalive hot path.
+        last = type(self)._auto_login_last_attempt_at
+        if last is not None:
+            now = datetime.now(timezone.utc)
+            elapsed = now - last
+            cooldown = type(self)._AUTO_LOGIN_COOLDOWN
+            if elapsed < cooldown:
+                LOGGER.info(
+                    "Skipping auto-login click: last attempt %s ago (cooldown %s).",
+                    elapsed, cooldown,
+                )
+                return False
+
+        # Layer 2 + 3: cross-process lockout check. The in-process
+        # cooldown above is reset every time the launcher loop
+        # respawns Python, which is how 12-360 login-click attempts
+        # per hour became possible during a sustained auth failure
+        # (the 2026-04-28 incident). The disk-backed lockout is the
         # belt-and-suspenders defense: a click ledger written to
         # state/auth_lockout.json that survives process restarts and
         # rate-limits clicks across the entire scraper deployment.
@@ -431,18 +473,19 @@ class PlaywrightCdpBrowserSession:
                 "Auto-login click REFUSED by disk-backed lockout: %s",
                 lockout_state.reason,
             )
-            # Do NOT mark the in-process flag here. We didn't actually
-            # click; the lockout will be re-checked on the next legitimate
-            # call (e.g. after the lockout expires) and the click can
-            # proceed then. Marking would waste the in-process budget
-            # for no reason.
+            # Do NOT mark the in-process timestamp here. We didn't
+            # actually click; the lockout will be re-checked on the
+            # next legitimate call (e.g. after the lockout expires)
+            # and the click can proceed then. Marking would waste the
+            # in-process cooldown budget for no reason.
             return False
 
-        # Mark FIRST — before we even try — so that any exception during
-        # the click still counts as a consumed attempt. This matches the
-        # spirit of "single-shot" strictly: one chance to recover, not
-        # one successful click.
-        type(self)._auto_login_attempted_this_process = True
+        # Mark the timestamp FIRST — before we even try — so that any
+        # exception during the click still counts as a consumed
+        # attempt within the cooldown. This matches the spirit of
+        # "single-shot per cooldown" strictly: one chance to recover
+        # per window, not one successful click.
+        type(self)._auto_login_last_attempt_at = datetime.now(timezone.utc)
 
         # Record the click attempt in the cross-process ledger BEFORE
         # the actual click. If the ledger write fails we still proceed
@@ -1819,15 +1862,17 @@ class PlaywrightCdpBrowserSession:
         navigation landing on auth).
 
         This delegates to _try_single_shot_login_click, which already
-        enforces the single-shot-per-process constraint via the
-        _auto_login_attempted_this_process class flag. Per
-        feedback_ove_auto_login_account_lock.md, auto-login must never
-        retry in a tight loop — calling this from multiple sites is
-        SAFE because they all share that single flag: the first one
-        to reach the click consumes the only attempt, and every
-        subsequent call (including from a different subsystem) short-
-        circuits to False. Net click volume is still bounded to 1 per
-        Python process, exactly as the revert memory requires.
+        enforces a process-wide click cooldown via the
+        _auto_login_last_attempt_at timestamp + _AUTO_LOGIN_COOLDOWN
+        (default 6h). Per feedback_ove_auto_login_account_lock.md,
+        auto-login must never retry in a tight loop — calling this
+        from multiple sites is SAFE because they all share that
+        timestamp: the first one to reach the click consumes the
+        cooldown window, and every subsequent call (including from a
+        different subsystem) short-circuits to False until the
+        cooldown elapses. The cross-process click ledger
+        (auth_lockout) provides a second rate-limit layer so even
+        process restarts cannot create a click storm.
 
         Returns True iff the page is no longer on the auth screen
         after the click. Authorized caller behavior: on True, re-check
@@ -3615,9 +3660,10 @@ class PlaywrightCdpBrowserSession:
                     # Manheim auth form, so a single click on Sign In
                     # is usually enough to restore SSO. The recovery
                     # helper is gated by the process-wide
-                    # _auto_login_attempted_this_process flag, so this
-                    # shares its one-attempt-per-process budget with
-                    # startup/keepalive/AutoCheck paths. No tight-loop
+                    # _auto_login_last_attempt_at timestamp + 6h cooldown
+                    # (Fix 2, 2026-04-30), so this shares its
+                    # one-attempt-per-cooldown budget with startup,
+                    # keepalive, and AutoCheck paths. No tight-loop
                     # retry is possible.
                     if attempt < max_attempts - 1 and self._recover_cr_auth_inline(
                         source_page, collected_popups, f"cr-click-recovery-{attempt+1}"
