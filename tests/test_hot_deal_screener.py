@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from ove_scraper.hot_deal_screener import (
+    is_autocheck_capture_failure,
     screen_autocheck,
     screen_condition_report,
     screen_vin_web_search,
@@ -65,11 +66,102 @@ class TestScreenConditionReport:
         assert result.passed is False
         assert "Title status" in result.reason
 
+    def test_total_loss_remarks_fail_even_with_clean_title(self):
+        cr = _make_cr(
+            title_status="Clean",
+            title_branding="None",
+            remarks=[
+                "CLEAN TITLE, HISTORY OF TOTAL LOSS, REGISTERED TO INSURANCE COMPANY",
+            ],
+        )
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is False
+        assert "Title risk" in result.reason
+        assert "TOTAL LOSS" in result.reason
+        assert result.details["rule_key"] == "title_risk"
+        assert result.details["score"] >= result.details["threshold"]
+
+    def test_listing_json_remarks_fail_even_when_cr_remarks_are_empty(self):
+        cr = _make_cr(
+            title_status="Title Present",
+            title_branding="--",
+            remarks=[],
+        )
+        listing = _make_listing(
+            announcementsEnrichment={
+                "remarks": "** CLEAN TITLE, HISTORY OF TOTAL LOSS, REGISTERED TO INSURANCE COMPANY ",
+            },
+            comments="** CLEAN TITLE, HISTORY OF TOTAL LOSS, REGISTERED TO INSURANCE COMPANY ",
+        )
+        result = screen_condition_report(cr, listing)
+        assert result.passed is False
+        assert "Title risk" in result.reason
+
+    def test_title_risk_normalization_handles_hyphenated_total_loss(self):
+        cr = _make_cr(
+            title_status="Clean",
+            title_branding="None",
+            remarks=["Clean title - history of total-loss"],
+        )
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is False
+        assert "Title risk" in result.reason
+
+    def test_insurance_company_in_title_context_fails(self):
+        cr = _make_cr(
+            title_status="Clean",
+            title_branding="None",
+            remarks=["Clean title, insurance company ownership noted"],
+        )
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is False
+        assert "Title risk" in result.reason
+
+    def test_insurance_company_reference_alone_does_not_fail(self):
+        cr = _make_cr(
+            title_status="Clean",
+            title_branding="None",
+            remarks=["Previous owner was an insurance company"],
+        )
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is True
+
     def test_structural_damage_fails(self):
         cr = _make_cr(structural_damage=True)
         result = screen_condition_report(cr, _make_listing())
         assert result.passed is False
         assert "Structural damage" in result.reason
+
+    def test_engine_starts_false_fails(self):
+        cr = _make_cr(vehicle_history={"engine_starts": False})
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is False
+        assert "does not start" in result.reason.lower()
+
+    def test_drivable_false_fails(self):
+        cr = _make_cr(vehicle_history={"drivable": False})
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is False
+        assert "does not drive" in result.reason.lower()
+
+    def test_metadata_defect_flags_fail_with_source_reason(self):
+        cr = _make_cr(metadata={
+            "defect_flags": [
+                {
+                    "rule_key": "non_running",
+                    "category": "drivability",
+                    "severity": "critical",
+                    "source_label": "listing_json.conditionEnrichment.damages",
+                    "matched_text": "no start",
+                    "raw_text": "Mechanical Battery Inop Repair Required no start has gas",
+                    "failure_label": "Non-running/non-driving concern",
+                }
+            ]
+        })
+        result = screen_condition_report(cr, _make_listing())
+        assert result.passed is False
+        assert "Battery Inop" in result.reason
+        assert result.details["defect_flag"]["rule_key"] == "non_running"
 
     def test_windshield_crack_fails(self):
         cr = _make_cr(damage_items=[{"section": "Glass", "description": "Windshield cracked"}])
@@ -143,7 +235,7 @@ class TestScreenConditionReport:
         ])
         result = screen_condition_report(cr, _make_listing())
         assert result.passed is False
-        assert "Branded title" in result.reason or "buyback" in result.reason.lower() or "lemon" in result.reason.lower()
+        assert "Title risk" in result.reason or "buyback" in result.reason.lower() or "lemon" in result.reason.lower()
 
     def test_active_powertrain_code_in_announcement_fails(self):
         # Real announcement: "Active powertrain codes present" should fail
@@ -285,21 +377,33 @@ class TestScreenConditionReport:
 
 class TestScreenAutocheck:
     def test_clean_report_passes(self):
-        data = {"title_brand_check": "OK", "odometer_check": "OK", "raw_text": "No issues found"}
+        data = {"scrape_status": "success", "title_brand_check": "OK", "odometer_check": "OK", "raw_text": "No issues found"}
         result = screen_autocheck(data)
         assert result.passed is True
 
     def test_title_brand_problem_fails(self):
-        data = {"title_brand_check": "Problem Reported", "odometer_check": "OK", "raw_text": ""}
+        data = {"scrape_status": "success", "title_brand_check": "Problem Reported", "odometer_check": "OK", "raw_text": ""}
         result = screen_autocheck(data)
         assert result.passed is False
         assert "title brand" in result.reason.lower()
 
     def test_odometer_problem_fails(self):
-        data = {"title_brand_check": "OK", "odometer_check": "Problem Reported", "raw_text": ""}
+        data = {"scrape_status": "success", "title_brand_check": "OK", "odometer_check": "Problem Reported", "raw_text": ""}
         result = screen_autocheck(data)
         assert result.passed is False
         assert "Odometer" in result.reason
+
+    def test_partial_autocheck_fails(self):
+        data = {
+            "scrape_status": "partial",
+            "failure_category": "experian_session_expired",
+            "title_brand_check": "OK",
+            "odometer_check": "OK",
+        }
+        result = screen_autocheck(data)
+        assert result.passed is False
+        assert "full report not captured" in result.reason
+        assert is_autocheck_capture_failure(result) is True
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,9 @@ from ove_scraper.hot_deal_db import (
     get_run_summary,
     init_db,
     insert_new_vins,
+    reclassify_autocheck_capture_failures_as_scrape_failed,
     reclassify_scraper_failures_as_scrape_failed,
+    reset_hot_deals_to_pending_for_rescreen,
     reset_scrape_failed_to_pending,
     touch_last_seen,
 )
@@ -220,6 +222,65 @@ def test_reset_scrape_failed_to_pending(db: sqlite3.Connection) -> None:
     assert toyota["rejection_reason"] == "Salvage vehicle"
 
 
+def test_reclassify_autocheck_capture_failures_as_scrape_failed(db: sqlite3.Connection) -> None:
+    insert_new_vins(db, [
+        {"vin": "1HGCG5655WA041389"},
+        {"vin": "2T1BU4EE9DC123456"},
+    ])
+    advance_status(db, "1HGCG5655WA041389", "step2_fail",
+                   rejection_step="step2",
+                   rejection_reason="AutoCheck: full report not captured (failed)")
+    advance_status(db, "2T1BU4EE9DC123456", "step2_fail",
+                   rejection_step="step2",
+                   rejection_reason="AutoCheck: Odometer problem reported")
+
+    moved = reclassify_autocheck_capture_failures_as_scrape_failed(db)
+    assert moved == 1
+
+    honda = db.execute(
+        "SELECT status, rejection_step FROM hot_deal_vins WHERE vin='1HGCG5655WA041389'"
+    ).fetchone()
+    assert honda["status"] == "scrape_failed"
+    assert honda["rejection_step"] == "scraper_error"
+
+    toyota = db.execute(
+        "SELECT status, rejection_step FROM hot_deal_vins WHERE vin='2T1BU4EE9DC123456'"
+    ).fetchone()
+    assert toyota["status"] == "step2_fail"
+    assert toyota["rejection_step"] == "step2"
+
+
+def test_reset_hot_deals_to_pending_for_rescreen_clears_stale_payloads(db: sqlite3.Connection) -> None:
+    insert_new_vins(db, [
+        {"vin": "1HGCG5655WA041389", "year": 2023, "make": "Honda", "model": "Accord"},
+        {"vin": "2T1BU4EE9DC123456", "year": 2024, "make": "Toyota", "model": "Corolla"},
+    ])
+    advance_status(db, "1HGCG5655WA041389", "hot_deal", data_column="cr_data", data_value="old-cr")
+    advance_status(db, "1HGCG5655WA041389", "hot_deal", data_column="autocheck_data", data_value="old-ac")
+    advance_status(db, "1HGCG5655WA041389", "hot_deal", data_column="websearch_data", data_value="old-ws")
+    advance_status(db, "2T1BU4EE9DC123456", "step1_fail",
+                   rejection_step="step1", rejection_reason="Salvage vehicle")
+
+    moved = reset_hot_deals_to_pending_for_rescreen(db)
+    assert moved == 1
+
+    honda = db.execute(
+        "SELECT status, cr_data, autocheck_data, websearch_data, screened_at "
+        "FROM hot_deal_vins WHERE vin='1HGCG5655WA041389'"
+    ).fetchone()
+    assert honda["status"] == "pending"
+    assert honda["cr_data"] is None
+    assert honda["autocheck_data"] is None
+    assert honda["websearch_data"] is None
+    assert honda["screened_at"] is None
+
+    toyota = db.execute(
+        "SELECT status, rejection_reason FROM hot_deal_vins WHERE vin='2T1BU4EE9DC123456'"
+    ).fetchone()
+    assert toyota["status"] == "step1_fail"
+    assert toyota["rejection_reason"] == "Salvage vehicle"
+
+
 def test_reclassify_scraper_failures_as_scrape_failed(db: sqlite3.Connection) -> None:
     insert_new_vins(db, [
         {"vin": "1HGCG5655WA041389"},  # scraper error (CR-click failed)
@@ -310,6 +371,22 @@ def test_get_rejection_clusters_for_run_finds_buggy_clusters(db: sqlite3.Connect
     assert clusters[0]["count"] == 12
     assert clusters[0]["reason"] == "Structural damage reported"
     assert len(clusters[0]["sample_vins"]) == 5  # capped at 5 per the implementation
+
+
+def test_get_rejection_clusters_for_run_ignores_scrape_failed(db: sqlite3.Connection) -> None:
+    run_id = create_run(db, ["VCH Marketing List"])
+    vins = [f"RETRY{i:012d}" for i in range(12)]
+    insert_new_vins(db, [{"vin": v, "year": 2024, "make": "Ford", "model": "F-150"} for v in vins])
+    for v in vins:
+        claim_next_pending(db)
+        advance_status(
+            db, v, "scrape_failed",
+            rejection_step="scraper_error",
+            rejection_reason="AutoCheck: full report not captured (failed)",
+        )
+    finish_run(db, run_id, "completed")
+
+    assert get_rejection_clusters_for_run(db, run_id, min_cluster_size=10) == []
 
 
 def test_get_rejection_clusters_for_run_respects_threshold(db: sqlite3.Connection) -> None:

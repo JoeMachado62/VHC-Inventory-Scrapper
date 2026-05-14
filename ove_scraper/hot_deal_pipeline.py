@@ -24,6 +24,7 @@ from ove_scraper.browser import (
     BrowserSessionError,
     ConditionReportClickFailedError,
     ListingNotFoundError,
+    SavedSearchPageEmpty,
 )
 from ove_scraper.cdp_browser import PlaywrightCdpBrowserSession
 from ove_scraper.config import Settings
@@ -39,6 +40,7 @@ from ove_scraper.hot_deal_db import (
     get_rejection_clusters_for_run,
     get_run_summary,
     insert_new_vins,
+    reclassify_autocheck_capture_failures_as_scrape_failed,
     reset_scrape_failed_to_pending,
     touch_last_seen,
 )
@@ -48,6 +50,7 @@ from ove_scraper.hot_deal_payload import (
 )
 from ove_scraper.hot_deal_report import format_hot_deal_summary
 from ove_scraper.hot_deal_screener import (
+    is_autocheck_capture_failure,
     screen_autocheck,
     screen_condition_report,
     screen_vin_web_search,
@@ -124,7 +127,13 @@ class HotDealPipelineRunner:
             # shot today. These are VINs where the browser couldn't open
             # the CR — a transient capture bug, not a real rejection —
             # and they deserve a retry with today's warmer session.
+            autocheck_reclassified = reclassify_autocheck_capture_failures_as_scrape_failed(self.db)
             retry_yesterday = reset_scrape_failed_to_pending(self.db)
+            if autocheck_reclassified:
+                self.log.info(
+                    "Hot Deal: reclassified %d AutoCheck capture-failure VIN(s) for retry",
+                    autocheck_reclassified,
+                )
             if retry_yesterday:
                 self.log.info(
                     "Hot Deal: reset %d previously-scrape-failed VIN(s) to pending for retry",
@@ -195,6 +204,20 @@ class HotDealPipelineRunner:
 
             finish_run(self.db, run_id, "completed", new_vins=new_count, sold_vins=sold_count, error_details=errors or None)
 
+        except BrowserSessionError as exc:
+            # Includes SavedSearchPageEmpty. Mark the DB run failed for
+            # accounting (the run did happen and produced no output),
+            # then re-raise so run_hot_deal_with_recovery can route the
+            # symptom through the right recovery path. We deliberately
+            # SKIP the post-run report + notifier blocks below — those
+            # would send a misleading "Hot Deal Screening Complete"
+            # email with zero deals. The recovery layer fires the right
+            # alert (notify_hot_deal_pipeline_failed) only after the
+            # daily attempt budget is exhausted.
+            self.log.error("Hot Deal pipeline session error: %s", exc)
+            errors.append(str(exc))
+            finish_run(self.db, run_id, "failed", new_vins=new_count, sold_vins=sold_count, error_details=errors)
+            raise
         except Exception as exc:
             self.log.error("Hot Deal pipeline failed: %s", exc)
             errors.append(str(exc))
@@ -237,7 +260,18 @@ class HotDealPipelineRunner:
         return summary
 
     def _export_search(self, search_name: str) -> Path | None:
-        """Export a single saved search CSV using the browser."""
+        """Export a single saved search CSV using the browser.
+
+        Session-level errors (BrowserSessionError, SavedSearchPageEmpty)
+        are deliberately allowed to propagate so the outer recovery
+        layer (run_hot_deal_with_recovery) can route SavedSearchPageEmpty
+        through the cookie-clear + relaunch path. Pre-fix (2026-05-03)
+        this method caught Exception broadly and returned None, which
+        downgraded the symptom into a generic "Failed to export saved
+        search" RuntimeError — losing the type signal that triggers
+        cookie-clear recovery and forcing the system to retry the same
+        dead session three times in a row before giving up for the day.
+        """
         export_dir = self.settings.export_dir / "hot-deal"
         export_dir.mkdir(parents=True, exist_ok=True)
         self.log.info("Hot Deal: exporting saved search '%s'", search_name)
@@ -251,7 +285,23 @@ class HotDealPipelineRunner:
                 self.log.info("Hot Deal: exported '%s' -> %s", search_name, path)
                 return path
             self.log.warning("Hot Deal: export returned no file for '%s'", search_name)
+        except BrowserSessionError:
+            # Includes SavedSearchPageEmpty subclass. Let it bubble so
+            # the outer recovery layer can decide between cookie-clear
+            # (stale auth) and plain Chrome relaunch (other session
+            # errors). Logging at ERROR before re-raising preserves the
+            # operator-visible breadcrumb.
+            self.log.error(
+                "Hot Deal: export failed for '%s' with session error; "
+                "letting it propagate for recovery",
+                search_name,
+            )
+            raise
         except Exception as exc:
+            # Genuine non-session errors (CSV parse, file IO, etc.) —
+            # treated as soft failures. The pipeline will mark the run
+            # failed but the next scheduler tick won't trigger any
+            # browser-level recovery.
             self.log.error("Hot Deal: export failed for '%s': %s", search_name, exc)
         return None
 
@@ -406,6 +456,14 @@ class HotDealPipelineRunner:
         step2 = screen_autocheck(autocheck_data)
         ac_json = json.dumps({"passed": step2.passed, "reason": step2.reason})
         if not step2.passed:
+            if is_autocheck_capture_failure(step2):
+                advance_status(
+                    self.db, vin, "scrape_failed",
+                    rejection_step="scraper_error", rejection_reason=step2.reason,
+                    data_column="autocheck_data", data_value=ac_json,
+                )
+                self.log.info("VIN %s SCRAPE_FAILED step2: %s", vin, step2.reason)
+                return
             advance_status(
                 self.db, vin, "step2_fail",
                 rejection_step="step2", rejection_reason=step2.reason,

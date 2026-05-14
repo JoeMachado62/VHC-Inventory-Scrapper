@@ -321,6 +321,7 @@ def get_rejection_clusters_for_run(
         SELECT rejection_reason AS reason, COUNT(*) AS cnt
         FROM hot_deal_vins
         WHERE rejection_reason IS NOT NULL
+          AND status <> 'scrape_failed'
           AND screened_at IS NOT NULL
           AND screened_at >= ?
           AND screened_at <= ?
@@ -334,6 +335,7 @@ def get_rejection_clusters_for_run(
     for row in cur.fetchall():
         sample = conn.execute(
             "SELECT vin FROM hot_deal_vins WHERE rejection_reason=? "
+            "AND status <> 'scrape_failed' "
             "AND screened_at >= ? AND screened_at <= ? LIMIT 5",
             (row["reason"], started_at, finished_at),
         ).fetchall()
@@ -361,6 +363,43 @@ def reset_scrape_failed_to_pending(conn: sqlite3.Connection) -> int:
     cur = conn.execute(
         "UPDATE hot_deal_vins SET status='pending', rejection_step=NULL, "
         "rejection_reason=NULL WHERE status='scrape_failed'"
+    )
+    conn.commit()
+    return cur.rowcount or 0
+
+
+def reclassify_autocheck_capture_failures_as_scrape_failed(conn: sqlite3.Connection) -> int:
+    """Move AutoCheck capture failures out of terminal Step 2 rejection.
+
+    A missing full AutoCheck scrape is a scraper completeness problem,
+    not negative vehicle evidence. Title/odometer problems stay
+    terminal; capture failures get retried like CR/browser failures.
+
+    Returns the number of VINs reclassified.
+    """
+    cur = conn.execute(
+        "UPDATE hot_deal_vins SET status='scrape_failed', rejection_step='scraper_error' "
+        "WHERE status='step2_fail' "
+        "AND rejection_reason LIKE 'AutoCheck: full report not captured (%'"
+    )
+    conn.commit()
+    return cur.rowcount or 0
+
+
+def reset_hot_deals_to_pending_for_rescreen(conn: sqlite3.Connection) -> int:
+    """Reset current Hot Deal rows to pending for a full fresh screen.
+
+    This is intentionally limited to rows that already passed into
+    ``status='hot_deal'``. The next pipeline run will scrape CR,
+    AutoCheck, and web search again before those VINs can be included
+    in the VPS batch.
+
+    Returns the number of VINs reset.
+    """
+    cur = conn.execute(
+        "UPDATE hot_deal_vins SET status='pending', rejection_step=NULL, "
+        "rejection_reason=NULL, screened_at=NULL, cr_data=NULL, "
+        "autocheck_data=NULL, websearch_data=NULL WHERE status='hot_deal'"
     )
     conn.commit()
     return cur.rowcount or 0

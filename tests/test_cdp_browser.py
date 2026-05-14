@@ -199,8 +199,9 @@ def test_inspect_cr_popups_raises_on_unavailable_popup(tmp_path) -> None:
 
 
 class FakeLoginLocator:
-    def __init__(self, *, visible: bool = True) -> None:
+    def __init__(self, *, visible: bool = True, present: bool = True) -> None:
         self._visible = visible
+        self._present = present
         self.clicks = 0
 
     @property
@@ -208,7 +209,7 @@ class FakeLoginLocator:
         return self
 
     def count(self) -> int:
-        return 1
+        return 1 if self._present else 0
 
     def is_visible(self, timeout: int | None = None) -> bool:
         return self._visible
@@ -238,12 +239,13 @@ class FakeLoginPage:
         url: str,
         password_filled: bool = True,
         url_after_click: str | None = None,
+        button_findable: bool = True,
     ) -> None:
         self.url = url
         self._password_filled = password_filled
         self._url_after_click = url_after_click
         self._on_login = True
-        self._submit = FakeLoginLocator()
+        self._submit = FakeLoginLocator(present=button_findable)
         self.timeouts: list[int] = []
 
     def evaluate(self, script: str):
@@ -367,6 +369,37 @@ def test_auto_login_allows_new_click_after_cooldown_elapsed(tmp_path) -> None:
     )
     assert session._try_single_shot_login_click(second_page) is True
     assert second_page._submit.clicks == 1
+
+
+def test_single_shot_auto_login_does_not_consume_cooldown_when_button_not_found(tmp_path) -> None:
+    """Regression for the 2026-05-07 AutoCheck OAuth incident.
+
+    Pre-fix: when the Sign-In selector chain failed to match (e.g.
+    against PingFederate's <a id="signOnButton"> on auth.manheim.com,
+    which our original selectors didn't recognize), the in-process
+    cooldown was already consumed BEFORE the locator chain ran. That
+    silently disabled auto-login for 6h on every subsequent VIN —
+    every "Skipping auto-login click: last attempt 0:00:01 ago"
+    log line came from this bug.
+
+    Post-fix: button-not-found is treated as a config/page-mismatch
+    (not a consumed Manheim auth attempt), so the cooldown stays
+    untouched and the next call gets a fresh chance once selectors
+    are updated."""
+    _reset_auto_login_flag()
+    session = PlaywrightCdpBrowserSession(make_settings(tmp_path))
+    page = FakeLoginPage(
+        url="https://auth.manheim.com/as/authorization.oauth2",
+        password_filled=True,
+        button_findable=False,
+    )
+
+    result = session._try_single_shot_login_click(page)
+
+    assert result is False
+    assert page._submit.clicks == 0
+    # The critical assertion: cooldown must NOT have been consumed.
+    assert PlaywrightCdpBrowserSession._auto_login_last_attempt_at is None
 
 
 def test_single_shot_auto_login_returns_false_if_still_on_login_after_click(tmp_path) -> None:
@@ -625,11 +658,13 @@ Calculated Owners
 1
 Number of Accidents
 0
+ Last Reported Event Date: 03/03/2026
  Last Reported Mileage: 17,790
  96
  90
  95
  This vehicle's AutoCheck Score: 96
+ Other comparable 2023 vehicles in the SUV - Midsize typically score between 90-95.
 Major State Title Brand Check -
  OK
  More info
@@ -648,6 +683,10 @@ Damage Check -
  More info
  More info
 Odometer Check -
+ OK
+ More info
+ More info
+Other Title Brand and Specific Event Check -
  OK
  More info
  More info
@@ -714,6 +753,18 @@ def test_parse_autocheck_score_owners_accidents_extracted() -> None:
     assert parsed["accident_count"] == 0
 
 
+def test_parse_autocheck_graphical_report_fields_extracted() -> None:
+    parsed = PlaywrightCdpBrowserSession._parse_autocheck_content(_SNAPSHOT_OK_TEXT)
+    assert parsed["historical_event_count"] == 8
+    assert parsed["last_reported_event_date"] == "03/03/2026"
+    assert parsed["last_reported_mileage"] == "17,790"
+    assert parsed["score_range_low"] == 90
+    assert parsed["score_range_high"] == 95
+    assert parsed["comparable_vehicle_year"] == 2023
+    assert parsed["comparable_vehicle_class"] == "SUV - Midsize"
+    assert parsed["other_title_brand_specific_event_check"] == "OK"
+
+
 def test_clean_check_value_handles_edge_cases() -> None:
     clean = PlaywrightCdpBrowserSession._clean_check_value
     # Standard snapshot output
@@ -740,4 +791,63 @@ def test_is_experian_error_page_detects_request_cannot_be_processed() -> None:
     # Empty / None safe
     assert detect("") is False
     assert detect(None) is False  # type: ignore[arg-type]
+
+
+def test_parse_autocheck_listing_json_fallback_extracts_score_range_and_checks() -> None:
+    parsed = PlaywrightCdpBrowserSession._parse_autocheck_listing_json(
+        {
+            "autocheck": {
+                "odometerCheckOK": True,
+                "vehicleUseAndEventCheckOK": False,
+                "titleAndProblemCheckOK": True,
+                "numberOfAccidents": 1,
+                "ownerCount": 2,
+                "score": 94,
+                "compareScoreRangeLow": 91,
+                "compareScoreRangeHigh": 96,
+            }
+        }
+    )
+
+    assert parsed["autocheck_score"] == 94
+    assert parsed["score_range_low"] == 91
+    assert parsed["score_range_high"] == 96
+    assert parsed["owner_count"] == 2
+    assert parsed["accident_count"] == 1
+    assert parsed["title_brand_check"] == "OK"
+    assert parsed["other_title_brand_specific_event_check"] == "OK"
+    assert parsed["odometer_check"] == "OK"
+    assert parsed["accident_check"] == "Information Reported(1)"
+    assert parsed["vehicle_use"] == "Other Use Reported"
+
+
+class FakeDetailDetectionPage:
+    def __init__(self, url: str, evaluate_result: bool) -> None:
+        self.url = url
+        self.evaluate_result = evaluate_result
+
+    def evaluate(self, _script: str, *_args):
+        return self.evaluate_result
+
+
+def test_page_looks_like_detail_rejects_search_results_even_with_vin(tmp_path) -> None:
+    session = PlaywrightCdpBrowserSession(make_settings(tmp_path))
+    vin = "1C4HJXEN9NW250788"
+    page = FakeDetailDetectionPage(
+        f"https://www.ove.com/search/results#/results?keyword={vin}",
+        evaluate_result=True,
+    )
+
+    assert session._page_looks_like_detail_for_vin(page, vin) is False
+
+
+def test_page_looks_like_detail_accepts_detail_route(tmp_path) -> None:
+    session = PlaywrightCdpBrowserSession(make_settings(tmp_path))
+    vin = "1C4HJXEN9NW250788"
+    page = FakeDetailDetectionPage(
+        f"https://www.ove.com/search/results#/details/{vin}/OVE",
+        evaluate_result=False,
+    )
+
+    assert session._page_looks_like_detail_for_vin(page, vin) is True
 

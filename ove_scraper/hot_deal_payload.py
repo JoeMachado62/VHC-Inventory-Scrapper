@@ -43,6 +43,9 @@ EXCLUDED_NEGATIVE_SIGNALS = [
     "engine does not start",
     "vehicle does not drive",
     "major mechanical warning",
+    "AutoCheck full report missing",
+    "warning lights",
+    "structured mechanical defect",
 ]
 
 # Same list using the keys cr_screen.excluded_signals_checked uses (per
@@ -56,6 +59,10 @@ EXCLUDED_SIGNALS_CHECKED = [
     "odometer",
     "airbag",
     "major_mechanical",
+    "non_running",
+    "warning_lights",
+    "autocheck_full_report",
+    "structured_condition_damage",
 ]
 
 
@@ -211,6 +218,40 @@ def _extract_images(listing_json: dict[str, Any], scrape_images: list[str]) -> l
             urls.append(v)
             seen.add(v)
     return urls
+
+
+def _build_detail_images(images: list[Any]) -> list[dict[str, Any]]:
+    """Normalize detail images to the VPS detail-image object schema."""
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in images or []:
+        if isinstance(item, str):
+            url = item
+            base: dict[str, Any] = {"url": url}
+        elif isinstance(item, dict):
+            url = item.get("url") or item.get("largeUrl") or item.get("imageUrl")
+            base = dict(item)
+            if url:
+                base["url"] = url
+        else:
+            continue
+        if not isinstance(url, str) or not url.startswith("http") or url in seen:
+            continue
+        index = len(out)
+        display_order = _coerce_int(base.get("display_order"))
+        out.append({
+            "url": url,
+            "role": base.get("role") or ("hero" if index == 0 else "gallery"),
+            "display_order": display_order if display_order is not None else index,
+            "is_primary": bool(base.get("is_primary")) if "is_primary" in base else index == 0,
+            "source_image_id": base.get("source_image_id"),
+            "metadata": base.get("metadata") if isinstance(base.get("metadata"), dict) else {},
+        })
+        seen.add(url)
+    if out and not any(img.get("is_primary") for img in out):
+        out[0]["is_primary"] = True
+        out[0]["role"] = out[0].get("role") or "hero"
+    return out
 
 
 def _extract_features_normalized(listing_json: dict[str, Any], mmr: float | None) -> dict[str, Any]:
@@ -388,8 +429,9 @@ def build_deal_entry(
     }
 
     # detail block. Echo the deep-scrape result through.
+    detail_image_source = deep_scrape.get("detail_images") or deep_scrape.get("images") or []
     detail: dict[str, Any] = {
-        "images": deep_scrape.get("detail_images") or [],
+        "images": _build_detail_images(detail_image_source),
         "condition_report": cr_block,
         "seller_comments": deep_scrape.get("seller_comments"),
         "listing_snapshot": deep_scrape.get("listing_snapshot") or {},

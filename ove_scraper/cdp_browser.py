@@ -364,6 +364,28 @@ class PlaywrightCdpBrowserSession:
         # None in unit tests / standalone usage; gated everywhere by
         # `if self._notifier is not None`.
         self._notifier: Any = None
+        # Persistent dedicated keepalive page (2026-05-04 fix). When
+        # `settings.keepalive_persistent_tab` is True, touch_session
+        # opens ONE worker tab on first call, reuses it across ticks,
+        # and never closes it. Real ops continue spawning their own
+        # worker tabs from the seed tab's context — they never collide.
+        # The sweep_orphan_tabs identity-check skips this page.
+        self._keepalive_page: Page | None = None
+        # Per-instance decay-detection deque (last 10 cards_render_ms
+        # samples). Decay condition: 3 of last 5 ticks > 12000ms.
+        # When tripped, raise SavedSearchPageEmpty to route through the
+        # existing cookie-clear + recover_browser_session path in
+        # main.py:run_browser_operation.
+        self._keepalive_render_history: list[int] = []
+        # 2026-05-06 active keepalive state. Round-robin index into the
+        # cached saved-search names tuple — incremented each tick so we
+        # rotate through the user's saved searches over multiple ticks.
+        self._keepalive_search_index: int = 0
+        # Cached saved-search names so the keepalive doesn't have to
+        # re-discover via the saved-searches list every tick. Refreshed
+        # if list_saved_searches() is called by sync (it overwrites this
+        # cache as a side-effect).
+        self._cached_saved_search_names: tuple[str, ...] = ()
 
     def set_notifier(self, notifier: Any) -> None:
         """Attach an AdminNotifier so the recovery path can fire alerts
@@ -464,7 +486,9 @@ class PlaywrightCdpBrowserSession:
         # operator must log in manually, which is FINE compared to
         # triggering another Manheim account lock.
         try:
-            lockout_state = auth_lockout.get_state(self.settings.artifact_dir)
+            lockout_state = auth_lockout.get_state(
+                self.settings.artifact_dir, port=self.settings.chrome_debug_port,
+            )
         except Exception as exc:
             LOGGER.warning("Auth-lockout state read failed (treating as unblocked): %s", exc)
             lockout_state = None
@@ -480,52 +504,60 @@ class PlaywrightCdpBrowserSession:
             # in-process cooldown budget for no reason.
             return False
 
-        # Mark the timestamp FIRST — before we even try — so that any
-        # exception during the click still counts as a consumed
-        # attempt within the cooldown. This matches the spirit of
-        # "single-shot per cooldown" strictly: one chance to recover
-        # per window, not one successful click.
-        type(self)._auto_login_last_attempt_at = datetime.now(timezone.utc)
-
-        # Record the click attempt in the cross-process ledger BEFORE
-        # the actual click. If the ledger write fails we still proceed
-        # (don't let an I/O hiccup block the click), but log loudly so
-        # the operator knows the rate-limit safety net is degraded.
-        try:
-            post_record_state = auth_lockout.record_login_click(self.settings.artifact_dir)
-            if post_record_state.blocked:
-                LOGGER.error(
-                    "Auto-login click REFUSED post-record (rate limit just tripped): %s",
-                    post_record_state.reason,
+        # Autofill-race retry (2026-05-06 fix). Chrome's password-manager
+        # autofill happens asynchronously after page load — typically
+        # 200-2000ms but can be slower if the password manager is busy
+        # or the page just rendered the form. Pre-fix this check fired
+        # ONCE immediately and any miss got the operator a misleading
+        # "auto-recovery disabled" email even though Chrome had the
+        # password and would have filled it shortly after. Now: poll
+        # up to ~5s for the field to be populated, focusing the field
+        # on each iteration to nudge Chrome to autofill.
+        filled = False
+        autofill_check_start = time.monotonic()
+        autofill_deadline = autofill_check_start + 5.0
+        autofill_attempts = 0
+        while time.monotonic() < autofill_deadline:
+            autofill_attempts += 1
+            try:
+                filled = page.evaluate(
+                    """
+                    () => {
+                        const pw = document.querySelector("input[type='password']");
+                        if (!(pw instanceof HTMLInputElement)) return false;
+                        // Focusing the field is a hint to Chrome's password
+                        // manager to autofill if it hasn't already. Harmless
+                        // if already filled.
+                        try { pw.focus(); } catch (e) {}
+                        return pw.value.length > 0;
+                    }
+                    """
                 )
-                # The ledger now shows we attempted; future calls will
-                # see the rate-limit cooldown until it expires.
+            except Exception as exc:
+                LOGGER.warning("Auto-login pre-check (password-populated) failed: %s", exc)
                 return False
-        except Exception as ledger_exc:
-            LOGGER.error(
-                "Auth-lockout ledger write FAILED — proceeding without rate-limit "
-                "protection (this is dangerous; check disk permissions): %s",
-                ledger_exc,
+            if filled:
+                break
+            page.wait_for_timeout(400)
+        if filled and autofill_attempts > 1:
+            LOGGER.info(
+                "Auto-login pre-check: password populated after %d attempt(s) "
+                "(%dms wait for Chrome autofill)",
+                autofill_attempts,
+                int((time.monotonic() - autofill_check_start) * 1000),
             )
-
-        try:
-            filled = page.evaluate(
-                """
-                () => {
-                    const pw = document.querySelector("input[type='password']");
-                    if (!(pw instanceof HTMLInputElement)) return false;
-                    return pw.value.length > 0;
-                }
-                """
-            )
-        except Exception as exc:
-            LOGGER.warning("Auto-login pre-check (password-populated) failed: %s", exc)
-            return False
         if not filled:
             LOGGER.warning(
                 "Auto-login skipped: password field is empty — Chrome's saved "
                 "credentials are not available. Operator must log in manually."
             )
+            # Consume the in-process cooldown so this same Python process
+            # doesn't burn 5s polling for autofill on every recovery
+            # attempt for the next 6h. (Cross-process spam is gated by
+            # the notifier's own cooldown.) This is the same semantics
+            # the original code had, preserved across the 2026-05-07
+            # button-not-found bug fix.
+            type(self)._auto_login_last_attempt_at = datetime.now(timezone.utc)
             # Loud-failure alert (Fix D, 2026-04-28): empty password field
             # means Chrome has no saved credentials, which permanently
             # disables auto-recovery for the lifetime of this profile.
@@ -547,9 +579,21 @@ class PlaywrightCdpBrowserSession:
                     )
             return False
 
+        # Locator chain ordered most-specific → most-generic. PingFederate
+        # (Manheim's auth provider, used by both OVE and the AutoCheck
+        # OAuth flow) renders the submit as <a id="signOnButton"> styled
+        # as a button — not <button type="submit"> — and labels it
+        # "Sign On" not "Sign In". The 2026-05-07 incident missed every
+        # AutoCheck VIN for 6h because the original 3 locators only
+        # matched OVE's main login form. Keep both flows covered.
         submit_locators = [
+            page.locator("#signOnButton").first,
+            page.locator("div.ping-buttons a.ping-button, div.ping-buttons button").first,
             page.locator("button[type='submit']").first,
-            page.get_by_role("button", name=re.compile(r"^\s*(sign\s*in|log\s*in|login)\s*$", re.I)).first,
+            page.get_by_role(
+                "button",
+                name=re.compile(r"^\s*(sign\s*(in|on)|log\s*in|login)\s*$", re.I),
+            ).first,
             page.locator("input[type='submit']").first,
         ]
         submit: Locator | None = None
@@ -561,8 +605,44 @@ class PlaywrightCdpBrowserSession:
             except Exception:
                 continue
         if submit is None:
-            LOGGER.warning("Auto-login skipped: could not locate a Sign In button on the login page")
+            # Bug fix (2026-05-07 AutoCheck OAuth incident): pre-fix the
+            # in-process timestamp + cross-process ledger were both
+            # consumed BEFORE this point, so a selector miss on a new
+            # auth-page variant silently disabled auto-login for 6h.
+            # By moving the timestamp/ledger writes to AFTER button-
+            # found, "button not found" is now a true no-op: log it and
+            # try again on the next call. If selectors are genuinely
+            # broken, the operator sees the warning and ships a fix
+            # without losing the cooldown budget in the meantime.
+            LOGGER.warning(
+                "Auto-login skipped: could not locate a Sign In button on the login page (url=%s)",
+                page.url,
+            )
             return False
+
+        # Button found → this is the point of no return. Mark the
+        # cooldown timestamp + ledger entry NOW, before the click, so
+        # any exception during the click (timeout, navigation race,
+        # account-lock detection) still counts as one consumed attempt.
+        # See the layered-rate-limiting docstring above for why both
+        # in-process and disk-backed gates are needed.
+        type(self)._auto_login_last_attempt_at = datetime.now(timezone.utc)
+        try:
+            post_record_state = auth_lockout.record_login_click(
+                self.settings.artifact_dir, port=self.settings.chrome_debug_port,
+            )
+            if post_record_state.blocked:
+                LOGGER.error(
+                    "Auto-login click REFUSED post-record (rate limit just tripped): %s",
+                    post_record_state.reason,
+                )
+                return False
+        except Exception as ledger_exc:
+            LOGGER.error(
+                "Auth-lockout ledger write FAILED — proceeding without rate-limit "
+                "protection (this is dangerous; check disk permissions): %s",
+                ledger_exc,
+            )
 
         LOGGER.info("Auto-login: clicking Sign In (single-shot, credentials were pre-filled)")
         try:
@@ -600,6 +680,7 @@ class PlaywrightCdpBrowserSession:
                     try:
                         auth_lockout.record_manheim_account_locked(
                             self.settings.artifact_dir,
+                            port=self.settings.chrome_debug_port,
                             reason=(
                                 f"detected on port {self.settings.chrome_debug_port} "
                                 f"after auto-login click; first 500 chars of page: "
@@ -633,52 +714,762 @@ class PlaywrightCdpBrowserSession:
         )
         return False
 
+    # Outcome tags for the structured KEEPALIVE_TICK log line. Kept as a
+    # closed set (no string interpolation in the value) so a future
+    # log-aggregation rule can match on `outcome=<exact tag>` without
+    # accidentally swallowing a free-form message.
+    _KEEPALIVE_OUTCOME_OK = "ok"
+    _KEEPALIVE_OUTCOME_GOTO_TIMEOUT = "goto_timeout"
+    _KEEPALIVE_OUTCOME_LOGIN_OK = "landed_on_login_then_clicked_ok"
+    _KEEPALIVE_OUTCOME_LOGIN_BLOCKED = "landed_on_login_then_click_blocked_by_lockout"
+    _KEEPALIVE_OUTCOME_LOGIN_FAILED = "landed_on_login_then_click_failed"
+    _KEEPALIVE_OUTCOME_CONNECT_FAILED = "connect_failed"
+    # 2026-05-04 keepalive durability fix outcomes. Emitted by the
+    # persistent-tab keepalive when it actually verifies render and
+    # observes a session that's accepting cookies but returning empty
+    # (cards_empty) or hung (cards_did_not_render).
+    _KEEPALIVE_OUTCOME_CARDS_EMPTY = "cards_empty"
+    _KEEPALIVE_OUTCOME_CARDS_DID_NOT_RENDER = "cards_did_not_render"
+
+    # Decay-detection thresholds. 3 of the last 5 ticks with
+    # cards_render_ms > 12_000 indicates the session is degrading even
+    # though individual ticks still complete. Triggers cookie-clear +
+    # browser recovery via the existing SavedSearchPageEmpty handler in
+    # main.py:run_browser_operation.
+    _KEEPALIVE_DECAY_RENDER_MS_THRESHOLD = 12_000
+    _KEEPALIVE_DECAY_WINDOW = 5
+    _KEEPALIVE_DECAY_HITS_REQUIRED = 3
+    _KEEPALIVE_RENDER_HISTORY_MAX = 10
+
     def touch_session(self) -> None:
+        # Dispatch hierarchy (2026-05-06):
+        #   keepalive_active=True (DEFAULT)
+        #     → active keepalive: rotate through saved searches, click
+        #       pagination, linger like a real user. Generates the
+        #       GraphQL query traffic that keeps OAuth Bearer tokens
+        #       warm. This is the response to the 401-on-graphql class
+        #       of failure that produced partial CSVs and missing VINs.
+        #   keepalive_active=False AND keepalive_persistent_tab=True
+        #     → persistent-tab keepalive (legacy 2026-05-04 design).
+        #       Fast and gentle but didn't simulate enough activity.
+        #   keepalive_active=False AND keepalive_persistent_tab=False
+        #     → worker-tab keepalive (oldest design, kept for
+        #       defensive emergency rollback via KEEPALIVE_ACTIVE=false
+        #       and KEEPALIVE_PERSISTENT_TAB=false env vars).
+        use_active = bool(getattr(self.settings, "keepalive_active", True))
+        use_persistent = bool(getattr(self.settings, "keepalive_persistent_tab", True))
+        if use_active:
+            self._touch_session_active()
+        elif use_persistent:
+            self._touch_session_persistent_tab()
+        else:
+            self._touch_session_worker_tab()
+
+    # ------------------------------------------------------------------
+    # Active keepalive (2026-05-06)
+    # ------------------------------------------------------------------
+
+    # Pagination button selectors, tried in order. OVE's UI may
+    # vary; we try multiple before giving up.
+    _PAGINATION_NEXT_SELECTORS: tuple[str, ...] = (
+        "button[aria-label*='Next' i]:not([disabled])",
+        "button[aria-label*='page next' i]:not([disabled])",
+        "[data-test-id*='pagination-next']:not([disabled])",
+        "[data-test-id='pagination-next-button']:not([disabled])",
+        "button:has-text('Next'):not([disabled])",
+        "a[aria-label*='Next' i]",
+    )
+
+    def _touch_session_active(self) -> None:
+        """Active keepalive: rotate through saved searches, navigate
+        into ONE search per tick, click through 2-3 pagination pages
+        with realistic dwell time on each.
+
+        Why this exists (2026-05-06): the previous persistent-tab
+        keepalive just navigated to the saved-searches list page and
+        waited 8 seconds. That wasn't generating the GraphQL query
+        traffic that real user activity does, and OVE's data-layer
+        auth (Bearer access tokens) was expiring silently while page-
+        shell cookies stayed valid. Result: HTTP 401 from
+        onesearch-api.manheim.com/graphql during exports, producing
+        partial CSVs that lost specific VINs (operator caught this
+        2026-05-06 evening: 4948-row CSV at 18:33, 4305-row CSV at
+        18:57 on the same saved search).
+
+        Active keepalive forces real GraphQL traffic each tick:
+          1. Navigate to saved-searches list (cookies)
+          2. Click the next saved-search card in the rotation
+             (taxonomy + initial result-set GraphQL queries fire)
+          3. Wait for vehicle cards to render (proves session works)
+          4. Linger keepalive_page_linger_ms (60s default) — like a
+             user reading the listings
+          5. Click next-page pagination
+             (paginated result-set GraphQL fires)
+          6. Linger again
+          7. Repeat for keepalive_pagination_clicks total clicks
+             (default 2)
+        Total tick: ~3-4 minutes inside the 5-min interval. Other
+        operations (sync, hot-deal, deep-scrape poll) may briefly
+        wait on the OveAutomationLock during long ticks; their
+        retry/backoff logic absorbs this.
+
+        Tab strategy: reuses the persistent keepalive page if it's
+        on ove.com, opens a fresh worker tab otherwise. Shares the
+        same `self._keepalive_page` slot as the persistent-tab
+        keepalive so sweep_orphan_tabs identity-skip works.
+
+        Recovery: if cards never render after navigating into the
+        saved search, raises SavedSearchPageEmpty. With the surgical
+        cookie clear shipped earlier today (preserves Manheim device-
+        trust), this recovery is now CHEAP — fresh OAuth flow via
+        saved credentials, no 2FA challenge.
+        """
+        t0 = time.monotonic()
+        outcome = self._KEEPALIVE_OUTCOME_OK
+        url_at_failure: str | None = None
+        seed_url: str | None = None
+        cards_render_ms: int | None = None
+        decay_signal = "none"
+        search_visited: str | None = None
+        pagination_clicks_made = 0
         try:
-            browser = self._connect_browser()
-            page = self._open_dedicated_ove_page(browser)
             try:
-                page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
-                if self._is_login_page(page):
-                    # Single-shot auto-click recovery; fall through to
-                    # raise if it didn't land us off login.
-                    if not self._try_single_shot_login_click(page):
-                        raise BrowserSessionError("OVE session is not authenticated; browser is on the login page")
-            finally:
-                self._close_page(page)
-        except PlaywrightTimeoutError as exc:
-            # 2026-04-30 fix: a timeout during keepalive does NOT mean
-            # auth is lost or Chrome is broken. It just means OVE was
-            # slow for this one tick. Pre-fix this raised
-            # BrowserSessionError, which propagated to
-            # run_browser_operation, which called recover_browser_session
-            # — kill+relaunch Chrome — which created a fresh about:blank
-            # tab on every cycle. Login B exhibited this 6 times in 5
-            # minutes on 2026-04-30 (09:21–09:26 burst), producing the
-            # user-visible "about:blank tab opens over and over on
-            # Login B" symptom.
-            #
-            # The keepalive is a liveness probe, not a workload. The
-            # right behavior on a transient probe failure is to log and
-            # try again on the next 5-minute tick. If a real auth
-            # problem exists, the next REAL operation (hourly sync or
-            # per-VIN scrape) will hit it through a code path that has
-            # proper retry semantics and IS allowed to escalate to
-            # recovery.
-            #
-            # We deliberately do NOT reset self._browser here — the CDP
-            # connection itself wasn't broken, only the page load was
-            # slow. Resetting would force a needless reconnect on the
-            # next tick.
-            LOGGER.warning(
-                "Keepalive goto timed out (treating as transient, NOT escalating "
-                "to Chrome recovery): %s",
-                exc,
+                browser = self._connect_browser()
+            except Exception as exc:
+                outcome = self._KEEPALIVE_OUTCOME_CONNECT_FAILED
+                self._browser = None
+                raise BrowserSessionError(f"OVE browser keepalive failed: {exc}") from exc
+
+            # Resolve which saved search to visit this tick. We rotate
+            # through whatever names we last cached. If empty, populate
+            # by visiting the saved-searches list once.
+            search_names = self._cached_saved_search_names
+            if not search_names:
+                try:
+                    search_names = self.list_saved_searches()
+                    self._cached_saved_search_names = search_names
+                except SavedSearchPageEmpty:
+                    outcome = self._KEEPALIVE_OUTCOME_CARDS_EMPTY
+                    LOGGER.warning(
+                        "Active keepalive: saved-searches list returned empty on port %d; "
+                        "session may be stale. Routing through cookie-clear recovery.",
+                        self.settings.chrome_debug_port,
+                    )
+                    raise
+                except BrowserSessionError:
+                    outcome = self._KEEPALIVE_OUTCOME_CARDS_DID_NOT_RENDER
+                    raise
+
+            if not search_names:
+                LOGGER.warning(
+                    "Active keepalive: no saved searches to rotate through "
+                    "(port %d); skipping tick", self.settings.chrome_debug_port,
+                )
+                return
+
+            # Round-robin: pick the next search and advance the index.
+            self._keepalive_search_index = self._keepalive_search_index % len(search_names)
+            search_visited = search_names[self._keepalive_search_index]
+            self._keepalive_search_index = (self._keepalive_search_index + 1) % len(search_names)
+            LOGGER.info(
+                "Active keepalive (port %d): visiting saved search %r "
+                "(rotation index %d/%d)",
+                self.settings.chrome_debug_port, search_visited,
+                self._keepalive_search_index or len(search_names),
+                len(search_names),
             )
-            return
+
+            # Acquire / reuse the keepalive page.
+            try:
+                seed_url = self._snapshot_first_blank_or_auth_url(browser)
+                page = self._get_or_create_keepalive_page(browser)
+            except PlaywrightTimeoutError as exc:
+                outcome = self._KEEPALIVE_OUTCOME_GOTO_TIMEOUT
+                url_at_failure = self._snapshot_first_blank_or_auth_url(browser) or seed_url
+                self._close_stuck_blank_or_auth_tabs(browser)
+                LOGGER.warning(
+                    "Active keepalive seed-page goto timed out (treating as transient): %s",
+                    exc,
+                )
+                return
+            except BrowserSessionError:
+                outcome = self._KEEPALIVE_OUTCOME_LOGIN_FAILED
+                url_at_failure = self._snapshot_first_blank_or_auth_url(browser) or seed_url
+                self._close_stuck_blank_or_auth_tabs(browser)
+                self._keepalive_page = None
+                raise
+
+            # Navigate into the chosen saved search.
+            try:
+                self._open_saved_search(page, search_visited)
+            except SavedSearchPageEmpty:
+                outcome = self._KEEPALIVE_OUTCOME_CARDS_EMPTY
+                try:
+                    url_at_failure = page.url
+                except Exception:
+                    pass
+                self._close_page(page)  # 2026-05-06 fix: don't leak the orphan tab
+                self._keepalive_page = None
+                raise
+            except BrowserSessionError:
+                outcome = self._KEEPALIVE_OUTCOME_LOGIN_FAILED
+                self._close_page(page)
+                self._keepalive_page = None
+                raise
+
+            # Render-verify: confirm VEHICLE cards actually appeared on
+            # the search-results page. 2026-05-06 regression: I was
+            # using _wait_for_saved_search_cards here, which waits for
+            # the SAVED-SEARCH-LIST card selector — that selector
+            # never matches on the post-click results page. Every tick
+            # timed out and triggered recovery, which leaked tabs.
+            # _wait_for_vehicle_results_cards uses the correct
+            # vehicle-card selector, same as _trigger_export.
+            cards_t0 = time.monotonic()
+            try:
+                self._wait_for_vehicle_results_cards(page, timeout_ms=60_000)
+            except SavedSearchPageEmpty:
+                outcome = self._KEEPALIVE_OUTCOME_CARDS_EMPTY
+                try:
+                    url_at_failure = page.url
+                except Exception:
+                    pass
+                self._close_page(page)
+                self._keepalive_page = None
+                # User confirmed: all saved searches have thousands of
+                # listings. If we see empty here, session went bad —
+                # raise to trigger surgical cookie-clear recovery.
+                raise
+            except BrowserSessionError:
+                outcome = self._KEEPALIVE_OUTCOME_CARDS_DID_NOT_RENDER
+                try:
+                    url_at_failure = page.url
+                except Exception:
+                    pass
+                self._close_page(page)
+                self._keepalive_page = None
+                raise
+            cards_render_ms = int((time.monotonic() - cards_t0) * 1000)
+
+            # Linger on page 1 like a user reading the listings.
+            linger_ms = int(getattr(self.settings, "keepalive_page_linger_ms", 60_000))
+            try:
+                page.wait_for_timeout(linger_ms)
+            except Exception:
+                pass
+
+            # Pagination: click "next page" N times with linger between.
+            target_clicks = int(getattr(self.settings, "keepalive_pagination_clicks", 2))
+            for _ in range(target_clicks):
+                clicked = self._click_pagination_next(page)
+                if not clicked:
+                    LOGGER.info(
+                        "Active keepalive: no next-page button reachable on '%s' "
+                        "(probably last page or single-page result); stopping pagination",
+                        search_visited,
+                    )
+                    break
+                pagination_clicks_made += 1
+                # Wait for the new page's vehicle cards to render
+                # (same selector as initial render — VEHICLE cards on
+                # results page, NOT saved-search-list cards). 30s
+                # should be ample for a paginated GraphQL query.
+                try:
+                    self._wait_for_vehicle_results_cards(page, timeout_ms=30_000)
+                except (SavedSearchPageEmpty, BrowserSessionError):
+                    LOGGER.warning(
+                        "Active keepalive: page %d after pagination click on '%s' "
+                        "did not render cards; tick still counts as exercise",
+                        pagination_clicks_made, search_visited,
+                    )
+                    # Stop paginating but don't trigger recovery — the
+                    # earlier render already proved the session works.
+                    break
+                try:
+                    page.wait_for_timeout(linger_ms)
+                except Exception:
+                    pass
+
+            # Decay detection still applies — slow-render is a useful
+            # observation even when the keepalive succeeds.
+            self._keepalive_render_history.append(cards_render_ms)
+            if len(self._keepalive_render_history) > self._KEEPALIVE_RENDER_HISTORY_MAX:
+                self._keepalive_render_history = self._keepalive_render_history[
+                    -self._KEEPALIVE_RENDER_HISTORY_MAX:
+                ]
+            window = self._keepalive_render_history[-self._KEEPALIVE_DECAY_WINDOW:]
+            slow_hits = sum(
+                1 for ms in window if ms > self._KEEPALIVE_DECAY_RENDER_MS_THRESHOLD
+            )
+            if slow_hits >= self._KEEPALIVE_DECAY_HITS_REQUIRED:
+                sorted_window = sorted(window)
+                p50 = sorted_window[len(sorted_window) // 2]
+                p90_idx = max(0, int(len(sorted_window) * 0.9) - 1)
+                p90 = sorted_window[p90_idx]
+                LOGGER.error(
+                    "KEEPALIVE_DECAY_DETECTED port=%d render_ms_p50=%d render_ms_p90=%d "
+                    "action=observation_only",
+                    self.settings.chrome_debug_port, p50, p90,
+                )
+                self._keepalive_render_history = []
+                decay_signal = "slow_render"
+        except SavedSearchPageEmpty:
+            raise
+        except BrowserSessionError:
+            self._browser = None
+            raise
         except Exception as exc:
+            outcome = self._KEEPALIVE_OUTCOME_CONNECT_FAILED
             self._browser = None
             raise BrowserSessionError(f"OVE browser keepalive failed: {exc}") from exc
+        finally:
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            LOGGER.warning(
+                "KEEPALIVE_TICK port=%d outcome=%s duration_ms=%d url_at_failure=%s "
+                "seed_url=%s tab_strategy=active cards_render_ms=%s decay_signal=%s "
+                "search_visited=%s pagination_clicks=%d",
+                self.settings.chrome_debug_port,
+                outcome,
+                duration_ms,
+                url_at_failure if url_at_failure is not None else "-",
+                seed_url if seed_url is not None else "-",
+                cards_render_ms if cards_render_ms is not None else "-",
+                decay_signal,
+                search_visited if search_visited is not None else "-",
+                pagination_clicks_made,
+            )
+
+    def _click_pagination_next(self, page: Page) -> bool:
+        """Try several next-page-button selectors in priority order.
+        Returns True if a click landed (proxied by URL change OR by
+        the click not raising), False if no clickable button was
+        found. Doesn't raise on miss — pagination might not exist
+        on the last page or for single-page result sets."""
+        before_url = page.url
+        for selector in self._PAGINATION_NEXT_SELECTORS:
+            try:
+                locator = page.locator(selector).first
+                if not locator.count():
+                    continue
+                if not locator.is_visible(timeout=1000):
+                    continue
+                if not locator.is_enabled(timeout=1000):
+                    continue
+            except Exception:
+                continue
+            try:
+                locator.click(timeout=5000)
+                # Brief pause for the click to propagate before the
+                # caller's wait_for_saved_search_cards picks up the
+                # new render.
+                page.wait_for_timeout(500)
+                # URL change is the strongest signal that pagination
+                # actually advanced; some OVE pagination updates the
+                # hash fragment, others swap the in-memory state.
+                # Either way, treating non-raise as success is fine.
+                return True
+            except Exception as exc:
+                LOGGER.debug(
+                    "Pagination click via %r failed: %s", selector, exc,
+                )
+                continue
+        return False
+
+    def _touch_session_persistent_tab(self) -> None:
+        # 2026-05-04 keepalive durability fix. See module-level Settings
+        # docstring for context. Key differences from the worker-tab
+        # fallback:
+        #   - Reuse self._keepalive_page across ticks (no churn)
+        #   - Call _wait_for_saved_search_cards to verify the page
+        #     actually rendered (cookie-accepted-but-empty backend
+        #     would otherwise show outcome=ok)
+        #   - Settle for keepalive_settle_ms so OVE's polling XHRs fire
+        #   - Track cards_render_ms in a per-instance deque for decay
+        #     detection
+        #   - Do NOT close the page — leave it for the next tick
+        t0 = time.monotonic()
+        outcome = self._KEEPALIVE_OUTCOME_OK
+        url_at_failure: str | None = None
+        seed_url: str | None = None
+        cards_render_ms: int | None = None
+        decay_signal = "none"
+        try:
+            try:
+                browser = self._connect_browser()
+            except Exception as exc:
+                outcome = self._KEEPALIVE_OUTCOME_CONNECT_FAILED
+                self._browser = None
+                raise BrowserSessionError(f"OVE browser keepalive failed: {exc}") from exc
+
+            try:
+                seed_url = self._snapshot_first_blank_or_auth_url(browser)
+                page = self._get_or_create_keepalive_page(browser)
+            except PlaywrightTimeoutError as exc:
+                outcome = self._KEEPALIVE_OUTCOME_GOTO_TIMEOUT
+                url_at_failure = self._snapshot_first_blank_or_auth_url(browser) or seed_url
+                self._close_stuck_blank_or_auth_tabs(browser)
+                LOGGER.warning(
+                    "Keepalive seed-page goto timed out (treating as transient): %s",
+                    exc,
+                )
+                return
+            except BrowserSessionError:
+                outcome = self._KEEPALIVE_OUTCOME_LOGIN_FAILED
+                url_at_failure = self._snapshot_first_blank_or_auth_url(browser) or seed_url
+                self._close_stuck_blank_or_auth_tabs(browser)
+                # Forget the bad keepalive page so the next tick re-creates it.
+                self._keepalive_page = None
+                raise
+
+            try:
+                page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
+            except PlaywrightTimeoutError as exc:
+                outcome = self._KEEPALIVE_OUTCOME_GOTO_TIMEOUT
+                try:
+                    url_at_failure = page.url
+                except Exception:
+                    url_at_failure = None
+                LOGGER.warning(
+                    "Keepalive worker-page goto timed out (treating as transient): %s",
+                    exc,
+                )
+                return
+
+            if self._is_login_page(page):
+                try:
+                    url_at_failure = page.url
+                except Exception:
+                    pass
+                if self._try_single_shot_login_click(page):
+                    outcome = self._KEEPALIVE_OUTCOME_LOGIN_OK
+                    url_at_failure = None
+                else:
+                    try:
+                        lk = auth_lockout.get_state(
+                            self.settings.artifact_dir,
+                            port=self.settings.chrome_debug_port,
+                        )
+                    except Exception:
+                        lk = None
+                    if lk is not None and lk.blocked:
+                        outcome = self._KEEPALIVE_OUTCOME_LOGIN_BLOCKED
+                    else:
+                        outcome = self._KEEPALIVE_OUTCOME_LOGIN_FAILED
+                    raise BrowserSessionError(
+                        "OVE session is not authenticated; browser is on the login page"
+                    )
+                # Login click succeeded — we're on the post-login page now.
+                # Skip the render-verify+settle this tick; next tick will
+                # verify a fresh session.
+                return
+
+            # Render-verify: confirm auth + backend token + React all worked.
+            # IMPORTANT (2026-05-04 fix): the keepalive does NOT propagate
+            # cards_empty / cards_did_not_render upward. Those exceptions
+            # would be caught by run_browser_operation's SavedSearchPageEmpty
+            # handler which calls _clear_chrome_cookies — and even with
+            # the surgical cookie clear, a transient empty-page observation
+            # is too weak a signal to justify wiping OVE cookies. The
+            # keepalive's job is to capture the observation in telemetry
+            # so the operator can see decay; the next REAL operation
+            # (sync, hot-deal export) will hit it through a path that
+            # has proper retry semantics and IS allowed to escalate.
+            #
+            # Pre-fix this branch raised SavedSearchPageEmpty which fired
+            # at 14:47 on 2026-05-04, wiped Login B's cookies (including
+            # device-trust), and forced a fresh 2FA text. Now: outcome
+            # tagged in telemetry, persistent page reset so next tick
+            # tries fresh, return cleanly.
+            #
+            # Bumped timeout from 15_000 to 30_000 to match operator's
+            # real-world observation that cold-start saved-searches
+            # render takes 22–30s, not 3–6s.
+            cards_t0 = time.monotonic()
+            try:
+                self._wait_for_saved_search_cards(page, timeout_ms=30_000)
+            except SavedSearchPageEmpty:
+                outcome = self._KEEPALIVE_OUTCOME_CARDS_EMPTY
+                try:
+                    url_at_failure = page.url
+                except Exception:
+                    pass
+                LOGGER.warning(
+                    "Keepalive observed empty saved-searches on port %d "
+                    "(NOT triggering recovery — next real op will handle "
+                    "if session is genuinely stale)",
+                    self.settings.chrome_debug_port,
+                )
+                # Drop the persistent page so next tick recreates it
+                # (gives the new tick a chance to recover via fresh nav).
+                self._keepalive_page = None
+                return
+            except BrowserSessionError:
+                outcome = self._KEEPALIVE_OUTCOME_CARDS_DID_NOT_RENDER
+                try:
+                    url_at_failure = page.url
+                except Exception:
+                    pass
+                LOGGER.warning(
+                    "Keepalive saved-search cards did not render on port %d "
+                    "within 30s (NOT triggering recovery — next real op "
+                    "will handle if persistent)",
+                    self.settings.chrome_debug_port,
+                )
+                self._keepalive_page = None
+                return
+            cards_render_ms = int((time.monotonic() - cards_t0) * 1000)
+
+            # Settle window: let OVE's polling XHRs fire and refresh the
+            # backend token. Matches A's natural 5–15s of "live" time
+            # between operations. Configurable via KEEPALIVE_SETTLE_MS.
+            settle_ms = int(getattr(self.settings, "keepalive_settle_ms", 8000))
+            try:
+                page.wait_for_timeout(settle_ms)
+            except Exception:
+                # Settle is best-effort. If wait_for_timeout fails (page
+                # closed mid-settle, etc.) the tick is still
+                # successful — we got the cards rendered.
+                pass
+
+            # Decay detection: append to history, check threshold.
+            self._keepalive_render_history.append(cards_render_ms)
+            if len(self._keepalive_render_history) > self._KEEPALIVE_RENDER_HISTORY_MAX:
+                self._keepalive_render_history = self._keepalive_render_history[
+                    -self._KEEPALIVE_RENDER_HISTORY_MAX:
+                ]
+            window = self._keepalive_render_history[-self._KEEPALIVE_DECAY_WINDOW:]
+            slow_hits = sum(
+                1 for ms in window if ms > self._KEEPALIVE_DECAY_RENDER_MS_THRESHOLD
+            )
+            if slow_hits >= self._KEEPALIVE_DECAY_HITS_REQUIRED:
+                # 2026-05-04 fix: decay detection is now OBSERVATION-ONLY.
+                # The original design (raise SavedSearchPageEmpty → cookie
+                # clear) was too eager and contributed to unnecessary
+                # device-trust cookie wipes / 2FA storms. Slow render
+                # usually means OVE itself is slow, not that the session
+                # is bad. The right response is to LOG the observation
+                # so the operator can correlate against OVE outage
+                # reports, but NOT to take destructive action from the
+                # keepalive itself.
+                #
+                # If the session IS genuinely degrading, the next real
+                # operation (sync, hot-deal export) will hit the failure
+                # through a path that has proper retry semantics and IS
+                # allowed to escalate to recovery.
+                sorted_window = sorted(window)
+                p50 = sorted_window[len(sorted_window) // 2]
+                p90_idx = max(0, int(len(sorted_window) * 0.9) - 1)
+                p90 = sorted_window[p90_idx]
+                LOGGER.error(
+                    "KEEPALIVE_DECAY_DETECTED port=%d render_ms_p50=%d render_ms_p90=%d "
+                    "action=observation_only",
+                    self.settings.chrome_debug_port, p50, p90,
+                )
+                # Reset history so we don't fire on every subsequent tick.
+                self._keepalive_render_history = []
+                decay_signal = "slow_render"
+        except SavedSearchPageEmpty:
+            # cards_empty / decay paths. Don't reset _browser — the CDP
+            # connection itself is fine; only the OVE session is bad.
+            # The caller (run_browser_operation) will route this through
+            # the cookie-clear handler.
+            raise
+        except BrowserSessionError:
+            self._browser = None
+            raise
+        except Exception as exc:
+            outcome = self._KEEPALIVE_OUTCOME_CONNECT_FAILED
+            self._browser = None
+            raise BrowserSessionError(f"OVE browser keepalive failed: {exc}") from exc
+        finally:
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            LOGGER.warning(
+                "KEEPALIVE_TICK port=%d outcome=%s duration_ms=%d url_at_failure=%s "
+                "seed_url=%s tab_strategy=persistent cards_render_ms=%s decay_signal=%s",
+                self.settings.chrome_debug_port,
+                outcome,
+                duration_ms,
+                url_at_failure if url_at_failure is not None else "-",
+                seed_url if seed_url is not None else "-",
+                cards_render_ms if cards_render_ms is not None else "-",
+                decay_signal,
+            )
+
+    def _get_or_create_keepalive_page(self, browser: Browser) -> Page:
+        """Return the persistent keepalive page, opening one if needed.
+
+        Reuses self._keepalive_page if it's still valid (not closed and
+        URL still on ove.com). Otherwise opens a fresh worker tab in
+        the seed page's context and stashes it.
+        """
+        existing = self._keepalive_page
+        if existing is not None:
+            try:
+                if not existing.is_closed():
+                    url = (existing.url or "").lower()
+                    if "ove.com" in url:
+                        return existing
+            except Exception:
+                # Existing page handle is broken (Chrome restart, GC, etc.).
+                # Fall through to recreate.
+                pass
+            self._keepalive_page = None
+
+        # Need a fresh keepalive page. Open one in the seed tab's
+        # context so it shares cookies + storage with the seed.
+        page = self._open_dedicated_ove_page(browser)
+        self._keepalive_page = page
+        return page
+
+    def _touch_session_worker_tab(self) -> None:
+        # Worker-tab fallback. Byte-identical to the pre-2026-05-04
+        # behavior so KEEPALIVE_PERSISTENT_TAB=false is a safe
+        # emergency rollback. Emits the same KEEPALIVE_TICK telemetry
+        # shape with tab_strategy=worker.
+        t0 = time.monotonic()
+        outcome = self._KEEPALIVE_OUTCOME_OK
+        url_at_failure: str | None = None
+        seed_url: str | None = None
+        page: Page | None = None
+        try:
+            try:
+                browser = self._connect_browser()
+            except Exception as exc:
+                outcome = self._KEEPALIVE_OUTCOME_CONNECT_FAILED
+                self._browser = None
+                raise BrowserSessionError(f"OVE browser keepalive failed: {exc}") from exc
+
+            try:
+                seed_url = self._snapshot_first_blank_or_auth_url(browser)
+                page = self._open_dedicated_ove_page(browser)
+            except PlaywrightTimeoutError as exc:
+                outcome = self._KEEPALIVE_OUTCOME_GOTO_TIMEOUT
+                url_at_failure = self._snapshot_first_blank_or_auth_url(browser) or seed_url
+                self._close_stuck_blank_or_auth_tabs(browser)
+                LOGGER.warning(
+                    "Keepalive seed-page goto timed out (treating as transient): %s",
+                    exc,
+                )
+                return
+            except BrowserSessionError:
+                outcome = self._KEEPALIVE_OUTCOME_LOGIN_FAILED
+                url_at_failure = self._snapshot_first_blank_or_auth_url(browser) or seed_url
+                self._close_stuck_blank_or_auth_tabs(browser)
+                raise
+
+            try:
+                try:
+                    page.goto(self._saved_searches_url(), wait_until="domcontentloaded", timeout=30000)
+                except PlaywrightTimeoutError as exc:
+                    outcome = self._KEEPALIVE_OUTCOME_GOTO_TIMEOUT
+                    try:
+                        url_at_failure = page.url
+                    except Exception:
+                        url_at_failure = None
+                    LOGGER.warning(
+                        "Keepalive worker-page goto timed out (treating as transient): %s",
+                        exc,
+                    )
+                    return
+                if self._is_login_page(page):
+                    try:
+                        url_at_failure = page.url
+                    except Exception:
+                        pass
+                    if self._try_single_shot_login_click(page):
+                        outcome = self._KEEPALIVE_OUTCOME_LOGIN_OK
+                        url_at_failure = None
+                    else:
+                        try:
+                            lk = auth_lockout.get_state(
+                                self.settings.artifact_dir,
+                                port=self.settings.chrome_debug_port,
+                            )
+                        except Exception:
+                            lk = None
+                        if lk is not None and lk.blocked:
+                            outcome = self._KEEPALIVE_OUTCOME_LOGIN_BLOCKED
+                        else:
+                            outcome = self._KEEPALIVE_OUTCOME_LOGIN_FAILED
+                        raise BrowserSessionError(
+                            "OVE session is not authenticated; browser is on the login page"
+                        )
+            finally:
+                self._close_page(page)
+        except BrowserSessionError:
+            self._browser = None
+            raise
+        except Exception as exc:
+            outcome = self._KEEPALIVE_OUTCOME_CONNECT_FAILED
+            self._browser = None
+            raise BrowserSessionError(f"OVE browser keepalive failed: {exc}") from exc
+        finally:
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            LOGGER.warning(
+                "KEEPALIVE_TICK port=%d outcome=%s duration_ms=%d url_at_failure=%s "
+                "seed_url=%s tab_strategy=worker cards_render_ms=- decay_signal=none",
+                self.settings.chrome_debug_port,
+                outcome,
+                duration_ms,
+                url_at_failure if url_at_failure is not None else "-",
+                seed_url if seed_url is not None else "-",
+            )
+
+    def _snapshot_first_blank_or_auth_url(self, browser: Browser) -> str | None:
+        """Return the URL of the first about:blank or auth.* tab found
+        across all contexts, or None. Used to capture what the user is
+        seeing when a goto times out — the visible spinner is almost
+        always one of these."""
+        try:
+            for context in browser.contexts:
+                for page in context.pages:
+                    try:
+                        if page.is_closed():
+                            continue
+                        url = (page.url or "").lower()
+                    except Exception:
+                        continue
+                    if not url:
+                        continue
+                    if (
+                        url == "about:blank"
+                        or any(pat in url for pat in self._ORPHAN_TAB_URL_PATTERNS)
+                    ):
+                        try:
+                            return page.url
+                        except Exception:
+                            return url
+        except Exception:
+            return None
+        return None
+
+    def _close_stuck_blank_or_auth_tabs(self, browser: Browser) -> None:
+        """Close every about:blank or auth-domain tab still open on this
+        browser. Called from the keepalive timeout path because the
+        existing try/finally only closed the worker page returned from
+        _open_dedicated_ove_page; if _get_ove_page's seed-page goto
+        timed out FIRST, the seed about:blank tab was left mid-
+        navigation. This method is the cleanup for that leak path —
+        safe even if no leak exists (no-op when nothing matches).
+        Failures are swallowed; this is a safety net."""
+        try:
+            for context in browser.contexts:
+                for page in list(context.pages):
+                    try:
+                        if page.is_closed():
+                            continue
+                        url = (page.url or "").lower()
+                    except Exception:
+                        continue
+                    if not url:
+                        continue
+                    if (
+                        url == "about:blank"
+                        or any(pat in url for pat in self._ORPHAN_TAB_URL_PATTERNS)
+                    ):
+                        self._close_page(page)
+        except Exception as exc:
+            LOGGER.debug("close_stuck_blank_or_auth_tabs: enumeration failed: %s", exc)
 
     def list_saved_searches(self) -> tuple[str, ...]:
         browser = self._connect_browser()
@@ -794,6 +1585,24 @@ class PlaywrightCdpBrowserSession:
                     self._open_saved_search(page, search_name)
                     download = self._trigger_export(page)
                     self._persist_download(download, target_path, search_name)
+                    # Row-count delta canary (2026-05-06). Detects silent
+                    # data-loss bugs like the 4948 -> 4305 shrinkage seen
+                    # on East-Hub-2025-2026 today between consecutive
+                    # syncs. Fires an alert if today's row count drops
+                    # below 75% of the recent max for the same search.
+                    # Side-effect free if history is empty (first run).
+                    try:
+                        self._record_export_count_and_check_canary(
+                            target_path, search_name,
+                        )
+                    except Exception as canary_exc:
+                        # Canary failures are non-fatal; the export
+                        # itself succeeded.
+                        LOGGER.warning(
+                            "Export row-count canary failed for '%s' "
+                            "(non-fatal): %s",
+                            search_name, canary_exc,
+                        )
                     return target_path
                 except SavedSearchPageEmpty as exc:
                     # OVE returned "No Saved Searches" — don't waste time on
@@ -1006,12 +1815,18 @@ class PlaywrightCdpBrowserSession:
             autocheck_data: dict[str, Any] | None = None
             try:
                 LOGGER.info("Stage capture_autocheck: starting for VIN %s", vin)
-                autocheck_data = self._capture_autocheck_on_page(detail_page, vin, artifact_dir)
+                autocheck_data = self._capture_autocheck_on_page(
+                    detail_page, vin, artifact_dir, listing_json=listing_json,
+                )
                 LOGGER.info(
-                    "Stage capture_autocheck: complete for VIN %s (score=%s, status=%s)",
+                    "Stage capture_autocheck: complete for VIN %s "
+                    "(score=%s, status=%s, category=%s, stage=%s, message=%s)",
                     vin,
                     autocheck_data.get("autocheck_score") if autocheck_data else None,
                     autocheck_data.get("scrape_status", "unknown") if autocheck_data else "skipped",
+                    autocheck_data.get("failure_category") if autocheck_data else None,
+                    autocheck_data.get("failure_stage") if autocheck_data else None,
+                    autocheck_data.get("failure_message") if autocheck_data else None,
                 )
             except Exception as ac_exc:
                 LOGGER.warning("AutoCheck capture failed (non-fatal) for VIN %s: %s", vin, ac_exc)
@@ -1241,6 +2056,17 @@ class PlaywrightCdpBrowserSession:
                     break
 
             for page in pages:
+                # Identity-skip the persistent keepalive page (2026-05-04
+                # fix). It might transiently show about:blank during
+                # navigation between ticks; the URL-based about:blank
+                # rule below would otherwise kill it. The identity
+                # check is the only safe way — never trust URL alone for
+                # the keepalive page.
+                if (
+                    self._keepalive_page is not None
+                    and page is self._keepalive_page
+                ):
+                    continue
                 try:
                     if page.is_closed():
                         continue
@@ -1304,6 +2130,45 @@ class PlaywrightCdpBrowserSession:
             )
         except Exception:
             return False
+
+    def _wait_for_vehicle_results_cards(self, page: Page, *, timeout_ms: int = 60_000) -> None:
+        """Wait for VEHICLE result cards to render on a search-results
+        page (e.g. /search/results#/results/<saved-search-uuid>).
+
+        2026-05-06: distinct from _wait_for_saved_search_cards, which
+        waits for SAVED-SEARCH list cards on the /saved_searches list
+        page. After the user (or active keepalive) clicks INTO a saved
+        search, the page navigates to the results URL and renders
+        vehicle-result cards using a totally different DOM structure.
+        Using the wrong helper here was the regression that produced
+        cards_did_not_render on every active-keepalive tick on
+        2026-05-06 23:05.
+
+        Distinguishes 'session expired, redirected to login' from
+        'cards just haven't rendered yet'. Only raises on session
+        problems; ordinary timeouts surface as a clear
+        BrowserSessionError so the caller can decide to recover or
+        continue.
+        """
+        if self._is_login_page(page):
+            raise BrowserSessionError(
+                "OVE session is not authenticated; browser is on the login page"
+            )
+        try:
+            page.wait_for_selector(
+                "[data-test-id*='vehicle'], [class*='VehicleCard'], tr[data-test-id*='vehicle']",
+                state="visible",
+                timeout=timeout_ms,
+            )
+        except PlaywrightTimeoutError:
+            if self._is_login_page(page):
+                raise BrowserSessionError(
+                    "OVE session expired during wait; browser redirected to login page"
+                )
+            raise BrowserSessionError(
+                f"Vehicle result cards did not render within {timeout_ms}ms — "
+                "possible session/data-layer issue or OVE outage"
+            )
 
     def _wait_for_saved_search_cards(self, page: Page, *, timeout_ms: int = 15_000) -> None:
         """Wait for saved-search card elements to appear in the DOM.
@@ -1426,32 +2291,31 @@ class PlaywrightCdpBrowserSession:
         card = page.locator(card_selector).first
         original_url = page.url
         if card.count():
-            # Strategy 1: click the inner title div inside the card
-            title_in_card = card.locator(".SavedSearchItem__title, .SavedSearchItem__title-container").first
+            # Strategy 1: click the actual title div inside the card.
+            # Important: do NOT use `.SavedSearchItem__title-container` here.
+            # That wrapper appears before the title in DOM order, so a
+            # `.first` locator can accidentally target the non-clickable
+            # container and leave the browser on the saved-searches list.
+            title_in_card = card.locator(".SavedSearchItem__title").first
             click_target = title_in_card if title_in_card.count() else card
             try:
                 click_target.click(timeout=10000)
-                # Wait for the page to actually navigate away from the
-                # saved-searches list. The previous code used
-                # wait_for_load_state("networkidle") which returns
-                # immediately if no navigation happened. We now verify
-                # the URL actually changed.
-                page.wait_for_timeout(2000)
-                if page.url != original_url and "/saved_searches" not in page.url:
-                    # Don't wait for networkidle — OVE has persistent XHR
-                    # polling that never settles. domcontentloaded is the
-                    # real signal, and the subsequent export selector wait
-                    # ensures the results rendered.
-                    page.wait_for_load_state("domcontentloaded", timeout=15000)
-                    LOGGER.info("Navigated to saved search '%s' results at %s", matched_name, page.url)
-                    return
+                # Verify the SPA actually moved into a results route.
+                # A click can succeed visually while the page stays on the
+                # saved-search index, so we wait explicitly for the hash
+                # route to become a results URL before trusting the click.
+                page.wait_for_url(re.compile(r"/results/"), timeout=15000)
+                page.wait_for_load_state("domcontentloaded", timeout=15000)
+                LOGGER.info("Navigated to saved search '%s' results at %s", matched_name, page.url)
+                return
+            except PlaywrightTimeoutError:
                 LOGGER.warning(
-                    "Click on saved search '%s' did not navigate away from list page (url=%s)",
+                    "Click on saved search '%s' did not reach results URL (url=%s)",
                     matched_name,
                     page.url,
                 )
-            except PlaywrightTimeoutError:
-                LOGGER.warning("Click on saved search '%s' card timed out", matched_name)
+            except Exception as exc:
+                LOGGER.warning("Click on saved search '%s' card failed: %s", matched_name, exc)
 
         # Strategy 2: configured link selector (a:has-text / button:has-text)
         link_selector = self.settings.ove_saved_search_link_selector.format(search_name=matched_name)
@@ -1610,13 +2474,27 @@ class PlaywrightCdpBrowserSession:
         # Without this, OVE can export a 0-byte CSV when the React app
         # has navigated to the results URL but hasn't populated the
         # results grid yet (seen at peak OVE load).
+        #
+        # 2026-05-11 fix: bumped from 60s → 180s. Operator confirmed
+        # the largest east-hub searches (East-Hub-2015-2021 et al.,
+        # 3k-4k rows each) now consistently take ~120s to render on
+        # OVE's side — twice the previous 60s budget. With the silent
+        # "proceed anyway" fallback, the export button isn't even on
+        # the page yet when the timeout fires, so the trigger-locator
+        # search at the bottom of this method fails and the whole
+        # export raises BrowserSessionError. 180s gives ~50% margin
+        # over the observed render time. Grid-settle also bumped
+        # 1500ms → 3000ms since a slower render implies slower hydrate.
+        #
+        # Prior history: 2026-05-06 bumped 20s → 60s based on 22-30s
+        # observed renders.
         try:
             page.wait_for_selector(
                 "[data-test-id*='vehicle'], [class*='VehicleCard'], tr[data-test-id*='vehicle']",
                 state="visible",
-                timeout=20000,
+                timeout=180000,
             )
-            page.wait_for_timeout(1500)  # let the rest of the grid catch up
+            page.wait_for_timeout(3000)  # let the rest of the grid catch up
         except PlaywrightTimeoutError:
             LOGGER.warning("Vehicle results selector not found before export; proceeding anyway")
 
@@ -1630,6 +2508,48 @@ class PlaywrightCdpBrowserSession:
             download = self._try_download_click(page, locator)
             if download is not None:
                 return download
+
+        # OVE's saved-search results page hides the real export entry in a
+        # menu item (#inventory_export). Clicking it navigates to the
+        # Inventory Export page, where the actual CSV download is triggered
+        # by the visible "Create Report" submit button.
+        hidden_inventory_export = page.locator("a#inventory_export").first
+        try:
+            if hidden_inventory_export.count() > 0:
+                try:
+                    with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                        page.evaluate(
+                            """
+                            () => {
+                              const el = document.querySelector('a#inventory_export');
+                              if (!el) throw new Error('Missing inventory export link');
+                              el.click();
+                            }
+                            """
+                        )
+                except Exception:
+                    page.evaluate(
+                        """
+                        () => {
+                          const el = document.querySelector('a#inventory_export');
+                          if (!el) throw new Error('Missing inventory export link');
+                          el.click();
+                        }
+                        """
+                    )
+                    page.wait_for_timeout(3000)
+                page.wait_for_timeout(1000)
+                report_download_locators = [
+                    page.locator("input#generate_button").first,
+                    page.get_by_role("button", name=re.compile(r"create\s*report", re.I)).first,
+                    page.get_by_role("button", name=re.compile(r"generate", re.I)).first,
+                ]
+                for report_trigger in report_download_locators:
+                    download = self._try_download_click(page, report_trigger)
+                    if download is not None:
+                        return download
+        except Exception as exc:
+            LOGGER.debug("Hidden inventory export flow did not complete cleanly: %s", exc)
 
         trigger_locators = [
             page.locator("#export-action-button").first,
@@ -1693,6 +2613,144 @@ class PlaywrightCdpBrowserSession:
             return locator.count() > 0 and locator.is_visible(timeout=1000) and locator.is_enabled(timeout=1000)
         except Exception:
             return False
+
+    # Row-count delta canary thresholds (2026-05-06). Detects silent
+    # data-loss bugs like the 4948 -> 4305 shrinkage seen on
+    # East-Hub-2025-2026 today between consecutive syncs.
+    _EXPORT_HISTORY_MAX = 10
+    _EXPORT_HISTORY_FILENAME = "saved_search_export_history.json"
+    # If current count is below this fraction of the recent max, fire
+    # an alert. 0.75 = 25% drop is considered suspicious.
+    _EXPORT_SHRINKAGE_THRESHOLD = 0.75
+    # Don't alert on tiny absolute drops (e.g. legitimate 10-row churn
+    # on a 50-row search). Only alert if the drop is meaningful.
+    _EXPORT_SHRINKAGE_MIN_ABSOLUTE = 100
+
+    def _record_export_count_and_check_canary(
+        self,
+        target_path: Path,
+        search_name: str,
+    ) -> None:
+        """Record the row count of the just-exported CSV and alert if it
+        dropped suspiciously vs recent exports of the same search.
+
+        State file: artifacts/_state/saved_search_export_history.json
+        Per-search history: last 10 (timestamp, row_count) pairs.
+
+        Alerting: emits an EXPORT_SHRINKAGE_DETECTED log line and (if
+        a notifier is wired in) sends an admin alert when the new
+        count is below 75% of the recent max AND the absolute drop is
+        > 100 rows. The 75% threshold tolerates normal auction churn
+        (vehicles selling/expiring throughout the day) but catches
+        the multi-hundred-row losses that indicate a partial export.
+        """
+        import json as _json
+        # Count rows = total lines minus header. Tolerate trailing
+        # blank line by counting non-empty lines only.
+        try:
+            with target_path.open("r", encoding="utf-8", errors="replace") as fh:
+                row_count = max(0, sum(1 for line in fh if line.strip()) - 1)
+        except Exception as exc:
+            LOGGER.warning(
+                "Row-count canary: failed to count rows in %s: %s",
+                target_path, exc,
+            )
+            return
+
+        history_path = (
+            self.settings.artifact_dir / "_state" / self._EXPORT_HISTORY_FILENAME
+        )
+        history: dict[str, Any] = {}
+        if history_path.exists():
+            try:
+                history = _json.loads(history_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                LOGGER.warning(
+                    "Row-count canary: history file unreadable (%s); "
+                    "starting fresh", exc,
+                )
+                history = {}
+
+        per_search: list[dict[str, Any]] = list(
+            history.get(search_name) or []
+        )
+        # Look at recent counts BEFORE appending the new one so we
+        # don't compare against ourselves.
+        recent_counts = [
+            int(entry.get("row_count") or 0)
+            for entry in per_search[-self._EXPORT_HISTORY_MAX:]
+            if isinstance(entry, dict)
+        ]
+        recent_max = max(recent_counts) if recent_counts else 0
+
+        # Append new entry and cap the history.
+        per_search.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "row_count": row_count,
+        })
+        per_search = per_search[-self._EXPORT_HISTORY_MAX:]
+        history[search_name] = per_search
+
+        try:
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+            history_path.write_text(
+                _json.dumps(history, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "Row-count canary: failed to write history file %s: %s",
+                history_path, exc,
+            )
+
+        # Canary check. Skip if no baseline (first run for this search).
+        if recent_max == 0:
+            LOGGER.info(
+                "Export row-count baseline established for '%s': %d rows",
+                search_name, row_count,
+            )
+            return
+
+        absolute_drop = recent_max - row_count
+        ratio = (row_count / recent_max) if recent_max > 0 else 1.0
+        suspicious = (
+            ratio < self._EXPORT_SHRINKAGE_THRESHOLD
+            and absolute_drop >= self._EXPORT_SHRINKAGE_MIN_ABSOLUTE
+        )
+
+        if suspicious:
+            LOGGER.error(
+                "EXPORT_SHRINKAGE_DETECTED search=%r current_rows=%d "
+                "recent_max=%d drop=%d ratio=%.2f threshold=%.2f",
+                search_name, row_count, recent_max, absolute_drop,
+                ratio, self._EXPORT_SHRINKAGE_THRESHOLD,
+            )
+            if self._notifier is not None:
+                try:
+                    notify_fn = getattr(
+                        self._notifier, "notify_export_shrinkage", None,
+                    )
+                    if callable(notify_fn):
+                        notify_fn(
+                            search_name=search_name,
+                            current_rows=row_count,
+                            recent_max=recent_max,
+                            absolute_drop=absolute_drop,
+                            ratio=ratio,
+                            threshold=self._EXPORT_SHRINKAGE_THRESHOLD,
+                            logger=LOGGER,
+                        )
+                except Exception as alert_exc:
+                    LOGGER.warning(
+                        "Failed to fire export-shrinkage alert: %s",
+                        alert_exc,
+                    )
+        else:
+            LOGGER.info(
+                "Export row-count OK for '%s': %d rows "
+                "(recent_max=%d, ratio=%.2f)",
+                search_name, row_count, recent_max, ratio,
+            )
 
     def _persist_download(self, download: Download, target_path: Path, search_name: str) -> None:
         failure = download.failure()
@@ -1824,7 +2882,11 @@ class PlaywrightCdpBrowserSession:
     """
 
     def _capture_autocheck_on_page(
-        self, detail_page: Page, vin: str, artifact_dir: Path,
+        self,
+        detail_page: Page,
+        vin: str,
+        artifact_dir: Path,
+        listing_json: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Extract AutoCheck data from an already-open OVE detail page.
 
@@ -1840,6 +2902,19 @@ class PlaywrightCdpBrowserSession:
         # full Experian report — so this step gathers owners/accidents/href
         # and is purely a precursor to the mandatory Experian navigation.
         LOGGER.info("AutoCheck: extracting inline indicators for VIN %s", vin)
+        listing_fallback = self._parse_autocheck_listing_json(listing_json)
+        if listing_fallback:
+            LOGGER.info(
+                "AutoCheck listing JSON fallback for VIN %s: score=%s owners=%s "
+                "accidents=%s range=%s-%s",
+                vin,
+                listing_fallback.get("autocheck_score"),
+                listing_fallback.get("owner_count"),
+                listing_fallback.get("accident_count"),
+                listing_fallback.get("score_range_low"),
+                listing_fallback.get("score_range_high"),
+            )
+
         inline_data = detail_page.evaluate(self._AUTOCHECK_INLINE_EXTRACT_JS) or {}
         has_inline_section = bool(
             inline_data.get("view_report_href")
@@ -1858,16 +2933,30 @@ class PlaywrightCdpBrowserSession:
                 bool(inline_data.get("view_report_href")),
             )
             result = self._parse_autocheck_inline(inline_data)
+            result = self._merge_autocheck_fallback(result, listing_fallback)
         else:
             LOGGER.warning("AutoCheck: no inline section detected for VIN %s", vin)
             detail_page.screenshot(path=str(ac_artifact_dir / "autocheck-none.png"), full_page=True)
             (ac_artifact_dir / "autocheck-none.html").write_text(detail_page.content(), encoding="utf-8")
-            return {
-                "scrape_status": "failed",
-                "failure_category": "not_found",
-                "failure_message": "No AutoCheck section on listing page",
-                "raw_text": "",
-            }
+            if listing_fallback:
+                LOGGER.warning(
+                    "AutoCheck: inline section missing for VIN %s, continuing with "
+                    "listing JSON fallback before Experian navigation",
+                    vin,
+                )
+                result = {
+                    **listing_fallback,
+                    "raw_text": "",
+                    "failure_stage": "inline",
+                }
+            else:
+                return {
+                    "scrape_status": "failed",
+                    "failure_category": "not_found",
+                    "failure_stage": "inline",
+                    "failure_message": "No AutoCheck section on listing page",
+                    "raw_text": "",
+                }
 
         # Step 2: MANDATORY — open the full Experian report. Title brands,
         # odometer branding and other serious issues are frequently omitted
@@ -1880,8 +2969,14 @@ class PlaywrightCdpBrowserSession:
             detail_page, result, ac_artifact_dir, vin,
         )
         result["scrape_status"] = experian_outcome["scrape_status"]
+        if result["scrape_status"] == "success":
+            result.pop("failure_category", None)
+            result.pop("failure_message", None)
+            result.pop("failure_stage", None)
         if experian_outcome.get("failure_category"):
             result["failure_category"] = experian_outcome["failure_category"]
+        if experian_outcome.get("failure_stage"):
+            result["failure_stage"] = experian_outcome["failure_stage"]
         if experian_outcome.get("failure_message"):
             result["failure_message"] = experian_outcome["failure_message"]
         return result
@@ -2015,6 +3110,7 @@ class PlaywrightCdpBrowserSession:
             return {
                 "scrape_status": "partial",
                 "failure_category": "experian_session_expired",
+                "failure_stage": "experian_short_circuit",
                 "failure_message": (
                     f"Experian/VehicleHistService session expired for this "
                     f"scraper process (>= {self._EXPERIAN_MAX_CONSECUTIVE_LOGIN_REDIRECTS} "
@@ -2023,6 +3119,7 @@ class PlaywrightCdpBrowserSession:
                 ),
             }
 
+        failure_reasons: list[str] = []
         view_href = (result.get("view_report_href") or "").strip()
         if not view_href:
             # Re-extract from the DOM at the moment of navigation, in case
@@ -2042,6 +3139,12 @@ class PlaywrightCdpBrowserSession:
                             break
                 except Exception:
                     continue
+        if not view_href:
+            failure_reasons.append("missing_href")
+            LOGGER.warning(
+                "AutoCheck Experian report href missing for VIN %s; popup fallback will be attempted",
+                vin,
+            )
 
         # Path A: direct navigation to the report URL in a new tab. This is
         # the most reliable path — same context inherits Manheim SSO cookies
@@ -2080,6 +3183,7 @@ class PlaywrightCdpBrowserSession:
                             "AutoCheck direct nav URL redirected to auth for VIN %s: %s (consecutive=%s)",
                             vin, report_page.url, self._experian_consecutive_login_redirects,
                         )
+                        failure_reasons.append(f"direct_login_redirect:{report_page.url}")
                         skip_capture_auth = True
 
                 if not skip_capture_auth:
@@ -2109,6 +3213,7 @@ class PlaywrightCdpBrowserSession:
                             "AutoCheck direct nav landed on login for VIN %s: url=%s (consecutive=%s)",
                             vin, report_page.url, self._experian_consecutive_login_redirects,
                         )
+                        failure_reasons.append(f"direct_login_page:{report_page.url}")
                     elif self._is_experian_error_page(full_text):
                         LOGGER.warning(
                             "AutoCheck direct nav landed on Experian error page for VIN %s "
@@ -2118,6 +3223,7 @@ class PlaywrightCdpBrowserSession:
                         return {
                             "scrape_status": "partial",
                             "failure_category": "experian_rate_limited",
+                            "failure_stage": "direct_nav",
                             "failure_message": (
                                 "Experian returned 'Your request cannot be processed' "
                                 "(typically a rate-limit or stale session-token response)."
@@ -2128,7 +3234,11 @@ class PlaywrightCdpBrowserSession:
                         self._merge_full_experian_report(result, full_text)
                         LOGGER.info("AutoCheck full report captured via direct nav for VIN %s (%d chars)", vin, len(full_text))
                         return {"scrape_status": "success"}
+            except PlaywrightTimeoutError as report_exc:
+                failure_reasons.append(f"direct_timeout:{report_exc}")
+                LOGGER.warning("AutoCheck direct navigation timed out for VIN %s: %s", vin, report_exc)
             except Exception as report_exc:
+                failure_reasons.append(f"direct_error:{type(report_exc).__name__}:{report_exc}")
                 LOGGER.warning("AutoCheck direct navigation failed for VIN %s: %s", vin, report_exc)
             finally:
                 # Tab cleanup — runs even if goto/screenshot/inner_text
@@ -2144,6 +3254,7 @@ class PlaywrightCdpBrowserSession:
             return {
                 "scrape_status": "partial",
                 "failure_category": "experian_session_expired",
+                "failure_stage": "direct_nav",
                 "failure_message": (
                     f"Experian session expired during this VIN (hit "
                     f"{self._EXPERIAN_MAX_CONSECUTIVE_LOGIN_REDIRECTS}-redirect cap)."
@@ -2159,6 +3270,8 @@ class PlaywrightCdpBrowserSession:
             try:
                 trigger = detail_page.locator(selector).first
                 if not trigger.is_visible(timeout=1500):
+                    failure_reasons.append(f"popup_selector_not_visible:{selector}")
+                    LOGGER.info("AutoCheck popup selector not visible for VIN %s: %s", vin, selector)
                     continue
                 LOGGER.info("AutoCheck: attempting popup click via %s for VIN %s", selector, vin)
                 # Popup spawn can take 3-5s on a busy session; give it 12s.
@@ -2185,6 +3298,7 @@ class PlaywrightCdpBrowserSession:
                             "AutoCheck popup URL redirected to auth for VIN %s: %s (consecutive=%s)",
                             vin, popup.url, self._experian_consecutive_login_redirects,
                         )
+                        failure_reasons.append(f"popup_login_redirect:{popup.url}")
                         if self._experian_short_circuit_tripped():
                             break
                         continue
@@ -2208,6 +3322,7 @@ class PlaywrightCdpBrowserSession:
                         "AutoCheck popup landed on login for VIN %s: url=%s (consecutive=%s)",
                         vin, popup.url, self._experian_consecutive_login_redirects,
                     )
+                    failure_reasons.append(f"popup_login_page:{popup.url}")
                     if self._experian_short_circuit_tripped():
                         break
                     continue
@@ -2220,6 +3335,7 @@ class PlaywrightCdpBrowserSession:
                     return {
                         "scrape_status": "partial",
                         "failure_category": "experian_rate_limited",
+                        "failure_stage": "popup",
                         "failure_message": (
                             "Experian returned 'Your request cannot be processed' "
                             "(typically a rate-limit or stale session-token response)."
@@ -2229,8 +3345,12 @@ class PlaywrightCdpBrowserSession:
                 self._merge_full_experian_report(result, popup_text)
                 LOGGER.info("AutoCheck full report captured via popup click for VIN %s (%d chars)", vin, len(popup_text))
                 return {"scrape_status": "success"}
+            except PlaywrightTimeoutError as popup_exc:
+                failure_reasons.append(f"popup_timeout:{selector}:{popup_exc}")
+                LOGGER.warning("AutoCheck popup click timed out via %s for VIN %s: %s", selector, vin, popup_exc)
             except Exception as popup_exc:
-                LOGGER.debug("AutoCheck popup click via %s failed for VIN %s: %s", selector, vin, popup_exc)
+                failure_reasons.append(f"popup_error:{selector}:{type(popup_exc).__name__}:{popup_exc}")
+                LOGGER.warning("AutoCheck popup click via %s failed for VIN %s: %s", selector, vin, popup_exc)
             finally:
                 # Popup cleanup — runs even if wait_for_load_state /
                 # screenshot / inner_text raised. Critical for the
@@ -2249,19 +3369,38 @@ class PlaywrightCdpBrowserSession:
             return {
                 "scrape_status": "partial",
                 "failure_category": "experian_session_expired",
+                "failure_stage": "popup",
                 "failure_message": (
                     f"Experian session expired (hit "
                     f"{self._EXPERIAN_MAX_CONSECUTIVE_LOGIN_REDIRECTS}-redirect cap); "
                     "restart scraper to recover."
                 ),
             }
+        detail = "; ".join(failure_reasons[-8:])
+        if not detail:
+            detail = "no detail; no direct href and no popup produced a report"
+        LOGGER.warning(
+            "AutoCheck Experian report unreachable for VIN %s: %s",
+            vin,
+            detail,
+        )
+        category = "experian_report_unreachable"
+        if any(reason.startswith("direct_timeout") or reason.startswith("popup_timeout") for reason in failure_reasons):
+            category = "experian_timeout"
+        elif any("login_" in reason for reason in failure_reasons):
+            category = "experian_login_redirect"
+        elif any(reason == "missing_href" for reason in failure_reasons):
+            category = "experian_href_missing"
+        elif any(reason.startswith("popup_") for reason in failure_reasons):
+            category = "experian_popup_failed"
         return {
             "scrape_status": "partial",
-            "failure_category": "experian_report_unreachable",
+            "failure_category": category,
+            "failure_stage": "experian_report",
             "failure_message": (
                 "Inline AutoCheck indicators captured but the full Experian "
                 "report could not be opened; title-brand and odometer-brand "
-                "checks may be incomplete."
+                f"checks may be incomplete. Attempts: {detail}"
             ),
         }
 
@@ -2332,6 +3471,7 @@ class PlaywrightCdpBrowserSession:
         # was green/red — the full report knows *what* the brand is.
         for key in (
             "title_brand_check",
+            "other_title_brand_specific_event_check",
             "odometer_check",
             "accident_check",
             "damage_check",
@@ -2343,6 +3483,20 @@ class PlaywrightCdpBrowserSession:
                 result[key] = full_value
         if full_parsed.get("autocheck_score") is not None:
             result["autocheck_score"] = full_parsed["autocheck_score"]
+        for key in (
+            "score_range_low",
+            "score_range_high",
+            "comparable_vehicle_year",
+            "comparable_vehicle_class",
+            "historical_event_count",
+            "owner_count",
+            "accident_count",
+            "last_reported_event_date",
+            "last_reported_mileage",
+        ):
+            full_value = full_parsed.get(key)
+            if full_value is not None and full_value != "":
+                result[key] = full_value
 
     def scrape_autocheck_modal(self, vin: str, artifact_dir: Path) -> dict[str, Any]:
         """Standalone AutoCheck scrape — opens its own page for the VIN.
@@ -2375,6 +3529,82 @@ class PlaywrightCdpBrowserSession:
                 page.close()
             except Exception:
                 pass
+
+    @staticmethod
+    def _merge_autocheck_fallback(
+        result: dict[str, Any],
+        fallback: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Fill missing AutoCheck fields from the OVE listing JSON.
+
+        The embedded OVE listing object often has score/range/owner/accident
+        facts even when the inline rendered AutoCheck widget is late or absent.
+        It is not authoritative enough to mark a scrape successful, but it is
+        valuable fallback data for partial captures and VPS rendering.
+        """
+        if not fallback:
+            return result
+        merged = dict(result)
+        for key, value in fallback.items():
+            if value is None or value == "":
+                continue
+            if merged.get(key) in (None, ""):
+                merged[key] = value
+        return merged
+
+    @staticmethod
+    def _parse_autocheck_listing_json(listing_json: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(listing_json, dict):
+            return {}
+        autocheck = listing_json.get("autocheck")
+        if not isinstance(autocheck, dict):
+            return {}
+
+        result: dict[str, Any] = {}
+
+        field_map = {
+            "score": "autocheck_score",
+            "ownerCount": "owner_count",
+            "numberOfAccidents": "accident_count",
+            "compareScoreRangeLow": "score_range_low",
+            "compareScoreRangeHigh": "score_range_high",
+        }
+        for source_key, target_key in field_map.items():
+            value = autocheck.get(source_key)
+            if isinstance(value, int):
+                result[target_key] = value
+
+        def ok_value(value: object, ok_label: str = "OK", problem_label: str = "Problem Reported") -> str | None:
+            if value is True:
+                return ok_label
+            if value is False:
+                return problem_label
+            return None
+
+        title_status = ok_value(autocheck.get("titleAndProblemCheckOK"))
+        if title_status:
+            result["title_brand_check"] = title_status
+            result["other_title_brand_specific_event_check"] = title_status
+
+        odometer_status = ok_value(autocheck.get("odometerCheckOK"))
+        if odometer_status:
+            result["odometer_check"] = odometer_status
+
+        use_event_status = ok_value(
+            autocheck.get("vehicleUseAndEventCheckOK"),
+            ok_label="OK",
+            problem_label="Other Use Reported",
+        )
+        if use_event_status:
+            result["vehicle_use"] = use_event_status
+
+        accidents = result.get("accident_count")
+        if isinstance(accidents, int):
+            result["accident_check"] = (
+                f"Information Reported({accidents})" if accidents > 0 else "OK"
+            )
+
+        return result
 
     @staticmethod
     def _parse_autocheck_inline(data: dict) -> dict[str, Any]:
@@ -2466,10 +3696,56 @@ class PlaywrightCdpBrowserSession:
                 if match else ""
             )
 
+        other_title_match = re.search(
+            r"Other\s+Title\s+Brand\s+and\s+Specific\s+Event\s+Check\s*[-\u2013\u2014]?\s*(.*?)(?=\n[A-Z]|\Z)",
+            raw_text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        result["other_title_brand_specific_event_check"] = (
+            PlaywrightCdpBrowserSession._clean_check_value(other_title_match.group(1))
+            if other_title_match else ""
+        )
+
         # Extract score if present
         score_match = re.search(r"(?:AutoCheck\s*Score|score)\s*:?\s*(\d+)", raw_text, re.IGNORECASE)
         if score_match:
             result["autocheck_score"] = int(score_match.group(1))
+
+        comparable_match = re.search(
+            r"Other\s+comparable\s+(\d{4})\s+vehicles\s+in\s+the\s+(.+?)\s+"
+            r"typically\s+score\s+between\s+(\d+)\s*[-\u2013\u2014]\s*(\d+)",
+            raw_text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if comparable_match:
+            result["comparable_vehicle_year"] = int(comparable_match.group(1))
+            result["comparable_vehicle_class"] = re.sub(r"\s+", " ", comparable_match.group(2)).strip()
+            result["score_range_low"] = int(comparable_match.group(3))
+            result["score_range_high"] = int(comparable_match.group(4))
+
+        event_count_match = re.search(
+            r"No\.\s*of\s*Historical\s*Events\s*:?\s*(\d+)",
+            raw_text,
+            re.IGNORECASE,
+        )
+        if event_count_match:
+            result["historical_event_count"] = int(event_count_match.group(1))
+
+        last_event_match = re.search(
+            r"Last\s+Reported\s+Event\s+Date\s*:?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})",
+            raw_text,
+            re.IGNORECASE,
+        )
+        if last_event_match:
+            result["last_reported_event_date"] = last_event_match.group(1)
+
+        last_mileage_match = re.search(
+            r"Last\s+Reported\s+Mileage\s*:?\s*([0-9][0-9,]*)",
+            raw_text,
+            re.IGNORECASE,
+        )
+        if last_mileage_match:
+            result["last_reported_mileage"] = last_mileage_match.group(1)
 
         # Extract accident count
         accident_match = re.search(r"Number\s*of\s*Accidents?\s*:?\s*(\d+)", raw_text, re.IGNORECASE)
@@ -3037,7 +4313,12 @@ class PlaywrightCdpBrowserSession:
     def _page_looks_like_detail_for_vin(self, page: Page, vin: str) -> bool:
         url = (page.url or "").lower()
         vin_lower = vin.lower()
-        if vin_lower in url and "/buy#/" not in url and "/saved_searches#/" not in url:
+        if "/buy#/" in url or "/saved_searches#/" in url:
+            return False
+        if "/#/results" in url or "#/results" in url:
+            return False
+        detail_route = f"#/details/{vin_lower}/"
+        if detail_route in url:
             return True
         try:
             return bool(
@@ -3047,9 +4328,15 @@ class PlaywrightCdpBrowserSession:
                         if (!text.includes(needle.toLowerCase())) return false;
                         const href = location.href.toLowerCase();
                         if (href.includes('/buy#/') || href.includes('/saved_searches#/')) return false;
+                        if (href.includes('#/results') || href.includes('/#/results')) return false;
+                        if (document.querySelector(
+                            ".SearchResultsView__container, [data-test-id='search-results'], [data-test-id='search-results-view']"
+                        )) return false;
+                        if (href.includes(`#/details/${needle.toLowerCase()}/`)) return true;
                         return Boolean(
-                            document.querySelector("h1, h2, [class*='vehicle-title'], [class*='listing-title']") ||
-                            document.querySelector("[data-test-id*='condition'], [class*='condition-report'], [class*='vehicle-detail']")
+                            document.querySelector(
+                                ".VehicleDetailsView__container, [data-test-id='vehicle-details-view-container'], [data-test-id='vehicle-details'], [class*='VehicleDetailsView']"
+                            )
                         );
                     }""",
                     vin,

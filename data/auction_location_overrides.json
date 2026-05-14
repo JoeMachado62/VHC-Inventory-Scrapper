@@ -1,4 +1,829 @@
 {
   "version": 1,
-  "overrides": []
+  "overrides": [
+    {
+      "pickup_location": "FL - South Florida Auto Auction",
+      "auction_house": "South Florida Auto Auction",
+      "state": "FL",
+      "zip": "33311",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:10:19.349487+00:00"
+    },
+    {
+      "pickup_location": "FL - Orlando Longwood Auto Auction",
+      "auction_house": "Orlando Longwood Auto Auction",
+      "state": "FL",
+      "zip": "32750",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:10:28.251455+00:00"
+    },
+    {
+      "pickup_location": "FL - FT LAUDERDALE",
+      "auction_house": "America's Auto Auction Richmond",
+      "state": "FL",
+      "zip": "33301",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:10:36.623946+00:00"
+    },
+    {
+      "pickup_location": "SC - America's Auto Auction Charleston",
+      "auction_house": "America's Auto Auction Charleston",
+      "state": "SC",
+      "zip": "29461",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:10:40.740187+00:00"
+    },
+    {
+      "pickup_location": "VA - America's Auto Auction Richmond",
+      "auction_house": "America's Auto Auction Richmond",
+      "state": "VA",
+      "zip": "23234",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:10:44.523402+00:00"
+    },
+    {
+      "pickup_location": "MI - America's Auto Auction West Michigan",
+      "auction_house": "America's Auto Auction West Michigan",
+      "state": "MI",
+      "zip": "49348",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:10:49.371333+00:00"
+    },
+    {
+      "pickup_location": "TX - Big Valley Auto Auction",
+      "auction_house": "Big Valley Auto Auction",
+      "state": "TX",
+      "zip": "78537",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:10:57.850764+00:00"
+    },
+    {
+      "pickup_location": "GA - LaGrange, GA",
+      "auction_house": "America's Auto Auction Jacksonville",
+      "state": "GA",
+      "zip": "30241",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:11:16.742048+00:00"
+    },
+    {
+      "pickup_location": "IL - Northlake",
+      "auction_house": "Greater Rockford Auto Auction Inc",
+      "state": "IL",
+      "zip": "61109",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:11:21.828470+00:00"
+    },
+    {
+      "pickup_location": "NC - Fayettville",
+      "auction_house": "America's Auto Auction Charleston",
+      "state": "NC",
+      "zip": "27534",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:11:28.417140+00:00"
+    },
+    {
+      "pickup_location": "FL - America's Auto Auction Jacksonville",
+      "auction_house": "America's Auto Auction Jacksonville",
+      "state": "FL",
+      "zip": "32219",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:11:33.005873+00:00"
+    },
+    {
+      "pickup_location": "IN - America's Auto Auction Clark County",
+      "auction_house": "America's Auto Auction Clark County",
+      "state": "IN",
+      "zip": "47130",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:11:40.848198+00:00"
+    },
+    {
+      "pickup_location": "VA - America's Auto Auction Virginia",
+      "auction_house": "America's Auto Auction Virginia",
+      "state": "VA",
+      "zip": "23464",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:11:45.745252+00:00"
+    },
+    {
+      "pickup_location": "IL - NORTH PEKIN",
+      "auction_house": "America's Auto Auction Greater Peoria",
+      "state": "IL",
+      "zip": "61550",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:12:03.447118+00:00"
+    },
+    {
+      "pickup_location": "PA - Garden Spot Auto Auction",
+      "auction_house": "Garden Spot Auto Auction",
+      "state": "PA",
+      "zip": "17522",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:12:07.864396+00:00"
+    },
+    {
+      "pickup_location": "NC - Releigh",
+      "auction_house": "America's Your Auction Tampa Bay",
+      "state": "NC",
+      "zip": "28110",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:12:18.227722+00:00"
+    },
+    {
+      "pickup_location": "PA - America's Auto Auction Erie",
+      "auction_house": "America's Auto Auction Erie",
+      "state": "PA",
+      "zip": "16407",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:12:23.793156+00:00"
+    },
+    {
+      "pickup_location": "SC - America's Auto Auction Greenville",
+      "auction_house": "America's Auto Auction Greenville",
+      "state": "SC",
+      "zip": "29651",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:12:32.446907+00:00"
+    },
+    {
+      "pickup_location": "SC - Grand Strand Auto Auction LLC",
+      "auction_house": "Grand Strand Auto Auction LLC",
+      "state": "SC",
+      "zip": "29526",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:12:38.576939+00:00"
+    },
+    {
+      "pickup_location": "IL - Greater Rockford Auto Auction Inc",
+      "auction_house": "Greater Rockford Auto Auction Inc",
+      "state": "IL",
+      "zip": "61109",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:12:45.429658+00:00"
+    },
+    {
+      "pickup_location": "NC - St. Helena",
+      "auction_house": "DAA - Digital",
+      "state": "NC",
+      "zip": "28425",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:12:53.126650+00:00"
+    },
+    {
+      "pickup_location": "IL - America's Auto Auction Saint Louis",
+      "auction_house": "America's Auto Auction Saint Louis",
+      "state": "IL",
+      "zip": "62207",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:12:58.281776+00:00"
+    },
+    {
+      "pickup_location": "TX - America's Auto Auction Dallas",
+      "auction_house": "America's Auto Auction Dallas",
+      "state": "TX",
+      "zip": "75061",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:13:03.092054+00:00"
+    },
+    {
+      "pickup_location": "MI - SHELBY TOWNSHIP",
+      "auction_house": "America's Auto Auction Toledo",
+      "state": "MI",
+      "zip": "48317",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:13:10.830840+00:00"
+    },
+    {
+      "pickup_location": "TX - America's Auto Auction Austin",
+      "auction_house": "America's Auto Auction Austin",
+      "state": "TX",
+      "zip": "78610",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:13:14.571506+00:00"
+    },
+    {
+      "pickup_location": "NY - State Line Auto Auction",
+      "auction_house": "State Line Auto Auction",
+      "state": "NY",
+      "zip": "14892",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:13:19.955363+00:00"
+    },
+    {
+      "pickup_location": "SC - SPARTANURG",
+      "auction_house": "America's Auto Auction Richmond",
+      "state": "SC",
+      "zip": "29651",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:13:25.505202+00:00"
+    },
+    {
+      "pickup_location": "TN - Music City Auto Auction",
+      "auction_house": "Music City Auto Auction",
+      "state": "TN",
+      "zip": "37174",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:13:31.574734+00:00"
+    },
+    {
+      "pickup_location": "TN - United Auto Exchange",
+      "auction_house": "United Auto Exchange",
+      "state": "TN",
+      "zip": "38118",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:13:38.755274+00:00"
+    },
+    {
+      "pickup_location": "GA - America's Auto Auction Savannah",
+      "auction_house": "America's Auto Auction Savannah",
+      "state": "GA",
+      "zip": "31408",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:13:47.842965+00:00"
+    },
+    {
+      "pickup_location": "PA - America's Auto Auction Harrisburg",
+      "auction_house": "America's Auto Auction Harrisburg",
+      "state": "PA",
+      "zip": "17055",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:13:52.095292+00:00"
+    },
+    {
+      "pickup_location": "SC - BATESBURG - LEESVILLE",
+      "auction_house": "America's Auto Auction Richmond",
+      "state": "SC",
+      "zip": "29070",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:13:57.901451+00:00"
+    },
+    {
+      "pickup_location": "TN - DAA - Digital",
+      "auction_house": "DAA - Digital",
+      "state": "TN",
+      "zip": "37067",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:14:04.684629+00:00"
+    },
+    {
+      "pickup_location": "MO - 166 Auto Auction",
+      "auction_house": "166 Auto Auction",
+      "state": "MO",
+      "zip": "65807",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:14:08.595727+00:00"
+    },
+    {
+      "pickup_location": "AL - America's Auto Auction Birmingham",
+      "auction_house": "America's Auto Auction Birmingham",
+      "state": "AL",
+      "zip": "35004",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:14:12.494121+00:00"
+    },
+    {
+      "pickup_location": "MI - Waterford Township",
+      "auction_house": "America's Auto Auction West Michigan",
+      "state": "MI",
+      "zip": "49348",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:14:16.710260+00:00"
+    },
+    {
+      "pickup_location": "NY - Buffalo Auto Auction Incorporated",
+      "auction_house": "Buffalo Auto Auction Incorporated",
+      "state": "NY",
+      "zip": "14094",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:14:21.892975+00:00"
+    },
+    {
+      "pickup_location": "TX - Metro Auto Auction Dallas",
+      "auction_house": "Metro Auto Auction Dallas",
+      "state": "TX",
+      "zip": "75056",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:14:26.283916+00:00"
+    },
+    {
+      "pickup_location": "TX - America\u2019s Auto Auction Corpus Christi",
+      "auction_house": "America\u2019s Auto Auction Corpus Christi",
+      "state": "TX",
+      "zip": "78380",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:14:30.516431+00:00"
+    },
+    {
+      "pickup_location": "GA - AutoNation Auto Auction - Atlanta",
+      "auction_house": "AutoNation Auto Auction - Atlanta",
+      "state": "GA",
+      "zip": "30294",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:14:36.346246+00:00"
+    },
+    {
+      "pickup_location": "OH - Value Auto Auction",
+      "auction_house": "Value Auto Auction",
+      "state": "OH",
+      "zip": "43731",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:14:41.252432+00:00"
+    },
+    {
+      "pickup_location": "IN - New Whiteland",
+      "auction_house": "America's Auto Auction Dallas",
+      "state": "IN",
+      "zip": "46184",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:15:00.824667+00:00"
+    },
+    {
+      "pickup_location": "OH - America's Auto Auction Columbus Fair",
+      "auction_house": "America's Auto Auction Columbus Fair",
+      "state": "OH",
+      "zip": "43207",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:15:05.270851+00:00"
+    },
+    {
+      "pickup_location": "OH - South Bloomfield",
+      "auction_house": "America's Your Auction Tampa Bay",
+      "state": "OH",
+      "zip": "43103",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:15:14.070105+00:00"
+    },
+    {
+      "pickup_location": "TN - Clarksville, TN",
+      "auction_house": "Music City Auto Auction",
+      "state": "TN",
+      "zip": "37174",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:15:25.778661+00:00"
+    },
+    {
+      "pickup_location": "FL - America's Auto Auction Pensacola",
+      "auction_house": "America's Auto Auction Pensacola",
+      "state": "FL",
+      "zip": "32526",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T13:15:30.890698+00:00"
+    },
+    {
+      "pickup_location": "TX - America's Auto Auction San Antonio",
+      "auction_house": "America's Auto Auction San Antonio",
+      "state": "TX",
+      "zip": "78233",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:04:17.762578+00:00"
+    },
+    {
+      "pickup_location": "MO - St. Joseph",
+      "auction_house": "America's Auto Auction Richmond",
+      "state": "MO",
+      "zip": "64153",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:04:48.955009+00:00"
+    },
+    {
+      "pickup_location": "TX - America's Auto Auction Houston",
+      "auction_house": "America's Auto Auction Houston",
+      "state": "TX",
+      "zip": "77047",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:04:55.535139+00:00"
+    },
+    {
+      "pickup_location": "GA - CHAMBLEE",
+      "auction_house": "America's Auto Auction Richmond",
+      "state": "GA",
+      "zip": "30341",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:05:00.324656+00:00"
+    },
+    {
+      "pickup_location": "SC - America's Auto Auction Augusta",
+      "auction_house": "America's Auto Auction Augusta",
+      "state": "SC",
+      "zip": "29841",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:05:05.018766+00:00"
+    },
+    {
+      "pickup_location": "GA - America\u2019s Auto Auction Albany",
+      "auction_house": "America\u2019s Auto Auction Albany",
+      "state": "GA",
+      "zip": "31705",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:05:10.335113+00:00"
+    },
+    {
+      "pickup_location": "MI - America's Auto Auction Greater Kalamazoo",
+      "auction_house": "America's Auto Auction Greater Kalamazoo",
+      "state": "MI",
+      "zip": "49087",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:05:16.924756+00:00"
+    },
+    {
+      "pickup_location": "PA - Greater Erie Auto Auction",
+      "auction_house": "Greater Erie Auto Auction",
+      "state": "PA",
+      "zip": "16415",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:05:24.674863+00:00"
+    },
+    {
+      "pickup_location": "FL - ft.walton beach",
+      "auction_house": "America's Auto Auction Pensacola",
+      "state": "FL",
+      "zip": "32526",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:05:30.189342+00:00"
+    },
+    {
+      "pickup_location": "TX - Angelton",
+      "auction_house": "America's Auto Auction Houston",
+      "state": "TX",
+      "zip": "77047",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:05:34.714864+00:00"
+    },
+    {
+      "pickup_location": "CT - Southern Auto Auction",
+      "auction_house": "Southern Auto Auction",
+      "state": "CT",
+      "zip": "06088",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:05:39.150765+00:00"
+    },
+    {
+      "pickup_location": "NY - America's Auto Auction New York",
+      "auction_house": "America's Auto Auction New York",
+      "state": "NY",
+      "zip": "14437",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:05:47.914982+00:00"
+    },
+    {
+      "pickup_location": "OH - Akron Auto Auction",
+      "auction_house": "Akron Auto Auction",
+      "state": "OH",
+      "zip": "44319",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:05:52.754659+00:00"
+    },
+    {
+      "pickup_location": "TN - murphreesboro",
+      "auction_house": "America's Your Auction Tampa Bay",
+      "state": "TN",
+      "zip": "37129",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:05:57.420429+00:00"
+    },
+    {
+      "pickup_location": "IL - Peora",
+      "auction_house": "America's Auto Auction Greater Peoria",
+      "state": "IL",
+      "zip": "61550",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:06:04.672529+00:00"
+    },
+    {
+      "pickup_location": "IL - America's Auto Auction Greater Peoria",
+      "auction_house": "America's Auto Auction Greater Peoria",
+      "state": "IL",
+      "zip": "61550",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:06:12.301726+00:00"
+    },
+    {
+      "pickup_location": "MA - America's Auto Auction Boston",
+      "auction_house": "America's Auto Auction Boston",
+      "state": "MA",
+      "zip": "01862",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:06:16.992642+00:00"
+    },
+    {
+      "pickup_location": "TN - Dealers Auto Auction East Tennessee LLC",
+      "auction_house": "Dealers Auto Auction East Tennessee LLC",
+      "state": "TN",
+      "zip": "37601",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:06:24.926602+00:00"
+    },
+    {
+      "pickup_location": "PA - America's Auto Auction Pittsburgh",
+      "auction_house": "America's Auto Auction Pittsburgh",
+      "state": "PA",
+      "zip": "15301",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:06:30.078772+00:00"
+    },
+    {
+      "pickup_location": "WI - Greater Milwaukee Auto Auction",
+      "auction_house": "Greater Milwaukee Auto Auction",
+      "state": "WI",
+      "zip": "53224",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:06:33.703417+00:00"
+    },
+    {
+      "pickup_location": "PA - Central Pennsylvania Auto Auction",
+      "auction_house": "Central Pennsylvania Auto Auction",
+      "state": "PA",
+      "zip": "17751",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:06:40.557185+00:00"
+    },
+    {
+      "pickup_location": "GA - Warner Robbins",
+      "auction_house": "America\u2019s Auto Auction Albany",
+      "state": "GA",
+      "zip": "31705",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:06:47.974845+00:00"
+    },
+    {
+      "pickup_location": "IN - Great Lakes Auto Auction",
+      "auction_house": "Great Lakes Auto Auction",
+      "state": "IN",
+      "zip": "46619",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:06:51.818197+00:00"
+    },
+    {
+      "pickup_location": "PA - America's Auto Auction Lancaster",
+      "auction_house": "America's Auto Auction Lancaster",
+      "state": "PA",
+      "zip": "17520",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:06:57.776693+00:00"
+    },
+    {
+      "pickup_location": "SC - PAWLEY'S ISLAND",
+      "auction_house": "Grand Strand Auto Auction LLC",
+      "state": "SC",
+      "zip": "29526",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:07:01.566156+00:00"
+    },
+    {
+      "pickup_location": "NC - Speedway Auto Auction of Charlotte",
+      "auction_house": "Speedway Auto Auction of Charlotte",
+      "state": "NC",
+      "zip": "28025",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:07:07.832143+00:00"
+    },
+    {
+      "pickup_location": "OK - DEALERS AUTO AUCTION OF OKLAHOMA CITY",
+      "auction_house": "DEALERS AUTO AUCTION OF OKLAHOMA CITY",
+      "state": "OK",
+      "zip": "73108",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:07:13.068648+00:00"
+    },
+    {
+      "pickup_location": "MO - North Kansas City",
+      "auction_house": "America's Auto Auction Kansas City",
+      "state": "MO",
+      "zip": "64153",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:07:18.526356+00:00"
+    },
+    {
+      "pickup_location": "AL - Sylacagua",
+      "auction_house": "United Auto Exchange",
+      "state": "AL",
+      "zip": "35215",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:07:39.372179+00:00"
+    },
+    {
+      "pickup_location": "IL - America's Auto Auction Chicago",
+      "auction_house": "America's Auto Auction Chicago",
+      "state": "IL",
+      "zip": "60418",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:07:44.951579+00:00"
+    },
+    {
+      "pickup_location": "SC - PAWLEY&apos;S ISLAND",
+      "auction_house": "Grand Strand Auto Auction LLC",
+      "state": "SC",
+      "zip": "29526",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:07:50.114372+00:00"
+    },
+    {
+      "pickup_location": "NC - Greensboro Auto Auction",
+      "auction_house": "Greensboro Auto Auction",
+      "state": "NC",
+      "zip": "27407",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:07:54.788166+00:00"
+    },
+    {
+      "pickup_location": "MI - Grand Rapds",
+      "auction_house": "America's Auto Auction West Michigan",
+      "state": "MI",
+      "zip": "49348",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:08:01.464494+00:00"
+    },
+    {
+      "pickup_location": "WI - FOX VALLEY AUTO AUCTION",
+      "auction_house": "FOX VALLEY AUTO AUCTION",
+      "state": "WI",
+      "zip": "54115",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:08:05.692601+00:00"
+    },
+    {
+      "pickup_location": "MO - America's Auto Auction Kansas City",
+      "auction_house": "America's Auto Auction Kansas City",
+      "state": "MO",
+      "zip": "64153",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:08:10.760906+00:00"
+    },
+    {
+      "pickup_location": "GA - America's Auto Auction Atlanta",
+      "auction_house": "America's Auto Auction Atlanta",
+      "state": "GA",
+      "zip": "30120",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:08:17.574390+00:00"
+    },
+    {
+      "pickup_location": "SC - Carolina Auto Auction Inc",
+      "auction_house": "Carolina Auto Auction Inc",
+      "state": "SC",
+      "zip": "29697",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:08:21.794274+00:00"
+    },
+    {
+      "pickup_location": "OK - America's Auto Auction Oklahoma",
+      "auction_house": "America's Auto Auction Oklahoma",
+      "state": "OK",
+      "zip": "74116",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:08:26.577387+00:00"
+    },
+    {
+      "pickup_location": "KY - America's Auto Auction Bowling Green",
+      "auction_house": "America's Auto Auction Bowling Green",
+      "state": "KY",
+      "zip": "42104",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:08:30.874170+00:00"
+    },
+    {
+      "pickup_location": "OH - America's Auto Auction Toledo",
+      "auction_house": "America's Auto Auction Toledo",
+      "state": "OH",
+      "zip": "43551",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:08:35.514436+00:00"
+    },
+    {
+      "pickup_location": "MN - America's Auto Auction Minnesota",
+      "auction_house": "America's Auto Auction Minnesota",
+      "state": "MN",
+      "zip": "56567",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:08:45.094315+00:00"
+    },
+    {
+      "pickup_location": "CA - America's Auto Auction Northern California",
+      "auction_house": "America's Auto Auction Northern California",
+      "state": "CA",
+      "zip": "94534",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:08:52.694152+00:00"
+    },
+    {
+      "pickup_location": "AZ - DAA Of The Southwest",
+      "auction_house": "DAA Of The Southwest",
+      "state": "AZ",
+      "zip": "85009",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:08:57.049115+00:00"
+    },
+    {
+      "pickup_location": "WA - DAA Northwest",
+      "auction_house": "DAA Northwest",
+      "state": "WA",
+      "zip": "99224",
+      "source": "ai_web_search",
+      "added_at": "2026-05-11T19:09:02.372451+00:00"
+    },
+    {
+      "pickup_location": "WI - America's Auto Auction Wisconsin",
+      "auction_house": "America's Auto Auction Wisconsin",
+      "state": "WI",
+      "zip": "54937",
+      "source": "ai_web_search",
+      "added_at": "2026-05-12T00:56:33.917570+00:00"
+    },
+    {
+      "pickup_location": "NC - Greenville Auto Auction",
+      "auction_house": "Greenville Auto Auction",
+      "state": "NC",
+      "zip": "27834",
+      "source": "ai_web_search",
+      "added_at": "2026-05-12T00:56:41.588085+00:00"
+    },
+    {
+      "pickup_location": "OH - SHEFFIELD VILLAGE",
+      "auction_house": "America's Auto Auction Erie",
+      "state": "OH",
+      "zip": "44054",
+      "source": "ai_web_search",
+      "added_at": "2026-05-12T00:56:53.560368+00:00"
+    },
+    {
+      "pickup_location": "UT - St George",
+      "auction_house": "America's Auto Auction Las Vegas",
+      "state": "UT",
+      "zip": "84770",
+      "source": "ai_web_search",
+      "added_at": "2026-05-12T00:57:27.329145+00:00"
+    },
+    {
+      "pickup_location": "AZ - Metro Auto Auction Phoenix",
+      "auction_house": "Metro Auto Auction Phoenix",
+      "state": "AZ",
+      "zip": "85043",
+      "source": "ai_web_search",
+      "added_at": "2026-05-12T00:57:37.330739+00:00"
+    },
+    {
+      "pickup_location": "NV - America's Auto Auction Las Vegas",
+      "auction_house": "America's Auto Auction Las Vegas",
+      "state": "NV",
+      "zip": "89030",
+      "source": "ai_web_search",
+      "added_at": "2026-05-12T00:57:41.413546+00:00"
+    },
+    {
+      "pickup_location": "MT - Auto Auction of Montana",
+      "auction_house": "Auto Auction of Montana",
+      "state": "MT",
+      "zip": "59101",
+      "source": "ai_web_search",
+      "added_at": "2026-05-12T00:57:44.322858+00:00"
+    },
+    {
+      "pickup_location": "SC - ST. GEORGE",
+      "auction_house": "America's Auto Auction Savannah",
+      "state": "SC",
+      "zip": "29651",
+      "source": "ai_web_search",
+      "added_at": "2026-05-12T14:16:08.706411+00:00"
+    },
+    {
+      "pickup_location": "TN - Dealers Auto Auction - Murfreesboro",
+      "auction_house": "Dealers Auto Auction - Murfreesboro",
+      "state": "TN",
+      "zip": "37129",
+      "source": "ai_web_search",
+      "added_at": "2026-05-12T14:16:24.084347+00:00"
+    },
+    {
+      "pickup_location": "CO - DAA of the Rockies",
+      "auction_house": "DAA of the Rockies",
+      "state": "CO",
+      "zip": "80229",
+      "source": "ai_web_search",
+      "added_at": "2026-05-12T14:16:35.373700+00:00"
+    },
+    {
+      "pickup_location": "FL - St. Petersburg",
+      "auction_house": "America's Your Auction Tampa Bay",
+      "state": "FL",
+      "zip": "33716",
+      "source": "ai_web_search",
+      "added_at": "2026-05-12T15:27:32.519457+00:00"
+    },
+    {
+      "pickup_location": "LA - America's Auto Auction New Orleans",
+      "auction_house": "America's Auto Auction New Orleans",
+      "state": "LA",
+      "zip": "70401",
+      "source": "ai_web_search",
+      "added_at": "2026-05-12T15:27:47.820736+00:00"
+    },
+    {
+      "pickup_location": "WV - Mountain State Auto Auction",
+      "auction_house": "Mountain State Auto Auction",
+      "state": "WV",
+      "zip": "26431",
+      "source": "ai_web_search",
+      "added_at": "2026-05-14T00:06:34.273400+00:00"
+    }
+  ]
 }

@@ -96,9 +96,17 @@ class AutoCheckReport(BaseModel):
 
     scrape_status: str = "not_attempted"  # success | partial | failed | not_attempted
     autocheck_score: int | None = None
+    score_range_low: int | None = None
+    score_range_high: int | None = None
+    comparable_vehicle_year: int | None = None
+    comparable_vehicle_class: str | None = None
+    historical_event_count: int | None = None
     owner_count: int | None = None
     accident_count: int | None = None
+    last_reported_event_date: str | None = None
+    last_reported_mileage: str | None = None
     title_brand_check: str | None = None  # "OK" | "Problem Reported"
+    other_title_brand_specific_event_check: str | None = None
     odometer_check: str | None = None     # "OK" | "Problem Reported"
     accident_check: str | None = None
     damage_check: str | None = None
@@ -109,6 +117,7 @@ class AutoCheckReport(BaseModel):
     raw_text: str | None = None
     failure_category: str | None = None
     failure_message: str | None = None
+    failure_stage: str | None = None
 
 
 class ConditionReport(BaseModel):

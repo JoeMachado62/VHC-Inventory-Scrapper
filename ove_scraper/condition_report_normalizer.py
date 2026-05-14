@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from ove_scraper.cr_parsers import identify_report_family, parse_condition_report_text
+from ove_scraper.hot_deal_rule_catalog import evaluate_defect_rules
 from ove_scraper.schemas import ConditionReport
 
 
@@ -103,9 +104,9 @@ def normalize_condition_report(
     announcements = extract_announcements(text)
     remarks = None if has_structured_report else extract_single_value(text, "remarks")
     seller_comments = None if has_structured_report else extract_single_value(text, "seller comments")
-    title_status = None if has_structured_report else extract_single_value(text, "title status")
-    title_state = None if has_structured_report else extract_single_value(text, "title state")
-    title_branding = None if has_structured_report else extract_single_value(text, "title branding")
+    title_status = None if has_structured_report and structured.get("title_status") else extract_single_value(text, "title status")
+    title_state = None if has_structured_report and structured.get("title_state") else extract_single_value(text, "title state")
+    title_branding = None if has_structured_report and structured.get("title_branding") else extract_single_value(text, "title branding")
     owners = extract_count(text, "owners")
     accidents = extract_count(text, "accidents")
 
@@ -165,6 +166,29 @@ def normalize_condition_report(
     # listing-JSON-derived light/arbitration signals, deduped.
     listing_real = report.metadata.pop("_listing_announcements", None) or []
     listing_synthetic = report.metadata.pop("_listing_synthetic_announcements", None) or []
+    listing_remarks = report.metadata.pop("_listing_remarks", None) or []
+    listing_seller_comments = report.metadata.pop("_listing_seller_comments", None) or []
+    listing_damage_items = report.metadata.pop("_listing_condition_damage_items", None) or []
+    listing_mechanical_findings = report.metadata.pop("_listing_condition_mechanical_findings", None) or []
+
+    if listing_remarks:
+        report.remarks = _merge_unique_text(report.remarks, listing_remarks)
+    if listing_seller_comments:
+        report.seller_comments_items = _merge_unique_text(report.seller_comments_items, listing_seller_comments)
+    if listing_damage_items:
+        report.damage_items = _merge_unique_dicts(
+            report.damage_items,
+            listing_damage_items,
+            key_fields=("source", "panel", "condition", "reported_severity", "notes"),
+        )
+        report.damage_summary = _summarize_report_damage_items(report.damage_items)
+    if listing_mechanical_findings:
+        report.mechanical_findings = _merge_unique_dicts(
+            report.mechanical_findings,
+            listing_mechanical_findings,
+            key_fields=("source", "system", "condition"),
+        )
+
     merged_announcements: list[str] = list(report.announcements or [])
     seen_lower = {a.lower() for a in merged_announcements}
     for item in list(listing_real) + list(listing_synthetic):
@@ -187,6 +211,7 @@ def normalize_condition_report(
     metadata_enrichment = dict(metadata_final.get("announcementsEnrichment") or {})
     metadata_enrichment["announcements"] = list(report.announcements)
     metadata_final["announcementsEnrichment"] = metadata_enrichment
+    metadata_final["defect_flags"] = build_defect_flags(report, listing_json)
     report.metadata = metadata_final
 
     # Add lf/rf/lr/rr aliases to tire_depths so the VPS contract is
@@ -200,6 +225,70 @@ def normalize_condition_report(
     _add_tire_depth_aliases(report)
 
     return report
+
+
+def build_defect_flags(report: ConditionReport, listing_json: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Build structured defect flags for shared CR/report consumers.
+
+    These flags are metadata only for individual ordered condition reports.
+    The Hot Deal screener is the policy layer that decides whether a flag
+    excludes a VIN from the marketing batch.
+    """
+    evidence: list[dict[str, Any]] = []
+
+    def add_text(source_label: str, value: Any, metadata: dict[str, Any] | None = None) -> None:
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                evidence.append({"source_label": source_label, "text": text, "metadata": metadata or {}})
+        elif isinstance(value, list):
+            for item in value:
+                add_text(source_label, item, metadata)
+
+    add_text("announcement", report.announcements)
+    add_text("remark", report.remarks)
+    add_text("seller comment", report.seller_comments_items)
+    add_text("problem highlight", report.problem_highlights)
+    if report.title_status:
+        add_text("title status", report.title_status)
+    if report.title_branding:
+        add_text("title branding", report.title_branding)
+
+    history = report.vehicle_history or {}
+    if history.get("engine_starts") is False:
+        add_text("vehicle history", "Engine does not start", {"field": "engine_starts"})
+    if history.get("drivable") is False:
+        add_text("vehicle history", "Vehicle does not drive", {"field": "drivable"})
+
+    for item in report.damage_items:
+        text = _damage_item_text(item)
+        if text:
+            evidence.append({
+                "source_label": str(item.get("source") or "condition report damage"),
+                "text": text,
+                "metadata": {k: v for k, v in item.items() if k != "raw"},
+            })
+    for finding in report.mechanical_findings:
+        text = _mechanical_finding_text(finding)
+        if text:
+            evidence.append({
+                "source_label": str(finding.get("source") or "condition report mechanical"),
+                "text": text,
+                "metadata": dict(finding),
+            })
+    for code in report.diagnostic_codes:
+        if re.match(r"^P0[A-F0-9]{3}$", str(code or ""), flags=re.IGNORECASE):
+            add_text("diagnostic code", f"Active powertrain code {code}", {"code": code})
+
+    if listing_json:
+        enrichment = listing_json.get("announcementsEnrichment") or {}
+        add_text("listing announcement", enrichment.get("announcements"))
+        add_text("listing remark", enrichment.get("remarks"))
+        add_text("listing comment", listing_json.get("comments"))
+        add_text("listing additional announcement", listing_json.get("additionalAnnouncements"))
+        add_text("listing remark", listing_json.get("remarks"))
+
+    return evaluate_defect_rules(evidence)
 
 
 _TIRE_DEPTH_ALIAS_MAP = {
@@ -220,6 +309,81 @@ def _add_tire_depth_aliases(report: ConditionReport) -> None:
             if src in report.tire_depths:
                 report.tire_depths[short] = report.tire_depths[src]
                 break
+
+
+def _merge_unique_text(existing: list[str], additions: list[str]) -> list[str]:
+    merged = [str(item) for item in existing or [] if str(item).strip()]
+    seen = {item.strip().lower() for item in merged}
+    for item in additions or []:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        merged.append(text)
+        seen.add(key)
+    return merged
+
+
+def _merge_unique_dicts(
+    existing: list[dict[str, Any]],
+    additions: list[dict[str, Any]],
+    *,
+    key_fields: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    merged = [dict(item) for item in existing or [] if isinstance(item, dict)]
+    seen = {
+        tuple(str(item.get(field) or "") for field in key_fields)
+        for item in merged
+    }
+    for item in additions or []:
+        if not isinstance(item, dict):
+            continue
+        candidate = dict(item)
+        key = tuple(str(candidate.get(field) or "") for field in key_fields)
+        if key in seen:
+            continue
+        merged.append(candidate)
+        seen.add(key)
+    return merged
+
+
+def _damage_item_text(item: dict[str, Any]) -> str:
+    parts = [
+        item.get("section_label") or item.get("section"),
+        item.get("panel"),
+        item.get("condition"),
+        item.get("reported_severity") or item.get("severity"),
+        item.get("action"),
+        item.get("notes"),
+    ]
+    return " ".join(str(part).strip() for part in parts if str(part or "").strip())
+
+
+def _mechanical_finding_text(finding: dict[str, Any]) -> str:
+    parts = [finding.get("system"), finding.get("condition"), finding.get("notes")]
+    return " ".join(str(part).strip() for part in parts if str(part or "").strip())
+
+
+def _summarize_report_damage_items(items: list[dict[str, Any]]) -> dict[str, Any]:
+    by_color: dict[str, int] = {}
+    by_section: dict[str, int] = {}
+    structural_issue = False
+    for item in items or []:
+        section = str(item.get("section") or "other")
+        color = str(item.get("severity_color") or "gray")
+        by_section[section] = by_section.get(section, 0) + 1
+        by_color[color] = by_color.get(color, 0) + 1
+        text = _damage_item_text(item).lower()
+        if section == "structure" or "structural" in text or "frame" in text or color == "red":
+            structural_issue = True
+    return {
+        "total_items": len(items or []),
+        "by_color": by_color,
+        "by_section": by_section,
+        "structural_issue": structural_issue,
+    }
 
 
 def extract_announcements(text: str) -> list[str]:
@@ -260,6 +424,132 @@ def build_problem_highlights(report: ConditionReport) -> list[str]:
     return [value for value in highlights if value]
 
 
+def _coerce_text_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                text = item.strip()
+            elif isinstance(item, dict):
+                text = str(item.get("text") or item.get("value") or "").strip()
+            else:
+                text = str(item or "").strip()
+            if text:
+                out.append(text)
+        return out
+    return []
+
+
+def _extract_listing_condition_damage_items(condition_enrichment: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    damage_items: list[dict[str, Any]] = []
+    mechanical_findings: list[dict[str, Any]] = []
+    raw_damages = condition_enrichment.get("damages")
+    if not isinstance(raw_damages, list):
+        return damage_items, mechanical_findings
+
+    for raw in raw_damages:
+        if not isinstance(raw, dict):
+            continue
+        category = str(raw.get("category") or "").strip()
+        item = str(raw.get("item") or "").strip()
+        damage = str(raw.get("damage") or "").strip()
+        severity = str(raw.get("severity") or "").strip()
+        action = str(raw.get("action") or "").strip()
+        notes = str(raw.get("notes") or "").strip()
+        if not any((category, item, damage, severity, action, notes)):
+            continue
+        section = _normalize_damage_section(category, item)
+        severity_color = _listing_damage_severity_color(category, item, damage, severity, notes)
+        severity_label, severity_rank = _listing_severity_rank(severity_color)
+        normalized = {
+            "source": "listing_json.conditionEnrichment.damages",
+            "section": section,
+            "section_label": category or section.title(),
+            "panel": item,
+            "condition": damage,
+            "reported_severity": severity,
+            "severity_color": severity_color,
+            "severity_label": severity_label,
+            "severity_rank": severity_rank,
+            "action": action,
+            "notes": notes,
+            "raw": raw,
+        }
+        damage_items.append(normalized)
+        if _looks_like_mechanical_damage(category, item, damage, severity, notes):
+            condition_parts = [damage, severity, action, notes]
+            mechanical_findings.append(
+                {
+                    "source": "listing_json.conditionEnrichment.damages",
+                    "section": "mechanical",
+                    "section_label": "Mechanical",
+                    "system": item or category or "Mechanical",
+                    "condition": " ".join(part for part in condition_parts if part),
+                    "notes": notes,
+                    "raw": raw,
+                }
+            )
+    return damage_items, mechanical_findings
+
+
+def _normalize_damage_section(category: str, item: str) -> str:
+    signal = f"{category} {item}".lower()
+    if "structure" in signal or "frame" in signal:
+        return "structure"
+    if "mechanical" in signal or "engine" in signal or "transmission" in signal or "battery" in signal:
+        return "mechanical"
+    if "interior" in signal:
+        return "interior"
+    if "tire" in signal or "wheel" in signal:
+        return "tires"
+    return "other" if category.lower() == "miscellaneous" else "exterior"
+
+
+def _listing_damage_severity_color(category: str, item: str, damage: str, severity: str, notes: str) -> str:
+    signal = f"{category} {item} {damage} {severity} {notes}".lower()
+    if any(token in signal for token in ("structural", "frame", "unacceptable", "no start", "does not start")):
+        return "red"
+    if any(token in signal for token in ("inop", "repair required", "replacement required", "warning - engine", "warning - electrical", "mechanical")):
+        return "orange"
+    if any(token in signal for token in ("suspect repair", "broken", "cracked", "missing")):
+        return "yellow"
+    return "gray"
+
+
+def _listing_severity_rank(color: str) -> tuple[str, int]:
+    if color == "red":
+        return "severe", 4
+    if color == "orange":
+        return "major", 3
+    if color == "yellow":
+        return "moderate", 2
+    return "minor", 1
+
+
+def _looks_like_mechanical_damage(category: str, item: str, damage: str, severity: str, notes: str) -> bool:
+    signal = f"{category} {item} {damage} {severity} {notes}".lower()
+    return any(
+        token in signal
+        for token in (
+            "mechanical",
+            "engine",
+            "trans",
+            "drivetrain",
+            "battery",
+            "warning - engine",
+            "warning - electrical",
+            "no start",
+            "does not start",
+            "inop",
+        )
+    )
+
+
 def _apply_listing_json(report: ConditionReport, listing: dict[str, Any]) -> None:
     """Populate ConditionReport fields from the embedded OVE listing JSON.
 
@@ -290,12 +580,14 @@ def _apply_listing_json(report: ConditionReport, listing: dict[str, Any]) -> Non
     # step at the end of normalize_condition_report uses to build the
     # final list.
     enrichment = listing.get("announcementsEnrichment") or {}
-    raw_announcements = enrichment.get("announcements") or []
-    listing_announcements = [
-        str(item).strip()
-        for item in raw_announcements
-        if isinstance(item, str) and str(item).strip()
-    ]
+    raw_announcements = _coerce_text_list(enrichment.get("announcements"))
+    listing_announcements = raw_announcements + _coerce_text_list(listing.get("announcements"))
+    listing_remarks = (
+        _coerce_text_list(enrichment.get("remarks"))
+        + _coerce_text_list(listing.get("remarks"))
+        + _coerce_text_list(listing.get("additionalAnnouncements"))
+    )
+    listing_seller_comments = _coerce_text_list(listing.get("comments"))
     synthetic: list[str] = []
     if listing.get("greenLight") is True:
         synthetic.append("Green Light")
@@ -326,6 +618,8 @@ def _apply_listing_json(report: ConditionReport, listing: dict[str, Any]) -> Non
     metadata = dict(report.metadata)
     metadata["_listing_announcements"] = listing_announcements
     metadata["_listing_synthetic_announcements"] = synthetic
+    metadata["_listing_remarks"] = listing_remarks
+    metadata["_listing_seller_comments"] = listing_seller_comments
     report.metadata = metadata
 
     # Overall grade
@@ -335,6 +629,7 @@ def _apply_listing_json(report: ConditionReport, listing: dict[str, Any]) -> Non
 
     # Autocheck → vehicle history
     autocheck = listing.get("autocheck") or {}
+    condition_enrichment = listing.get("conditionEnrichment") or {}
     history = dict(report.vehicle_history)
     owner_count = autocheck.get("ownerCount")
     if isinstance(owner_count, int) and "owners" not in history:
@@ -342,8 +637,23 @@ def _apply_listing_json(report: ConditionReport, listing: dict[str, Any]) -> Non
     accidents = autocheck.get("numberOfAccidents")
     if isinstance(accidents, int) and "accidents" not in history:
         history["accidents"] = accidents
+    if isinstance(condition_enrichment, dict):
+        engine_starts = condition_enrichment.get("engineStarts")
+        if isinstance(engine_starts, bool) and "engine_starts" not in history:
+            history["engine_starts"] = engine_starts
+        drivable = condition_enrichment.get("drivable")
+        if isinstance(drivable, bool) and "drivable" not in history:
+            history["drivable"] = drivable
     if history != report.vehicle_history:
         report.vehicle_history = history
+
+    if isinstance(condition_enrichment, dict):
+        damage_items, mechanical_findings = _extract_listing_condition_damage_items(condition_enrichment)
+        if damage_items or mechanical_findings:
+            metadata = dict(report.metadata)
+            metadata["_listing_condition_damage_items"] = damage_items
+            metadata["_listing_condition_mechanical_findings"] = mechanical_findings
+            report.metadata = metadata
 
     # conditionReportUrl → metadata.report_link.href (canonical CR deep link
     # the VPS template uses for the "See Original Condition Report" button)

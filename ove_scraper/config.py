@@ -63,6 +63,52 @@ class Settings:
     # hydration failures. 5-min keepalives keep the session warm and detect
     # dead CDP within one cycle. Tunable via BROWSER_KEEPALIVE_INTERVAL_SECONDS.
     browser_keepalive_interval_seconds: int = 300
+    # 2026-05-04 keepalive durability fix. The 5-min keepalive on the
+    # idle Login B Chrome was opening a fresh worker tab, doing
+    # `page.goto(saved_searches_url)`, waiting 1.5s, and closing — so
+    # OVE's session-refreshing polling XHRs never got a chance to fire,
+    # and the keepalive declared `outcome=ok` even when the saved-
+    # searches API was silently returning empty. Two new knobs:
+    #   - keepalive_persistent_tab: True → reuse a single dedicated
+    #     "keepalive page" across ticks (verify cards rendered, settle
+    #     for keepalive_settle_ms, leave tab open for next tick).
+    #     False → byte-identical fallback to the open/close worker
+    #     pattern. One-line escape hatch via env var
+    #     KEEPALIVE_PERSISTENT_TAB=false.
+    #   - keepalive_settle_ms: how long to stay on the rendered saved-
+    #     searches page after `_wait_for_saved_search_cards` succeeds,
+    #     letting OVE's polling XHRs settle and refresh the backend
+    #     token. Matches A's natural 5–15s of "live" interaction time
+    #     between operations.
+    keepalive_persistent_tab: bool = True
+    keepalive_settle_ms: int = 8000
+    # 2026-05-06 active keepalive. The persistent-tab keepalive (visit
+    # saved-searches page, wait 8s, do nothing) wasn't simulating
+    # enough user activity to keep OVE's data-layer auth (Bearer token)
+    # warm — saved-search exports started returning HTTP 401 from
+    # onesearch-api.manheim.com/graphql and partial CSVs began landing
+    # on the VPS with specific VINs missing.
+    #
+    # Active keepalive (when keepalive_active=True): each tick rotates
+    # through the user's saved searches one-at-a-time, navigates into
+    # one search, waits for cards to render, lingers on each page like
+    # a real user would, then clicks pagination forward N times. This
+    # generates the GraphQL query traffic that exercises the token-
+    # refresh chain — same as a real user actively shopping.
+    #
+    # Setting hierarchy: keepalive_active=True (default) wins. If
+    # active is False, falls back to keepalive_persistent_tab (legacy).
+    # If both False, falls back to the worker-tab open/close pattern
+    # (oldest, most defensive).
+    keepalive_active: bool = True
+    # Number of "next page" pagination clicks per tick. With 60-90s
+    # linger per page, total tick is ~3-4 minutes — close to the 5-min
+    # interval. Larger values risk bumping into the next tick's wake.
+    keepalive_pagination_clicks: int = 2
+    # Time to linger on each page before the next pagination click,
+    # simulating a real user reading. 60s feels human-paced; faster
+    # might trigger anti-automation heuristics.
+    keepalive_page_linger_ms: int = 60_000
     deep_scrape_max_workers: int = 1
     deep_scrape_lease_seconds: int = 900
     deep_scrape_retry_delay_seconds: int = 300
@@ -179,6 +225,11 @@ class Settings:
             sync_interval_seconds=_get_int("SYNC_INTERVAL_SECONDS", 3600),
             deep_scrape_poll_interval_seconds=_get_int("DEEP_SCRAPE_POLL_INTERVAL_SECONDS", 30),
             browser_keepalive_interval_seconds=_get_int("BROWSER_KEEPALIVE_INTERVAL_SECONDS", 300),
+            keepalive_persistent_tab=_get_bool("KEEPALIVE_PERSISTENT_TAB", True),
+            keepalive_settle_ms=_get_int("KEEPALIVE_SETTLE_MS", 8000),
+            keepalive_active=_get_bool("KEEPALIVE_ACTIVE", True),
+            keepalive_pagination_clicks=_get_int("KEEPALIVE_PAGINATION_CLICKS", 2),
+            keepalive_page_linger_ms=_get_int("KEEPALIVE_PAGE_LINGER_MS", 60_000),
             deep_scrape_max_workers=_get_int("DEEP_SCRAPE_MAX_WORKERS", recommend_deep_scrape_workers()),
             deep_scrape_lease_seconds=_get_int("DEEP_SCRAPE_LEASE_SECONDS", 900),
             deep_scrape_retry_delay_seconds=_get_int("DEEP_SCRAPE_RETRY_DELAY_SECONDS", 300),

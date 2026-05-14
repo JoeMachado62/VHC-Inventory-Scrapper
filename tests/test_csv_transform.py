@@ -89,6 +89,46 @@ def test_redact_detail_rejects_sensitive_text() -> None:
         raise AssertionError("Expected redaction validation failure")
 
 
+def test_redact_detail_preserves_defect_flags_for_individual_reports() -> None:
+    detail = DeepScrapeResult(
+        images=["https://cdn.example.com/1.jpg"],
+        condition_report=ConditionReport(
+            overall_grade="3.5",
+            metadata={
+                "defect_flags": [
+                    {
+                        "rule_key": "structural_frame",
+                        "source_label": "listing comment",
+                        "raw_text": "Structural damage on rear trunk floor",
+                        "matched_text": "structural damage",
+                        "failure_label": "Structural/frame concern",
+                    }
+                ]
+            },
+        ),
+        seller_comments="Structural damage on rear trunk floor",
+    )
+    request = PendingDetailRequest.model_validate(
+        {
+            "request_id": "manual",
+            "vin": "1HGCM82633A004352",
+            "source_platform": "manheim",
+            "status": "PENDING",
+            "priority": 100,
+            "attempts": 0,
+            "requested_at": "2026-03-08T00:00:00+00:00",
+            "request_source": "manual",
+            "requested_by": "test",
+            "reason": None,
+            "metadata": {},
+        }
+    )
+    settings = Settings(vch_api_base_url="https://example.com/v1", vch_service_token="token")
+    payload = redact_detail(detail, request, settings)
+    flags = payload["condition_report"]["metadata"]["defect_flags"]
+    assert flags[0]["rule_key"] == "structural_frame"
+
+
 def test_pickup_location_override_used_before_lookup(monkeypatch) -> None:
     monkeypatch.setattr(
         location_zip_lookup,
@@ -661,6 +701,60 @@ def test_normalize_condition_report_does_not_synthesize_structural_damage_from_l
     )
     assert report_no_text is not None
     assert report_no_text.structural_damage is None
+
+
+def test_normalize_condition_report_preserves_listing_condition_damage_defects() -> None:
+    report = normalize_condition_report(
+        ConditionReport(),
+        raw_text="5.0 Extra Clean No Structural Damage",
+        report_link={"href": "https://insightcr.manheim.com/cr-display?listingID=123"},
+        listing_json={
+            "conditionGrade": "5.0",
+            "conditionEnrichment": {
+                "engineStarts": True,
+                "drivable": True,
+                "damages": [
+                    {
+                        "category": "Mechanical",
+                        "item": "Battery",
+                        "damage": "Inop",
+                        "severity": "Repair Required",
+                        "action": "Mech Ck",
+                        "notes": "no start has gas acts like its",
+                    },
+                    {
+                        "category": "Miscellaneous",
+                        "item": "Warning - Engine",
+                        "damage": "On",
+                        "severity": "Unacceptable",
+                    },
+                ],
+            },
+        },
+    )
+
+    assert report is not None
+    assert any(item["panel"] == "Battery" for item in report.damage_items)
+    assert any(finding["system"] == "Battery" for finding in report.mechanical_findings)
+    flags = report.metadata["defect_flags"]
+    assert any(flag["rule_key"] == "non_running" for flag in flags)
+    assert any(flag["rule_key"] == "warning_lights" for flag in flags)
+
+
+def test_normalize_condition_report_flags_listing_seller_comment_defect() -> None:
+    report = normalize_condition_report(
+        ConditionReport(),
+        raw_text="4.2 Clean",
+        report_link={"href": "https://insightcr.manheim.com/cr-display?listingID=123"},
+        listing_json={
+            "comments": "Parking sensor fault warning. Structural damage on the rear trunk floor",
+        },
+    )
+
+    assert report is not None
+    assert any("Structural damage on the rear trunk floor" in item for item in report.seller_comments_items)
+    flags = report.metadata["defect_flags"]
+    assert any(flag["rule_key"] == "structural_frame" for flag in flags)
 
 
 def test_report_link_selector_rejects_generic_ove_condition_order_page() -> None:

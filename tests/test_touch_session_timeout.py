@@ -46,6 +46,10 @@ def _make_session(tmp_path: Path) -> PlaywrightCdpBrowserSession:
         artifact_dir=tmp_path / "artifacts",
         export_dir=tmp_path / "exports",
         log_file_path=tmp_path / "scraper.log",
+        # Worker-tab path (open/goto/close). Persistent-tab and active
+        # paths are tested separately in their own files.
+        keepalive_persistent_tab=False,
+        keepalive_active=False,
     )
     return PlaywrightCdpBrowserSession(settings)
 

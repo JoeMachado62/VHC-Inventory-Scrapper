@@ -99,7 +99,7 @@ class AdminNotifier:
         body_lines = [
             f"Manheim has locked the account on {login_label}. The scraper has",
             "detected the account-locked error page and recorded a 6-hour cooldown",
-            "in state/auth_lockout.json. Every Python process will refuse to attempt",
+            f"in artifacts/_state/auth_lockout_{port or 'PORT'}.json. Every Python process will refuse to attempt",
             "auth interaction until the cooldown expires OR you run the manual unlock",
             "command (see below).",
             "",
@@ -217,6 +217,55 @@ class AdminNotifier:
         )
         return self._send_with_cooldown(
             key="snapshot-safety-gate-blocked",
+            subject=subject,
+            body="\n".join(body_lines),
+            logger=logger,
+        )
+
+    def notify_export_shrinkage(
+        self,
+        *,
+        search_name: str,
+        current_rows: int,
+        recent_max: int,
+        absolute_drop: int,
+        ratio: float,
+        threshold: float,
+        logger=None,
+    ) -> bool:
+        """2026-05-06: alerts when an OVE saved-search export is
+        suspiciously smaller than recent runs (silent data loss).
+
+        Background: 2026-05-06 sync exported East-Hub-2025-2026 with
+        4948 rows at 18:33, then 4305 rows at 18:57 — losing 643
+        vehicles silently. This alert catches that pattern in the
+        moment so the operator can investigate before the snapshot
+        gets pushed to the VPS with bad data.
+        """
+        subject = (
+            f"OVE export SHRINKAGE: '{search_name}' "
+            f"{current_rows} rows ({int(ratio * 100)}% of recent max)"
+        )
+        body_lines = [
+            "An OVE saved-search export came in significantly smaller than recent runs.",
+            "This often indicates a partial export (the page hadn't fully rendered before",
+            "the CSV button was clicked) and means the snapshot pushed to the VPS may be",
+            "missing vehicles.",
+            "",
+            f"Saved search:    {search_name}",
+            f"This export:     {current_rows} rows",
+            f"Recent max:      {recent_max} rows",
+            f"Absolute drop:   {absolute_drop} rows",
+            f"Ratio:           {ratio:.2f} (threshold: {threshold:.2f})",
+            "",
+            "Action required: check logs/ove_scraper.log for the 'Vehicle results selector",
+            "not found before export; proceeding anyway' warning around the time of this",
+            "export. If present, the page-render timeout was too short. The next sync will",
+            "retry from a fresh navigation; if shrinkage persists across multiple syncs,",
+            "investigate OVE backend behavior or the saved-search filter definition.",
+        ]
+        return self._send_with_cooldown(
+            key=f"export-shrinkage:{search_name}",
             subject=subject,
             body="\n".join(body_lines),
             logger=logger,

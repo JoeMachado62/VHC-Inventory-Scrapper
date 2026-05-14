@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import json
@@ -7,6 +8,8 @@ from functools import lru_cache
 from pathlib import Path
 
 import pgeocode
+
+logger = logging.getLogger(__name__)
 
 OVERRIDE_DB_PATH = Path("data") / "auction_location_overrides.json"
 
@@ -130,7 +133,68 @@ def resolve_location_zip(pickup_location: str | None, auction_house: str | None,
         if zip_code:
             return zip_code
 
-    return None
+    ai_zip = _try_ai_resolver(pickup_location, auction_house, state_code)
+    if ai_zip:
+        return ai_zip
+
+    return _state_centroid_fallback(pickup_location, auction_house, state_code)
+
+
+def _try_ai_resolver(pickup_location: str | None, auction_house: str | None, state_code: str) -> str | None:
+    """Invoke the OpenAI web_search ZIP lookup and persist successful hits.
+
+    Gated by OVE_AI_ZIP_RESOLVER_ENABLED (default true). Disabled
+    automatically when OPENAI_API_KEY is missing. Failures are logged but
+    never raised — the caller falls through to the state-centroid fallback.
+    """
+    if os.getenv("OVE_AI_ZIP_RESOLVER_ENABLED", "true").lower() in {"0", "false", "no", "off"}:
+        return None
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    model = os.getenv("OPENAI_MODEL", "gpt-5.4").strip() or "gpt-5.4"
+
+    from ove_scraper.ai_zip_resolver import resolve_zip_via_ai, append_override
+
+    try:
+        zip_code = resolve_zip_via_ai(
+            pickup_location=pickup_location,
+            auction_house=auction_house,
+            state=state_code,
+            api_key=api_key,
+            model=model,
+        )
+    except Exception as exc:
+        logger.warning(
+            "AI ZIP resolver crashed for auction=%r state=%s: %s",
+            auction_house, state_code, exc,
+        )
+        return None
+
+    if not zip_code:
+        return None
+
+    try:
+        append_override(pickup_location, auction_house, state_code, zip_code, overrides_path=OVERRIDE_DB_PATH)
+        load_override_db.cache_clear()
+    except Exception as exc:
+        logger.warning(
+            "Failed to persist AI-resolved ZIP for auction=%r state=%s: %s",
+            auction_house, state_code, exc,
+        )
+    return zip_code
+
+
+def _state_centroid_fallback(pickup_location: str | None, auction_house: str | None, state_code: str) -> str | None:
+    from ove_scraper.state_centroid_zips import state_centroid_zip
+
+    centroid = state_centroid_zip(state_code)
+    if centroid:
+        logger.warning(
+            "Using state-centroid ZIP fallback %s for auction=%r pickup=%r state=%s",
+            centroid, auction_house, pickup_location, state_code,
+        )
+    return centroid
 
 
 def normalize_state(value: str | None) -> str | None:

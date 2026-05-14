@@ -148,7 +148,9 @@ class TestBuildPricing:
 
 class TestBuildDealEntry:
     def test_happy_path_extracts_all_required_fields(self):
-        entry = build_deal_entry(_make_payload_data())
+        data = _make_payload_data()
+        data["deep_scrape"]["images"] = ["https://img.example.com/1.jpg"]
+        entry = build_deal_entry(data)
         assert entry is not None
         assert entry["vin"] == "1FT8W2BN0PEC12345"
         assert entry["auction_end_at"] == "2026-04-26T20:00:00Z"
@@ -169,6 +171,14 @@ class TestBuildDealEntry:
         assert entry["cr_screen"]["version"] == NEGATIVE_CR_FILTER_VERSION
         assert entry["cr_screen"]["reasons"] == []
         assert "structural_damage" in entry["cr_screen"]["excluded_signals_checked"]
+        assert entry["detail"]["images"] == [{
+            "url": "https://img.example.com/1.jpg",
+            "role": "hero",
+            "display_order": 0,
+            "is_primary": True,
+            "source_image_id": None,
+            "metadata": {},
+        }]
         # Positive highlights derived from the deep-scrape CR
         assert any("structural" in h.lower() for h in entry["cr_screen"]["positive_highlights"])
         assert any("clean title" in h.lower() for h in entry["cr_screen"]["positive_highlights"])

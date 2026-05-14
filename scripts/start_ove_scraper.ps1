@@ -64,43 +64,71 @@ try {
         }
     }
 
-    # Auth-lockout file (2026-04-28 hardening). Single source of truth
-    # shared with Python at ove_scraper/auth_lockout.py. The file is
-    # written by Python when account-lock or rate-limit-breach events
-    # occur. The launcher reads it before each Python spawn and:
-    #   - if `manual_unlock_required` is true, EXIT the launcher loop
-    #     entirely (the operator must run `python -m ove_scraper.main unlock`)
-    #   - if `manheim_locked_until_utc` or `rate_limit_until_utc` is in
-    #     the future, sleep until then before respawning Python
-    # This is the linchpin: without it the `while ($true)` loop below
-    # would bypass every cross-process safeguard by simply restarting
-    # Python and letting it consume another single-shot login click.
-    $lockoutPath = Join-Path $repoRoot "artifacts\_state\auth_lockout.json"
+    # Auth-lockout files (2026-04-28 hardening, per-port split 2026-05-01).
+    # Shared with Python at ove_scraper/auth_lockout.py. Written by
+    # Python when account-lock or rate-limit-breach events occur.
+    #
+    # Pre-split: a single auth_lockout.json held everything. Now:
+    #   - auth_lockout_global.json holds `manual_unlock_required` only
+    #     (the operator-level park flag — applies to BOTH accounts).
+    #   - auth_lockout_<port>.json (e.g. _9222, _9223) holds per-account
+    #     click ledger and cooldowns.
+    #
+    # The launcher must respect ALL of them: if EITHER per-port file has
+    # an active cooldown, sleep until the LONGER of the two clears
+    # before respawning. The legacy single auth_lockout.json is also
+    # read for backwards compat in case Python hasn't migrated yet.
+    $lockoutStateDir = Join-Path $repoRoot "artifacts\_state"
+    $lockoutGlobalPath = Join-Path $lockoutStateDir "auth_lockout_global.json"
+    $lockoutLegacyPath = Join-Path $lockoutStateDir "auth_lockout.json"
+    $lockoutPortPaths = @(
+        (Join-Path $lockoutStateDir "auth_lockout_9222.json"),
+        (Join-Path $lockoutStateDir "auth_lockout_9223.json")
+    )
 
     function Get-AuthLockoutWaitSeconds {
-        if (-not (Test-Path $lockoutPath)) { return @{ Wait = 0; Reason = $null; Manual = $false } }
-        try {
-            $obj = Get-Content $lockoutPath -Raw | ConvertFrom-Json
-        } catch {
-            return @{ Wait = 0; Reason = "lockout-file-unreadable: $_"; Manual = $false }
+        # Step 1: global manual-unlock flag. Lives in auth_lockout_global.json
+        # post-split, falls back to the legacy file if pre-migration.
+        $manualSet = $false
+        foreach ($p in @($lockoutGlobalPath, $lockoutLegacyPath)) {
+            if (-not (Test-Path $p)) { continue }
+            try {
+                $g = Get-Content $p -Raw | ConvertFrom-Json
+            } catch { continue }
+            if ($g.manual_unlock_required) { $manualSet = $true }
         }
-        if ($obj.manual_unlock_required) {
+        if ($manualSet) {
             return @{ Wait = -1; Reason = "manual_unlock_required"; Manual = $true }
         }
+
+        # Step 2: per-port cooldowns. Sleep until the LONGER cooldown
+        # clears so neither account is started prematurely.
         $now = [DateTimeOffset]::UtcNow
         $maxWait = 0
         $reason = $null
-        foreach ($field in @('manheim_locked_until_utc', 'rate_limit_until_utc')) {
-            $value = $obj.$field
-            if (-not $value) { continue }
+        $candidatePaths = @()
+        foreach ($p in $lockoutPortPaths) {
+            if (Test-Path $p) { $candidatePaths += $p }
+        }
+        if (Test-Path $lockoutLegacyPath) { $candidatePaths += $lockoutLegacyPath }
+        foreach ($p in $candidatePaths) {
             try {
-                $until = [DateTimeOffset]::Parse($value)
-            } catch { continue }
-            if ($until -le $now) { continue }
-            $delta = [int]([Math]::Ceiling(($until - $now).TotalSeconds))
-            if ($delta -gt $maxWait) {
-                $maxWait = $delta
-                $reason = "$field=$value"
+                $obj = Get-Content $p -Raw | ConvertFrom-Json
+            } catch {
+                continue
+            }
+            foreach ($field in @('manheim_locked_until_utc', 'rate_limit_until_utc')) {
+                $value = $obj.$field
+                if (-not $value) { continue }
+                try {
+                    $until = [DateTimeOffset]::Parse($value)
+                } catch { continue }
+                if ($until -le $now) { continue }
+                $delta = [int]([Math]::Ceiling(($until - $now).TotalSeconds))
+                if ($delta -gt $maxWait) {
+                    $maxWait = $delta
+                    $reason = "$([System.IO.Path]::GetFileName($p)):$field=$value"
+                }
             }
         }
         return @{ Wait = $maxWait; Reason = $reason; Manual = $false }
@@ -132,7 +160,7 @@ try {
         $lockout = Get-AuthLockoutWaitSeconds
         if ($lockout.Manual) {
             Add-Content -Path $launcherLog -Value (
-                "{0} EXITING launcher: manual_unlock_required is set in auth_lockout.json. " +
+                "{0} EXITING launcher: manual_unlock_required is set in auth_lockout_global.json. " +
                 "Run: python -m ove_scraper.main unlock" -f ([DateTime]::UtcNow.ToString("o"))
             )
             break

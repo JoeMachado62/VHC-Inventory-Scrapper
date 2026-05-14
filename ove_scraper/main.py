@@ -136,6 +136,27 @@ _AUTH_FAIL_PARK_THRESHOLD = 5         # after 5 consecutive failures, park
 _TRANSIENT_ERROR_COUNT = 0
 _TRANSIENT_ERROR_REBUILD_THRESHOLD = 10   # rebuild only after this many in a row
 
+# Per-port consecutive saved-search-timeout streak (Fix, 2026-05-01).
+# The transient classifier matches "Page.goto: Timeout" — which was the
+# right call for one-off OVE slowness, but it caused a real production
+# bug on Login B (2026-05-01): the SYNC kept hitting goto-timeout on
+# https://www.ove.com/saved_searches#/, the classifier said "transient,
+# retry", 10 retries triggered a runtime rebuild, the rebuild left
+# Chrome's dead session intact so the next attempt produced the same
+# timeout, and the system entered an infinite loop with no real recovery.
+#
+# A goto that times out N times in a row at the saved-search URL is a
+# session-dead signal, not transient. We track the streak per port (so
+# A's health doesn't influence B's escalation decision) and at the
+# threshold we route the failure into the real recovery path (Chrome
+# kill+relaunch, lockout-gated) instead of the transient retry loop.
+#
+# Threshold of 3 is deliberate: 1 = single OVE hiccup, 2 = could be
+# coincidence, 3 = session dead. Total wait before escalation: ~3min
+# (3 × 60s timeout + retry gaps).
+_SAVED_SEARCH_TIMEOUT_STREAK: dict[int, int] = {}
+_SAVED_SEARCH_TIMEOUT_ESCALATE_AT = 3
+
 # Shared mutable heartbeat state. The main loop updates these fields as
 # it observes new events (sync_ok, poll_ok, claim taken, etc); the
 # background heartbeat ticker reads them every 30s and POSTs them to
@@ -191,10 +212,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "unlock",
         help=(
-            "Clear the disk-backed auth lockout state at "
-            "state/auth_lockout.json. Use after Manheim has lifted an "
-            "account lock and you have manually re-authed Chrome. "
-            "Without this, every Python process refuses auth attempts."
+            "Clear the disk-backed auth lockout state in "
+            "artifacts/_state/ (per-port files + global manual-unlock "
+            "flag). Use after Manheim has lifted an account lock and "
+            "you have manually re-authed Chrome. Without this, every "
+            "Python process refuses auth attempts."
         ),
     )
     subparsers.add_parser(
@@ -242,7 +264,9 @@ def main() -> None:
     # browser session can't be constructed (e.g. Chrome isn't running).
     if args.command == "unlock":
         auth_lockout.unlock(settings.artifact_dir)
-        print(f"Auth lockout cleared. State: {auth_lockout.describe_state(settings.artifact_dir)}")
+        print(auth_lockout.describe_state(settings.artifact_dir, port=None))
+        for _port in (PRIMARY_CHROME.port, SYNC_CHROME.port):
+            print(f"PORT {_port}: {auth_lockout.describe_state(settings.artifact_dir, port=_port)}")
         print(
             "REMINDER: confirm Manheim has lifted any account lock on their side "
             "before restarting the scraper, or you'll trigger another lockout."
@@ -250,7 +274,16 @@ def main() -> None:
         return
 
     if args.command == "lockout-status":
-        print(auth_lockout.describe_state(settings.artifact_dir))
+        # Three lines: global flag, then each known port (Login A, Login B).
+        # Per-port split landed 2026-05-01 — pre-split, lockout was a single
+        # shared file; the global line preserves the operator-override flag,
+        # and the per-port lines surface where the actual ledger / cooldown
+        # lives now.
+        print(auth_lockout.describe_state(settings.artifact_dir, port=None))
+        print(f"PORT {PRIMARY_CHROME.port} (Login A): "
+              f"{auth_lockout.describe_state(settings.artifact_dir, port=PRIMARY_CHROME.port)}")
+        print(f"PORT {SYNC_CHROME.port} (Login B):  "
+              f"{auth_lockout.describe_state(settings.artifact_dir, port=SYNC_CHROME.port)}")
         return
 
     # Cross-process auth lockout gate (2026-04-28 hardening). Every
@@ -265,21 +298,32 @@ def main() -> None:
     # connecting to Chrome only to refuse work.
     operational_commands = {"run", "sync-once", "poll-once", "scrape-vin", "hot-deal", "hot-deal-reprocess"}
     if args.command in operational_commands:
-        lockout_state = auth_lockout.get_state(settings.artifact_dir)
-        if lockout_state.blocked:
+        # Per-port lockout split (2026-05-01): the launcher manages both
+        # Chrome instances, so refuse to start if EITHER port is blocked.
+        # Recovery code paths inside the loop check their own port
+        # independently, but at startup we have no way to know which
+        # instance the operator just touched, so the safe move is to
+        # park the whole process until the operator clears the relevant
+        # lockout. The global manual-unlock flag is folded into every
+        # per-port get_state, so checking each port covers the global
+        # case too.
+        for _port in (PRIMARY_CHROME.port, SYNC_CHROME.port):
+            lockout_state = auth_lockout.get_state(settings.artifact_dir, port=_port)
+            if not lockout_state.blocked:
+                continue
             logger.error(
-                "STARTUP BLOCKED by auth lockout: %s",
-                lockout_state.reason,
+                "STARTUP BLOCKED by auth lockout (port %d): %s",
+                _port, lockout_state.reason,
             )
             logger.error(
-                "Lockout state file: %s",
-                settings.artifact_dir / "_state" / "auth_lockout.json",
+                "Lockout state directory: %s",
+                settings.artifact_dir / "_state",
             )
             logger.error(
                 "To clear manually after Manheim has lifted any account lock: "
                 "python -m ove_scraper.main unlock"
             )
-            print(f"BLOCKED: {lockout_state.reason}")
+            print(f"BLOCKED (port {_port}): {lockout_state.reason}")
             raise SystemExit(EXIT_CODE_AUTH_LOCKOUT_ACTIVE)
 
     browser, api_client, sync_runner, deep_scrape_worker, notifier = build_runtime(settings, logger)
@@ -833,6 +877,24 @@ def run_poll_once_with_recovery(
     return run_browser_operation(settings, browser, logger, worker.process_pending_once, "detail poll", notifier=notifier)
 
 
+def _is_saved_search_session_probe(operation_name: str) -> bool:
+    """True for operations that probe the saved-search page to validate
+    OVE session liveness — the goto target where Login B's dead-session
+    timeouts surface. Matches both the hourly sync and the keepalive."""
+    name = operation_name.lower()
+    return "sync" in name or "saved-search" in name or "keepalive" in name
+
+
+def _is_saved_search_goto_timeout(exc: BaseException) -> bool:
+    """True if `exc` is the specific failure mode that the per-port
+    streak counter is designed to break out of: a Playwright goto
+    timeout against the OVE saved-searches URL."""
+    msg = str(exc)
+    if "Page.goto: Timeout" not in msg:
+        return False
+    return "saved_searches" in msg or "saved-searches" in msg
+
+
 def run_browser_operation(
     settings: Settings,
     browser,
@@ -851,11 +913,13 @@ def run_browser_operation(
     """
     if lock_name is None:
         lock_name = lock_name_for_port(settings.chrome_debug_port)
+    port = settings.chrome_debug_port
+    is_session_probe = _is_saved_search_session_probe(operation_name)
     try:
         with OveAutomationLock(name=lock_name, timeout_seconds=_browser_operation_lock_timeout_seconds(operation_name)):
             ensure_browser_session(settings, browser, logger, notifier=notifier)
             try:
-                return operation()
+                result = operation()
             except SavedSearchPageEmpty as exc:
                 # "No Saved Searches" means OVE accepted the session cookie
                 # but the token is stale — the backend returns zero searches
@@ -869,11 +933,52 @@ def run_browser_operation(
                 )
                 _clear_chrome_cookies(settings, browser, logger)
                 recover_browser_session(settings, browser, logger, notifier=notifier)
+                _SAVED_SEARCH_TIMEOUT_STREAK[port] = 0
                 return operation()
             except BrowserSessionError as exc:
                 logger.warning("%s lost browser session: %s", operation_name, exc)
                 recover_browser_session(settings, browser, logger, notifier=notifier)
+                _SAVED_SEARCH_TIMEOUT_STREAK[port] = 0
                 return operation()
+            except Exception as exc:
+                # Per-port streak escalation (2026-05-01). The transient
+                # classifier in the main loop will treat this as a
+                # transient retry, but if we've already seen the same
+                # failure mode multiple times in a row on this port we
+                # need to break out of the retry loop and run real
+                # recovery (Chrome kill+relaunch, lockout-gated).
+                if is_session_probe and _is_saved_search_goto_timeout(exc):
+                    streak = _SAVED_SEARCH_TIMEOUT_STREAK.get(port, 0) + 1
+                    _SAVED_SEARCH_TIMEOUT_STREAK[port] = streak
+                    if streak >= _SAVED_SEARCH_TIMEOUT_ESCALATE_AT:
+                        logger.error(
+                            "SAVED_SEARCH_TIMEOUT_STREAK port=%d streak=%d "
+                            "→ escalating to recover_browser_session",
+                            port, streak,
+                        )
+                        _SAVED_SEARCH_TIMEOUT_STREAK[port] = 0
+                        try:
+                            recover_browser_session(settings, browser, logger, notifier=notifier)
+                        except BrowserSessionError as recover_exc:
+                            # Recovery itself failed (e.g. lockout active).
+                            # Re-raise so the main loop's circuit breaker
+                            # gets its turn — this is the right outcome:
+                            # we tried to recover, we couldn't, escalate.
+                            raise
+                        # Recovery succeeded — retry the original op once.
+                        return operation()
+                    logger.warning(
+                        "Saved-search goto timeout (port=%d streak=%d/%d); "
+                        "letting transient handler retry",
+                        port, streak, _SAVED_SEARCH_TIMEOUT_ESCALATE_AT,
+                    )
+                raise
+            else:
+                # Successful operation resets the streak so a future
+                # blip starts counting from zero.
+                if is_session_probe:
+                    _SAVED_SEARCH_TIMEOUT_STREAK[port] = 0
+                return result
     except AutomationLockBusyError as exc:
         logger.warning("%s skipped because another OVE automation task is active: %s", operation_name, exc)
         return None
@@ -994,14 +1099,45 @@ def recover_browser_session(settings: Settings, browser, logger, notifier: Admin
     # BrowserSessionError sends control back to the main loop which
     # backs off and eventually exits via the auth-fail park threshold
     # — clean, no Chrome thrashing.
-    lockout_state = auth_lockout.get_state(settings.artifact_dir)
+    # Per-port lockout: a B-side rate-limit no longer blocks A's recovery
+    # (and vice versa). The global manual-unlock flag is still observed
+    # because get_state folds it into every per-port read.
+    lockout_state = auth_lockout.get_state(
+        settings.artifact_dir, port=settings.chrome_debug_port,
+    )
     if lockout_state.blocked:
         logger.error(
-            "recover_browser_session REFUSED by auth lockout: %s",
-            lockout_state.reason,
+            "recover_browser_session REFUSED by auth lockout (port %d): %s",
+            settings.chrome_debug_port, lockout_state.reason,
         )
         raise BrowserSessionError(
             f"Browser recovery skipped — auth lockout active: {lockout_state.reason}"
+        )
+
+    # Per-port relaunch rate gate (2026-05-04 fix). The lockout gate
+    # above only kicks in AFTER an account-lock event has been recorded.
+    # The 2026-05-04 incident showed that 6 Chrome relaunches on port
+    # 9223 in 9 minutes (~90s spacing) triggered Manheim's anti-abuse
+    # heuristic and locked the account BEFORE any single failure was
+    # severe enough to record an account-lock event. The streak counter
+    # in run_browser_operation resets to 0 after each relaunch, so a
+    # single ~10-min bad window can fire 3+ relaunches before the first
+    # 30-min lockout cooldown ever starts. This gate enforces a 5-min
+    # floor between successive relaunches per port, regardless of what
+    # else is happening, so a panic-relaunch loop becomes structurally
+    # impossible.
+    is_rate_limited, last_age_s = auth_lockout.is_relaunch_rate_limited(
+        settings.artifact_dir, port=settings.chrome_debug_port,
+    )
+    if is_rate_limited:
+        logger.error(
+            "RELAUNCH_RATE_LIMITED port=%d last_relaunch_age_s=%d (5-min floor)",
+            settings.chrome_debug_port, last_age_s,
+        )
+        raise BrowserSessionError(
+            f"Browser recovery skipped — Chrome on port "
+            f"{settings.chrome_debug_port} was relaunched {last_age_s}s ago; "
+            "5-min floor in effect to prevent Manheim anti-abuse trigger."
         )
 
     # Same guard at the recover entry — _clear_chrome_cookies path
@@ -1011,6 +1147,21 @@ def recover_browser_session(settings: Settings, browser, logger, notifier: Admin
     browser.close()
     _kill_stale_chrome(chrome, logger)
     launch_browser_script(chrome, logger)
+    # Record the relaunch BEFORE waiting for CDP so the rate gate
+    # protects subsequent attempts even if wait_for_cdp times out.
+    try:
+        auth_lockout.record_chrome_relaunch(
+            settings.artifact_dir, port=settings.chrome_debug_port,
+        )
+    except Exception as exc:
+        # Ledger write failure is non-fatal — the rate gate just won't
+        # be effective for this relaunch. Loud log so operators notice
+        # if disk is full / permissions broken.
+        logger.error(
+            "Failed to record Chrome relaunch in ledger (rate gate degraded "
+            "for port %d): %s",
+            settings.chrome_debug_port, exc,
+        )
     wait_for_cdp(settings, logger, timeout_seconds=45)
     try:
         browser.ensure_session()
@@ -1084,25 +1235,109 @@ def _kill_stale_chrome(chrome: ChromeInstance, logger) -> None:
         )
 
 
-def _clear_chrome_cookies(settings: Settings, browser, logger) -> None:
-    """Kill Chrome and delete its cookie files so the next launch starts
-    a fresh OVE login.  This is the programmatic equivalent of the manual
-    fix: clearing browser cookies then re-logging in.
+# Cookie domains that ARE deleted by the surgical clear. These are the
+# OVE session/app cookies — wiping them forces a fresh OVE session
+# while leaving Manheim's device-trust cookie intact, so re-auth via
+# the saved-credentials path doesn't trigger a fresh 2FA challenge.
+# Pattern uses SQL LIKE: 'ove.com' (exact) OR '%.ove.com' (subdomains).
+_OVE_COOKIE_DOMAIN_PATTERNS: tuple[str, ...] = (
+    "ove.com",      # exact host_key
+    "%.ove.com",    # any *.ove.com subdomain (e.g. www.ove.com, .ove.com)
+)
 
-    Called when OVE shows 'No Saved Searches' — the session cookie looks
-    valid to OVE's page shell (no login redirect) but the backend token
-    is stale, so it silently returns zero searches. Routes by
-    settings.chrome_debug_port so the right Chrome's cookies get wiped.
+
+def _clear_chrome_cookies(settings: Settings, browser, logger) -> None:
+    """Kill Chrome and SURGICALLY delete only OVE cookies, preserving
+    Manheim/Cox/Okta device-trust cookies so re-auth doesn't trigger 2FA.
+
+    2026-05-04 redesign. Pre-fix this function deleted the entire
+    Cookies SQLite database, which wiped the Manheim device-trust
+    cookie alongside the stale OVE session cookie. Result: every
+    recovery cycle forced a fresh 2FA text to the operator's phone,
+    blocking automated re-auth.
+
+    Post-fix (this function) opens the Cookies SQLite directly and
+    runs `DELETE FROM cookies WHERE host_key MATCHES ove.com pattern`,
+    leaving everything else intact. The Manheim device-trust cookie
+    persists, so on next visit:
+      - OVE has no session cookie → redirects to Manheim auth
+      - Manheim sees device-trust cookie → no 2FA required
+      - Chrome auto-fills credentials → Playwright clicks Sign In
+      - Redirect back to OVE with fresh session
+
+    Falls back to full Cookies file delete if SQLite operations fail —
+    we never want to leave the system in a state where stale OVE
+    cookies persist (that was the original bug this whole path was
+    designed to fix). The fallback restores the pre-2026-05-04
+    behavior; you'll get a 2FA text but recovery still works.
+
+    Called when OVE shows 'No Saved Searches' — the session cookie
+    looks valid to OVE's page shell (no login redirect) but the
+    backend token is stale, so it silently returns zero searches.
+    Routes by settings.chrome_debug_port.
     """
+    import sqlite3
+
     chrome = chrome_for_port(settings.chrome_debug_port)
     browser.close()
     _kill_stale_chrome(chrome, logger)
 
-    cookie_files = [
-        chrome.profile_path / "Default" / "Network" / "Cookies",
-        chrome.profile_path / "Default" / "Network" / "Cookies-journal",
-    ]
-    for path in cookie_files:
+    cookies_path = chrome.profile_path / "Default" / "Network" / "Cookies"
+    journal_path = chrome.profile_path / "Default" / "Network" / "Cookies-journal"
+
+    if not cookies_path.exists():
+        logger.info(
+            "Cookies file does not exist at %s; nothing to clear", cookies_path,
+        )
+        return
+
+    # Surgical SQLite delete. Try this first; fall back to full file
+    # delete on any failure (better to lose device-trust than to leave
+    # stale OVE cookies in place — the latter was the original
+    # production bug).
+    try:
+        conn = sqlite3.connect(str(cookies_path), timeout=10.0)
+        try:
+            where_clauses = " OR ".join(
+                "host_key = ?" if "%" not in p else "host_key LIKE ?"
+                for p in _OVE_COOKIE_DOMAIN_PATTERNS
+            )
+            params = tuple(_OVE_COOKIE_DOMAIN_PATTERNS)
+
+            # Count what we're about to delete + what we're keeping so
+            # the operator can see in the log that the surgical clear
+            # actually targeted only OVE cookies.
+            total_before = conn.execute(
+                "SELECT COUNT(*) FROM cookies"
+            ).fetchone()[0]
+            to_delete = conn.execute(
+                f"SELECT COUNT(*) FROM cookies WHERE {where_clauses}",
+                params,
+            ).fetchone()[0]
+
+            conn.execute(f"DELETE FROM cookies WHERE {where_clauses}", params)
+            conn.commit()
+
+            logger.info(
+                "Surgical cookie clear (port %d): deleted %d OVE cookies, "
+                "preserved %d non-OVE cookies (Manheim device-trust intact)",
+                settings.chrome_debug_port,
+                to_delete,
+                total_before - to_delete,
+            )
+            return
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning(
+            "Surgical cookie clear failed (%s); falling back to full file "
+            "delete (operator will get a fresh 2FA text on next login)",
+            exc,
+        )
+
+    # Fallback: full delete (pre-2026-05-04 behavior). Loud so operators
+    # can see when the surgical path didn't work.
+    for path in (cookies_path, journal_path):
         try:
             if path.exists():
                 path.unlink()
@@ -1511,6 +1746,59 @@ def run_hot_deal_with_recovery(
             result = runner.run_once()
         finally:
             db_conn.close()
+    except SavedSearchPageEmpty as exc:
+        # Stale-auth recovery (2026-05-03 fix): "No Saved Searches" means
+        # OVE accepted the session cookie but the backend token is dead.
+        # In-page reload retries cannot fix this — they reload the same
+        # bad cookies. The mirror handler in run_browser_operation
+        # ([main.py: see except SavedSearchPageEmpty around line 903])
+        # already exists for sync/poll; the hot-deal pipeline previously
+        # swallowed the exception type and never reached this branch,
+        # so all 3 daily attempts hit the same dead cookies and the
+        # pipeline failed with no real recovery (the 2026-05-03
+        # incident). Clear cookies + relaunch Chrome BEFORE marking
+        # state failed so the next scheduler tick (~30 min later) gets
+        # a fresh authenticated session.
+        finish = datetime.now(EASTERN_TZ)
+        reason = (
+            f"SavedSearchPageEmpty (stale auth on Login A): {exc}. "
+            "Cookies cleared + Chrome relaunched; next retry will use fresh session."
+        )
+        logger.warning(
+            "Hot Deal pipeline detected stale OVE session (No Saved Searches): "
+            "clearing cookies and relaunching browser before next retry"
+        )
+        try:
+            _clear_chrome_cookies(settings, browser, logger)
+            recover_browser_session(settings, browser, logger, notifier=notifier)
+        except BrowserSessionError as recover_exc:
+            # Recovery itself failed (likely lockout active). Mark the
+            # state failed with the recovery error so the operator sees
+            # both signals. Do NOT re-raise — the main loop's auth
+            # handler would force a runtime rebuild that doesn't help
+            # if the lockout is what's blocking us.
+            logger.error(
+                "Hot Deal stale-auth recovery FAILED on attempt %s: %s",
+                attempts_today, recover_exc,
+            )
+            reason = f"SavedSearchPageEmpty + recovery failed: {recover_exc}"
+        _save_hot_deal_state(state_path, {
+            "last_run_date_eastern": today_str,
+            "last_run_status": "failed",
+            "last_run_at": finish.isoformat(),
+            "attempts_today": attempts_today,
+            "last_failure_reason": reason,
+        })
+        if attempts_today >= settings.hot_deal_max_daily_attempts and notifier is not None:
+            try:
+                notifier.notify_hot_deal_pipeline_failed(
+                    attempts=attempts_today,
+                    last_error=reason,
+                    logger=logger,
+                )
+            except Exception as notify_exc:
+                logger.warning("Failed to send Hot Deal failure notification: %s", notify_exc)
+        return
     except BrowserSessionError:
         # Re-raise to the main loop's auth handler. Leave state as
         # "started" — the stale-start detection will reclassify it as

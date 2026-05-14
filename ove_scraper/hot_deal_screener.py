@@ -5,11 +5,17 @@ No browser, network, or database calls — deterministic and testable.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 from typing import Any
 
 from pydantic import BaseModel, Field
 
+from ove_scraper.hot_deal_rule_catalog import (
+    HOT_DEAL_NARRATIVE_RULES,
+    NarrativeRule,
+    format_defect_flag_reason,
+)
 from ove_scraper.schemas import ConditionReport
 
 
@@ -146,6 +152,25 @@ _AUTOCHECK_BRANDED_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+_NON_ALNUM_PATTERN = re.compile(r"[^a-z0-9]+")
+_WHITESPACE_PATTERN = re.compile(r"\s+")
+
+
+@dataclass(frozen=True)
+class _NarrativeEvidence:
+    source_label: str
+    raw_text: str
+    normalized_text: str
+
+
+@dataclass(frozen=True)
+class _NarrativeSignalMatch:
+    signal_key: str
+    source_label: str
+    raw_text: str
+    matched_text: str
+    score: int
+
 
 # ---------------------------------------------------------------------------
 # Step 1: Condition Report screening
@@ -173,6 +198,32 @@ def screen_condition_report(
     if listing_json.get("hasFrameDamage") is True:
         return ScreenResult(passed=False, step="step1", reason="Frame damage (listing flag)")
 
+    history = cr.vehicle_history or {}
+    if history.get("engine_starts") is False:
+        return ScreenResult(
+            passed=False,
+            step="step1",
+            reason="Engine does not start",
+            details={"field": "vehicle_history.engine_starts"},
+        )
+    if history.get("drivable") is False:
+        return ScreenResult(
+            passed=False,
+            step="step1",
+            reason="Vehicle does not drive",
+            details={"field": "vehicle_history.drivable"},
+        )
+
+    defect_flags = _get_defect_flags(cr)
+    if defect_flags:
+        first = defect_flags[0]
+        return ScreenResult(
+            passed=False,
+            step="step1",
+            reason=format_defect_flag_reason(first),
+            details={"defect_flag": first, "defect_flags": defect_flags},
+        )
+
     # Title branding from CR
     if cr.title_branding and _BRANDED_TITLE_PATTERNS.search(cr.title_branding):
         return ScreenResult(
@@ -194,12 +245,14 @@ def screen_condition_report(
     # KM8JEDD13SU329976 (Hyundai Tucson): the lemon-law announcement
     # was a real red flag that was only caught by a broad
     # engine/drivetrain match because title_branding was empty.
-    for announcement in cr.announcements:
-        if _BRANDED_TITLE_PATTERNS.search(announcement):
-            return ScreenResult(
-                passed=False, step="step1",
-                reason=f"Branded title announcement: {announcement[:120]}",
-            )
+    title_risk_signal = _find_narrative_rule_match(cr, "title_risk", listing_json)
+    if title_risk_signal:
+        strongest = max(title_risk_signal["signals"], key=lambda item: item["score"])
+        return ScreenResult(
+            passed=False, step="step1",
+            reason=f"Title risk in {strongest['source_label']}: {strongest['raw_text'][:120]}",
+            details=title_risk_signal,
+        )
 
     # Structural damage
     if cr.structural_damage is True:
@@ -216,7 +269,7 @@ def screen_condition_report(
             )
 
     # Scan all text fields for TMU
-    all_text = _collect_text_fields(cr)
+    all_text = _collect_text_fields(cr, listing_json)
     if _TMU_PATTERNS.search(all_text):
         return ScreenResult(passed=False, step="step1", reason="True Miles Unknown (TMU)")
 
@@ -265,7 +318,23 @@ def screen_condition_report(
 def screen_autocheck(autocheck_data: dict[str, Any]) -> ScreenResult:
     """Screen based on the full AutoCheck report scraped from the modal."""
 
-    raw_text = autocheck_data.get("raw_text", "")
+    status = str(autocheck_data.get("scrape_status") or "not_attempted")
+    if status != "success":
+        return ScreenResult(
+            passed=False,
+            step="step2",
+            reason=f"AutoCheck: full report not captured ({status})",
+            details={
+                "scrape_status": status,
+                "failure_category": autocheck_data.get("failure_category"),
+                "failure_message": autocheck_data.get("failure_message"),
+            },
+        )
+
+    raw_text = " ".join(
+        str(autocheck_data.get(key) or "")
+        for key in ("raw_text", "full_report_text")
+    )
 
     # Title brand check
     title_check = autocheck_data.get("title_brand_check", "")
@@ -298,6 +367,15 @@ def screen_autocheck(autocheck_data: dict[str, Any]) -> ScreenResult:
     return ScreenResult(passed=True, step="step2")
 
 
+def is_autocheck_capture_failure(result: ScreenResult) -> bool:
+    """True when Step 2 failed because scraping was incomplete."""
+    if result.passed or result.step != "step2":
+        return False
+    details = result.details or {}
+    status = str(details.get("scrape_status") or "")
+    return bool(status) and status != "success"
+
+
 # ---------------------------------------------------------------------------
 # Step 3: VIN web search screening
 # ---------------------------------------------------------------------------
@@ -326,7 +404,7 @@ def screen_vin_web_search(search_result: dict[str, Any]) -> ScreenResult:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _collect_text_fields(cr: ConditionReport) -> str:
+def _collect_text_fields(cr: ConditionReport, listing_json: dict[str, Any] | None = None) -> str:
     """Concatenate the *parsed finding* text fields from a CR for keyword
     scanning.
 
@@ -343,7 +421,151 @@ def _collect_text_fields(cr: ConditionReport) -> str:
     parts.extend(cr.remarks)
     parts.extend(cr.seller_comments_items)
     parts.extend(cr.problem_highlights)
+    for item in _iter_listing_narrative_values(listing_json):
+        parts.append(item)
     return " ".join(parts)
+
+
+def _get_defect_flags(cr: ConditionReport) -> list[dict[str, Any]]:
+    metadata = cr.metadata or {}
+    flags = metadata.get("defect_flags")
+    if not isinstance(flags, list):
+        return []
+    return [flag for flag in flags if isinstance(flag, dict)]
+
+
+def _normalize_narrative_text(text: str) -> str:
+    lowered = str(text or "").lower().replace("&", " and ")
+    cleaned = _NON_ALNUM_PATTERN.sub(" ", lowered)
+    return _WHITESPACE_PATTERN.sub(" ", cleaned).strip()
+
+
+def _iter_narrative_evidence(
+    cr: ConditionReport,
+    listing_json: dict[str, Any] | None = None,
+) -> list[_NarrativeEvidence]:
+    evidence: list[_NarrativeEvidence] = []
+    for source_label, values in (
+        ("announcement", cr.announcements),
+        ("remark", cr.remarks),
+        ("seller comment", cr.seller_comments_items),
+        ("problem highlight", cr.problem_highlights),
+    ):
+        for value in values:
+            raw_text = str(value or "").strip()
+            if not raw_text:
+                continue
+            evidence.append(
+                _NarrativeEvidence(
+                    source_label=source_label,
+                    raw_text=raw_text,
+                    normalized_text=_normalize_narrative_text(raw_text),
+                )
+            )
+    for source_label, raw_text in _iter_listing_narrative_evidence(listing_json):
+        evidence.append(
+            _NarrativeEvidence(
+                source_label=source_label,
+                raw_text=raw_text,
+                normalized_text=_normalize_narrative_text(raw_text),
+            )
+        )
+    return evidence
+
+
+def _find_narrative_rule_match(
+    cr: ConditionReport,
+    rule_key: str,
+    listing_json: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    evidence = _iter_narrative_evidence(cr, listing_json)
+    if not evidence:
+        return None
+
+    for rule in HOT_DEAL_NARRATIVE_RULES:
+        if rule.key != rule_key:
+            continue
+        return _evaluate_narrative_rule(rule, evidence)
+    return None
+
+
+def _iter_listing_narrative_values(listing_json: dict[str, Any] | None) -> list[str]:
+    return [text for _, text in _iter_listing_narrative_evidence(listing_json)]
+
+
+def _iter_listing_narrative_evidence(listing_json: dict[str, Any] | None) -> list[tuple[str, str]]:
+    if not listing_json:
+        return []
+
+    evidence: list[tuple[str, str]] = []
+    enrichment = listing_json.get("announcementsEnrichment") or {}
+
+    def append_values(source_label: str, values: Any) -> None:
+        if isinstance(values, str):
+            text = values.strip()
+            if text:
+                evidence.append((source_label, text))
+            return
+        if isinstance(values, list):
+            for item in values:
+                text = str(item or "").strip()
+                if text:
+                    evidence.append((source_label, text))
+
+    append_values("listing announcement", enrichment.get("announcements"))
+    append_values("listing remark", enrichment.get("remarks"))
+    append_values("listing comment", listing_json.get("comments"))
+    append_values("listing additional announcement", listing_json.get("additionalAnnouncements"))
+    append_values("listing remark", listing_json.get("remarks"))
+    return evidence
+
+
+def _evaluate_narrative_rule(
+    rule: NarrativeRule,
+    evidence: list[_NarrativeEvidence],
+) -> dict[str, Any] | None:
+    matches: list[_NarrativeSignalMatch] = []
+    total_score = 0
+
+    for signal in rule.signals:
+        best_match: _NarrativeSignalMatch | None = None
+        for item in evidence:
+            matched = signal.pattern.search(item.normalized_text)
+            if not matched:
+                continue
+            score = signal.weight + signal.source_bonus.get(item.source_label, 0)
+            signal_match = _NarrativeSignalMatch(
+                signal_key=signal.key,
+                source_label=item.source_label,
+                raw_text=item.raw_text,
+                matched_text=matched.group(0),
+                score=score,
+            )
+            if best_match is None or signal_match.score > best_match.score:
+                best_match = signal_match
+        if best_match is not None:
+            matches.append(best_match)
+            total_score += best_match.score
+
+    if total_score < rule.threshold:
+        return None
+
+    return {
+        "rule_key": rule.key,
+        "category": rule.category,
+        "score": total_score,
+        "threshold": rule.threshold,
+        "signals": [
+            {
+                "signal_key": match.signal_key,
+                "source_label": match.source_label,
+                "raw_text": match.raw_text,
+                "matched_text": match.matched_text,
+                "score": match.score,
+            }
+            for match in matches
+        ],
+    }
 
 
 def _extract_section(text: str, heading: str) -> str | None:
