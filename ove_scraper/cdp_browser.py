@@ -406,6 +406,7 @@ class PlaywrightCdpBrowserSession:
     def ensure_session(self) -> None:
         try:
             browser = self._connect_browser()
+            self.compact_tabs()
             page = self._get_ove_page(browser.contexts)
             page.wait_for_load_state("domcontentloaded", timeout=5000)
             if self._is_login_page(page):
@@ -2097,6 +2098,104 @@ class PlaywrightCdpBrowserSession:
             )
         return closed
 
+    def compact_tabs(self) -> int:
+        """Keep one scraper-owned tab open and close duplicate clutter.
+
+        The Chrome profiles used here are dedicated automation profiles, but
+        they are still visible to human operators. A stale auth loop, crash
+        restore, or popup-heavy condition-report run can leave a confusing
+        pile of tabs. This method trims only scraper-owned pages:
+
+          - auth/login tabs,
+          - stray about:blank tabs when another tab can be kept,
+          - duplicate OVE tabs.
+
+        Non-OVE external pages are left alone unless they match the auth
+        orphan patterns. The persistent keepalive page is preferred as the
+        survivor when present so active keepalive does not lose its warm tab.
+        """
+        browser = self._connect_browser()
+        closed = 0
+        base = (self.settings.ove_base_url or "https://www.ove.com").lower()
+
+        def page_url(page: Page) -> str:
+            try:
+                if page.is_closed():
+                    return ""
+                return (page.url or "").lower()
+            except Exception:
+                return ""
+
+        def is_auth_orphan(url: str) -> bool:
+            return any(pattern in url for pattern in self._ORPHAN_TAB_URL_PATTERNS)
+
+        def is_scraper_owned(url: str) -> bool:
+            return (
+                url == "about:blank"
+                or base in url
+                or is_auth_orphan(url)
+            )
+
+        def score(page: Page) -> int:
+            url = page_url(page)
+            if not url:
+                return -100
+            if self._keepalive_page is not None and page is self._keepalive_page:
+                return 1000
+            if is_auth_orphan(url):
+                return -50
+            if base in url:
+                value = 100
+                if "/saved_searches" in url:
+                    value += 30
+                if "/search/results" in url:
+                    value += 20
+                if "/details/" in url:
+                    value += 10
+                try:
+                    if self._is_login_page(page) or self._is_error_page(page):
+                        value -= 200
+                except Exception:
+                    value -= 50
+                return value
+            if url == "about:blank":
+                return 0
+            return -10
+
+        for context in browser.contexts:
+            try:
+                pages = [page for page in list(context.pages) if not page.is_closed()]
+            except Exception:
+                continue
+            if len(pages) <= 1:
+                continue
+            scraper_pages = [page for page in pages if is_scraper_owned(page_url(page))]
+            if len(scraper_pages) <= 1:
+                continue
+            keep = max(scraper_pages, key=score)
+            for page in scraper_pages:
+                if page is keep:
+                    continue
+                url = page_url(page)
+                if not url:
+                    continue
+                LOGGER.warning(
+                    "compact_tabs: closing duplicate scraper tab on port %d url=%s",
+                    self.settings.chrome_debug_port,
+                    page.url,
+                )
+                if self._keepalive_page is not None and page is self._keepalive_page:
+                    self._keepalive_page = None
+                self._close_page(page)
+                closed += 1
+        if closed:
+            LOGGER.warning(
+                "compact_tabs: closed %d duplicate scraper tab(s) on port %d",
+                closed,
+                self.settings.chrome_debug_port,
+            )
+        return closed
+
     def _create_worker_page(self, context: BrowserContext, *, start_url: str | None = None) -> Page:
         page = context.new_page()
         try:
@@ -2495,8 +2594,11 @@ class PlaywrightCdpBrowserSession:
                 timeout=180000,
             )
             page.wait_for_timeout(3000)  # let the rest of the grid catch up
-        except PlaywrightTimeoutError:
-            LOGGER.warning("Vehicle results selector not found before export; proceeding anyway")
+        except PlaywrightTimeoutError as exc:
+            raise SavedSearchPageEmpty(
+                "OVE results did not render vehicle cards before export; "
+                "refusing to create a likely header-only CSV"
+            ) from exc
 
         direct_download_locators = [
             page.get_by_role("button", name=re.compile(r"export\s*csv", re.I)).first,
@@ -2509,10 +2611,46 @@ class PlaywrightCdpBrowserSession:
             if download is not None:
                 return download
 
-        # OVE's saved-search results page hides the real export entry in a
-        # menu item (#inventory_export). Clicking it navigates to the
-        # Inventory Export page, where the actual CSV download is triggered
-        # by the visible "Create Report" submit button.
+        trigger_locators = [
+            page.locator("#export-action-button").first,
+            page.locator("[data-testid='export-data-button']").first,
+            page.get_by_role("button", name=re.compile(r"^export$", re.I)).first,
+            page.locator(self.settings.ove_export_button_selector).first,
+            page.get_by_text("EXPORT", exact=False).first,
+            page.get_by_text("Export", exact=False).first,
+        ]
+        csv_locators = [
+            page.get_by_role("menuitem", name=re.compile(r"export\s*csv|csv", re.I)).first,
+            page.get_by_role("button", name=re.compile(r"export\s*csv|csv", re.I)).first,
+            page.get_by_role("link", name=re.compile(r"export\s*csv|csv", re.I)).first,
+            page.get_by_text("EXPORT CSV", exact=False).first,
+            page.get_by_text("Export CSV", exact=False).first,
+            page.get_by_text(".csv", exact=False).first,
+        ]
+
+        for trigger in trigger_locators:
+            if not self._locator_ready(trigger):
+                continue
+
+            download = self._try_download_click(page, trigger)
+            if download is not None:
+                return download
+
+            try:
+                self._click_locator(trigger)
+                page.wait_for_timeout(750)
+            except Exception:
+                continue
+
+            for csv_locator in csv_locators:
+                download = self._try_download_click(page, csv_locator)
+                if download is not None:
+                    return download
+
+        # Last resort only: the legacy nav link. This is intentionally after
+        # the real results-page export button because a#inventory_export also
+        # appears in the hidden Sell navigation and produces a seller inventory
+        # report, which can be a valid-looking header-only CSV.
         hidden_inventory_export = page.locator("a#inventory_export").first
         try:
             if hidden_inventory_export.count() > 0:
@@ -2550,42 +2688,6 @@ class PlaywrightCdpBrowserSession:
                         return download
         except Exception as exc:
             LOGGER.debug("Hidden inventory export flow did not complete cleanly: %s", exc)
-
-        trigger_locators = [
-            page.locator("#export-action-button").first,
-            page.locator("[data-testid='export-data-button']").first,
-            page.get_by_role("button", name=re.compile(r"^export$", re.I)).first,
-            page.locator(self.settings.ove_export_button_selector).first,
-            page.get_by_text("EXPORT", exact=False).first,
-            page.get_by_text("Export", exact=False).first,
-        ]
-        csv_locators = [
-            page.get_by_role("menuitem", name=re.compile(r"export\s*csv|csv", re.I)).first,
-            page.get_by_role("button", name=re.compile(r"export\s*csv|csv", re.I)).first,
-            page.get_by_role("link", name=re.compile(r"export\s*csv|csv", re.I)).first,
-            page.get_by_text("EXPORT CSV", exact=False).first,
-            page.get_by_text("Export CSV", exact=False).first,
-            page.get_by_text(".csv", exact=False).first,
-        ]
-
-        for trigger in trigger_locators:
-            if not self._locator_ready(trigger):
-                continue
-
-            download = self._try_download_click(page, trigger)
-            if download is not None:
-                return download
-
-            try:
-                self._click_locator(trigger)
-                page.wait_for_timeout(750)
-            except Exception:
-                continue
-
-            for csv_locator in csv_locators:
-                download = self._try_download_click(page, csv_locator)
-                if download is not None:
-                    return download
 
         raise BrowserSessionError("Could not trigger CSV export from OVE")
 
@@ -2773,7 +2875,12 @@ class PlaywrightCdpBrowserSession:
             pass
 
         if save_as_worked:
-            return
+            if self._count_export_vehicle_rows(target_path) > 0:
+                return
+            raise BrowserSessionError(
+                f"Exported CSV for '{search_name}' contained no VIN rows"
+                f" (suggested filename: {download.suggested_filename})"
+            )
 
         # Fallback: find the actual CSV in Chrome's default Downloads folder.
         # OVE names exports "Export.csv", "Export (1).csv", "Export (2).csv",
@@ -2802,7 +2909,14 @@ class PlaywrightCdpBrowserSession:
                 except Exception:
                     pass
                 if target_path.exists() and target_path.stat().st_size > 0:
-                    return
+                    if self._count_export_vehicle_rows(target_path) > 0:
+                        return
+                    raise BrowserSessionError(
+                        f"Exported CSV for '{search_name}' contained no VIN rows"
+                        f" (suggested filename: {download.suggested_filename})"
+                    )
+            except BrowserSessionError:
+                raise
             except Exception as exc:
                 LOGGER.warning("Fallback copy from Chrome Downloads failed: %s", exc)
 
@@ -2810,6 +2924,33 @@ class PlaywrightCdpBrowserSession:
             f"Exported CSV for '{search_name}' was empty"
             f" (suggested filename: {download.suggested_filename})"
         )
+
+    def _count_export_vehicle_rows(self, path: Path) -> int:
+        import csv as _csv
+
+        try:
+            lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+        except Exception:
+            return 0
+        header_index: int | None = None
+        for index, line in enumerate(lines):
+            columns = [part.strip().strip('"').lower() for part in line.split(",")]
+            if "vin" in columns:
+                header_index = index
+                break
+        if header_index is None:
+            return 0
+        reader = _csv.DictReader(lines[header_index:])
+        count = 0
+        for row in reader:
+            vin = ""
+            for key, value in row.items():
+                if key and key.strip().lower() == "vin":
+                    vin = (value or "").strip().upper()
+                    break
+            if re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", vin):
+                count += 1
+        return count
 
     def _remove_file_if_present(self, path: Path) -> None:
         try:

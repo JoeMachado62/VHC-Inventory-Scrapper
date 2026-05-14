@@ -61,7 +61,14 @@ class TransformResult:
 
 def load_csv_rows(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
+        lines = handle.readlines()
+        header_index = 0
+        for index, line in enumerate(lines):
+            columns = [part.strip().strip('"').lower() for part in line.split(",")]
+            if "vin" in columns:
+                header_index = index
+                break
+        reader = csv.DictReader(lines[header_index:])
         return [dict(row) for row in reader]
 
 

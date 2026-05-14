@@ -979,6 +979,18 @@ def run_browser_operation(
                 if is_session_probe:
                     _SAVED_SEARCH_TIMEOUT_STREAK[port] = 0
                 return result
+            finally:
+                try:
+                    if hasattr(browser, "compact_tabs"):
+                        browser.compact_tabs()
+                    elif hasattr(browser, "sweep_orphan_tabs"):
+                        browser.sweep_orphan_tabs()
+                except Exception as sweep_exc:
+                    logger.warning(
+                        "Post-operation tab cleanup raised during %s (non-fatal): %s",
+                        operation_name,
+                        sweep_exc,
+                    )
     except AutomationLockBusyError as exc:
         logger.warning("%s skipped because another OVE automation task is active: %s", operation_name, exc)
         return None

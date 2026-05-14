@@ -64,8 +64,8 @@ if (-not $existing) {
         try {
             $prefsJson = Get-Content $prefsPath -Raw | ConvertFrom-Json
             if ($prefsJson.profile) {
-                $prefsJson.profile.exit_type = "Normal"
-                $prefsJson.profile.exited_cleanly = $true
+                $prefsJson.profile | Add-Member -NotePropertyName exit_type -NotePropertyValue "Normal" -Force
+                $prefsJson.profile | Add-Member -NotePropertyName exited_cleanly -NotePropertyValue $true -Force
             }
             # 2026-04-28 hardening: disable Chrome's auto-sign-in feature
             # so the password manager fills the login form but does NOT

@@ -261,7 +261,10 @@ class VCHApiClient:
                 if response.status_code == 401:
                     raise ApiClientError("VCH API authentication failed (401)")
                 if response.status_code >= 500:
-                    response.raise_for_status()
+                    raise ApiClientError(
+                        "VCH API server error "
+                        f"{response.status_code} for {url}: {response.text[:2000]}"
+                    )
                 if response.status_code >= 400:
                     raise ApiClientError(f"VCH API rejected request with status {response.status_code}: {response.text}")
                 return response
