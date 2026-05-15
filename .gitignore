@@ -1,4 +1,5 @@
 .env
+.env.staging
 .venv/
 .cache/
 .codex_pytest_cache/

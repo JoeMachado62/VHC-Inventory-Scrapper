@@ -156,6 +156,7 @@ _TRANSIENT_ERROR_REBUILD_THRESHOLD = 10   # rebuild only after this many in a ro
 # (3 × 60s timeout + retry gaps).
 _SAVED_SEARCH_TIMEOUT_STREAK: dict[int, int] = {}
 _SAVED_SEARCH_TIMEOUT_ESCALATE_AT = 3
+_LUX_PREFLIGHT_LAST_AT: dict[int, float] = {}
 
 # Shared mutable heartbeat state. The main loop updates these fields as
 # it observes new events (sync_ok, poll_ok, claim taken, etc); the
@@ -916,6 +917,7 @@ def run_browser_operation(
     port = settings.chrome_debug_port
     is_session_probe = _is_saved_search_session_probe(operation_name)
     try:
+        run_lux_auth_preflight(settings, operation_name, logger)
         with OveAutomationLock(name=lock_name, timeout_seconds=_browser_operation_lock_timeout_seconds(operation_name)):
             ensure_browser_session(settings, browser, logger, notifier=notifier)
             try:
@@ -994,6 +996,117 @@ def run_browser_operation(
     except AutomationLockBusyError as exc:
         logger.warning("%s skipped because another OVE automation task is active: %s", operation_name, exc)
         return None
+
+
+def run_lux_auth_preflight(settings: Settings, operation_name: str, logger) -> None:
+    """Best-effort Lux auth/tab-hygiene preflight before OVE browser work.
+
+    The deterministic Playwright code remains the owner of scraper work. Lux is
+    used only for the browser-auth handoff and tab cleanup problem space. This
+    function is intentionally best-effort: a Lux outage must not prevent the
+    existing Playwright recovery path from getting its turn.
+    """
+    if os.getenv("OVE_LUX_AUTH_PREFLIGHT", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+    interval_seconds = _get_lux_preflight_interval_seconds(operation_name)
+    now = time.monotonic()
+    last = _LUX_PREFLIGHT_LAST_AT.get(settings.chrome_debug_port)
+    if last is not None and now - last < interval_seconds:
+        return
+    script = _SCRIPTS_DIR / "lux_auth_handoff.py"
+    if not script.exists():
+        logger.debug("Lux auth preflight skipped; script missing at %s", script)
+        return
+    track = "sync" if settings.chrome_debug_port == SYNC_CHROME.port else "hot-deal"
+    timeout_seconds = _get_lux_preflight_timeout_seconds(operation_name)
+    command = [
+        "python",
+        str(script),
+        "--track",
+        track,
+        "--port",
+        str(settings.chrome_debug_port),
+        "--artifact-dir",
+        str(settings.artifact_dir),
+    ]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    try:
+        logger.info(
+            "Lux auth preflight starting for %s on port %d (track=%s, timeout=%ss)",
+            operation_name,
+            settings.chrome_debug_port,
+            track,
+            timeout_seconds,
+        )
+        result = subprocess.run(
+            command,
+            cwd=str(Path(__file__).resolve().parent.parent),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        _LUX_PREFLIGHT_LAST_AT[settings.chrome_debug_port] = time.monotonic()
+    except subprocess.TimeoutExpired as exc:
+        logger.warning(
+            "Lux auth preflight timed out for %s on port %d after %ss; continuing with Playwright path. stdout=%s stderr=%s",
+            operation_name,
+            settings.chrome_debug_port,
+            timeout_seconds,
+            (exc.stdout or "")[-1000:],
+            (exc.stderr or "")[-1000:],
+        )
+        return
+    except Exception as exc:
+        logger.warning("Lux auth preflight failed to start for %s: %s", operation_name, exc)
+        return
+    if result.returncode == 0:
+        logger.info(
+            "Lux auth preflight OK for %s on port %d. stdout_tail=%s",
+            operation_name,
+            settings.chrome_debug_port,
+            (result.stdout or "")[-1000:],
+        )
+        return
+    logger.warning(
+        "Lux auth preflight returned %s for %s on port %d; continuing with Playwright path. stdout_tail=%s stderr_tail=%s",
+        result.returncode,
+        operation_name,
+        settings.chrome_debug_port,
+        (result.stdout or "")[-1000:],
+        (result.stderr or "")[-1000:],
+    )
+
+
+def _get_lux_preflight_timeout_seconds(operation_name: str) -> int:
+    raw = os.getenv("OVE_LUX_AUTH_PREFLIGHT_TIMEOUT_SECONDS")
+    if raw:
+        try:
+            return max(30, int(raw))
+        except ValueError:
+            pass
+    name = operation_name.lower()
+    if "hot" in name:
+        return 300
+    if "sync" in name:
+        return 300
+    return 180
+
+
+def _get_lux_preflight_interval_seconds(operation_name: str) -> int:
+    raw = os.getenv("OVE_LUX_AUTH_PREFLIGHT_INTERVAL_SECONDS")
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    name = operation_name.lower()
+    if "hot" in name:
+        return 0
+    if "sync" in name:
+        return 300
+    return 600
 
 
 def _is_process_state_error(exc: BaseException) -> bool:
